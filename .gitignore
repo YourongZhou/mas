@@ -1,1 +1,9 @@
 math_mas_project/.env
+math_mas_project/src/agents/__pycache__/*
+math_mas_project/src/__pycache__/*
+math_mas_project/.langgraph_api/*
+math_mas_project/__pycache__/*
+mas_project/.env
+mas_project/src/agents/__pycache__/*
+mas_project/src/__pycache__/*
+mas_project/.langgraph_api/*
