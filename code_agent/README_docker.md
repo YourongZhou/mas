@@ -16,6 +16,8 @@ tutorial: https://zhuanlan.zhihu.com/p/1924864194345431337
 
 ## 镜像源推荐
 
+docker镜像源地址经常变更或下线，推荐配置如下
+
 ```sh
 {
     "registry-mirrors": [
@@ -30,7 +32,10 @@ tutorial: https://zhuanlan.zhihu.com/p/1924864194345431337
 ```
 
 
-# set and check user permission
+# 权限管理
+
+python调用docker刚需将用户添加到docker组
+
 ```bash
 # 1. 将用户添加到docker组（只需要做一次）
 sudo usermod -aG docker $USER
