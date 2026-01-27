@@ -7,3 +7,5 @@ mas_project/.env
 mas_project/src/agents/__pycache__/*
 mas_project/src/__pycache__/*
 mas_project/.langgraph_api/*
+code_agent/result/*
+code_agent/__pycache__/*
