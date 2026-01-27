@@ -109,7 +109,7 @@ def generate_scanpy_code(state: ScanpyAgentState) -> ScanpyAgentState:
     关键：强制模型生成analysis_summary变量（解决没结果的问题）
     """
     # 1. 配置DashScope API Key（替换为你的有效Key）
-    dashscope.api_key = "sk-f5f0fa472cb545ea9faa4ed6c2e45c42"
+    dashscope.api_key = "YOUR_API_KEY"
 
     # 2. System Prompt
     system_prompt = """
