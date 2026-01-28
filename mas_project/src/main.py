@@ -6,7 +6,8 @@ from src.agents.supervisor import supervisor_node
 from src.agents.critic import critic_node
 from src.agents.rag import rag_app as rag_worker
 from src.agents.code import code_app as code_worker
-from src.agents.tool import react_graph as tool_worker
+# from src.agents.tool import react_graph as tool_worker
+from src.dra.agent.graph import graph as tool_worker
 
 # --- 路由逻辑 ---
 
