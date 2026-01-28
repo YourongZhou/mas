@@ -9,3 +9,12 @@ mas_project/src/__pycache__/*
 mas_project/.langgraph_api/*
 code_agent/result/*
 code_agent/__pycache__/*
+mas_2/.env
+mas_2/src/agents/__pycache__/*
+mas_2/src/__pycache__/*
+mas_2/.langgraph_api/*
+mas_2/__pycache__/*
+mas_2/data/*
+mas_2/notebooks/cache/*
+mas_2/notebooks/result/*
+*/__pycache__/*

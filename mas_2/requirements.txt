@@ -1,0 +1,14 @@
+langgraph
+langchain-openai
+langchain
+langchain-core
+python-dotenv
+pydantic
+chromadb
+sentence-transformers
+requests
+gseapy
+pandas
+pytest
+pytest-mock
+

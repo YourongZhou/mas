@@ -1,0 +1,43 @@
+{
+  "total_steps": 30,
+  "node_sequence": [
+    "supervisor",
+    "code_dev",
+    "critic",
+    "supervisor",
+    "code_dev",
+    "critic",
+    "supervisor",
+    "code_dev",
+    "critic",
+    "supervisor",
+    "code_dev",
+    "critic",
+    "supervisor",
+    "code_dev",
+    "critic",
+    "supervisor",
+    "code_dev",
+    "critic",
+    "supervisor",
+    "code_dev",
+    "critic",
+    "supervisor",
+    "code_dev",
+    "critic",
+    "supervisor",
+    "code_dev",
+    "critic",
+    "supervisor",
+    "code_dev",
+    "critic"
+  ],
+  "final_state": {
+    "final_answer": "",
+    "code_solution": "{'code': 'import os\\nimport scanpy as sc\\nimport pandas as pd\\nimport numpy as np\\n\\n# 设置结果保存路径\\nresult_dir = \"./result\"\\nos.makedirs(result_dir, exist_ok=True)\\n\\n# 1. 读取数据并进行预处理（QC、标准化）\\nprint(\"Step 1: Loading and preprocessing data...\")\\nadata = sc.read_h5ad(\"/home/luting/projects/mas/mas_2/data/pbmc3k.h5ad\")\\n\\n# QC：计算线粒体基因比例（假设mt基因以\\'MT-\\'或\\'mt-\\'开头）\\nadata.var[\"mt\"] = adata.var_names.str.startswith(\"MT-\") | adata.var_names.str.startswith(\"mt-\")\\nsc.pp.calculate_qc_metrics(adata, qc_vars=[\"mt\"], percent_top=None, log1p=False, inplace=True)\\n\\n# 过滤低质量细胞和基因（可根据实际数据调整阈值）\\n# 示例：保留至少 500 个基因表达的细胞，且线粒体比例 < 20%\\nadata = adata[adata.obs.n_genes_by_counts >= 500]\\nadata = adata[adata.obs.pct_counts_mt < 20]\\n\\n# 过滤低表达基因（至少在10个细胞中表达）\\nsc.pp.filter_genes(adata, min_cells=10)\\n\\n# 标准化与对数转换\\nsc.pp.normalize_total(adata, target_sum=1e4)  # 每个细胞总UMI数归一化至10000\\nsc.pp.log1p(adata)  # log1p transformation\\n\\n# 2. PCA 降维\\nprint(\"Step 2: Performing PCA...\")\\nsc.pp.highly_variable_genes(adata, min_mea",
+    "rag_context": "",
+    "final_report": ""
+  },
+  "generated_codes_count": 38,
+  "celltype_results_count": 0
+}
