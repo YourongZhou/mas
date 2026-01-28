@@ -22,69 +22,9 @@ sc.settings.verbosity = 3  # 显示Scanpy详细日志
 sc.set_figure_params(dpi=80, facecolor="white")  # 设置图片样式
 
 
-def convert_to_docker_path(local_path, mode = "data"):
-    """
-    将本地文件路径转换为Docker容器内的路径
-
-    Args:
-        local_path (str): 本地文件路径，例如 '/home/zwhuang/Data/scHetero/adata_raw_new.h5ad'
-        base_docker_path (str): Docker容器内的基础路径，默认为 '/app/data'
-
-    Returns:
-        str: Docker容器内的路径
-    """
-    if mode == "data":
-        base_docker_path = "/app/data"
-    elif mode == "output":
-        base_docker_path = "/app/output"
-    else:
-        raise ValueError("mode参数必须为'data'或'output'")
-    # Check if the path is a directory
-    if os.path.isdir(local_path):
-        # If it's a directory, the whole directory is mounted to base_docker_path
-        return base_docker_path
-    else:
-        # If it's a file, append the filename to base_docker_path
-        filename = os.path.basename(local_path)
-        docker_path = os.path.join(base_docker_path, filename)
-        return docker_path
-
-
-def create_html_with_base64_image(image_path, output_html_path):
-    """
-    Reads a PNG image, converts it to base64, and creates an HTML file with the embedded image.
-
-    Args:
-        image_path (str): Path to the input PNG image
-        output_html_path (str): Path to the output HTML file
-    """
-    # Check if the image file exists
-    if not os.path.exists(image_path):
-        print(f"Error: Image file '{image_path}' does not exist.")
-        return
-
-    # Read the image file in binary mode
-    with open(image_path, 'rb') as image_file:
-        # Encode the image as base64
-        base64_encoded = base64.b64encode(image_file.read()).decode('utf-8')
-
-    # Create HTML content with the base64-encoded image
-    html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-    <title>UMAP Clustering</title>
-</head>
-<body>
-    <h1>Leiden Clustering UMAP</h1>
-    <img src="data:image/png;base64,{base64_encoded}" alt="UMAP Visualization">
-</body>
-</html>"""
-
-    # Write the HTML content to the output file
-    with open(output_html_path, 'w') as html_file:
-        html_file.write(html_content)
-
-    print(f"Successfully created HTML file with base64-encoded image: {output_html_path}")
+from _utils.docker_path import convert_to_docker_path
+from _utils.base64_support import create_html_with_base64_image
+from config import OPENAI_API_KEY
 
 
 class ScanpyAgentState(TypedDict):
@@ -109,7 +49,7 @@ def generate_scanpy_code(state: ScanpyAgentState) -> ScanpyAgentState:
     关键：强制模型生成analysis_summary变量（解决没结果的问题）
     """
     # 1. 配置DashScope API Key（替换为你的有效Key）
-    dashscope.api_key = "YOUR_API_KEY"
+    dashscope.api_key = OPENAI_API_KEY
 
     # 2. System Prompt
     system_prompt = """
@@ -229,12 +169,13 @@ from executor import CodeExecutor
 
 def run_scanpy_code(state: ScanpyAgentState) -> ScanpyAgentState:
     """
-    运行生成的Scanpy代码，提取分析结果和UMAP图base64编码
+    运行生成的Scanpy代码，提取分析结果和UMAP图base64编码,若运行失败，提出返回给generate_scanpy_code的修改建议
     核心特性：
         1. 容错处理：代码执行失败也不会崩溃，保留完整错误日志
         2. 强制提取：优先识别===RESULT===/===IMAGE===标记，解决list index out of range
         3. 调试友好：打印stdout/stderr，方便排查代码执行问题
         4. Docker执行：在Docker容器中安全执行代码
+        5. debug处理：如果运行失败，分析报错并根据报错给generate_scanpy_code代码或reqirements提出修改建议
     """
     # 1. 拼接完整的可执行代码（补充基础导入，确保代码独立运行）
     full_scanpy_code = f"""
@@ -284,17 +225,6 @@ except Exception as e:
 
         with open(temp_txt_path, "w", encoding="utf-8") as f:
             f.write(state['requirements_txt'])
-
-        # # Create requirements.txt file for the Docker container
-        # requirements_path = os.path.join(temp_dir, "requirements.txt")
-        # with open(requirements_path, "w", encoding="utf-8") as f:
-        #     f.write("scanpy>=1.11.0\n")
-        #     f.write("matplotlib>=3.5.0\n")
-        #     f.write("anndata>=0.11.0\n")
-        #     f.write("igraph\n")
-        #     f.write("leidenalg\n")
-        #     f.write("numpy\n")
-        #     f.write("pandas\n")
 
         # 3. Execute code in Docker container
         executor = CodeExecutor(temp_dir, data_dir=state['data_path'], output_dir = f"{os.path.dirname(os.path.abspath(__file__))}/result")
@@ -387,6 +317,13 @@ def display_result(state: ScanpyAgentState) -> ScanpyAgentState:
     return state
 
 
+def is_continue(state: ScanpyAgentState) -> bool:
+    """
+    判断是否继续执行后续节点（仅当代码运行成功时继续）
+    """
+    return state.get("success", False)
+
+
 # 1. 创建状态图
 workflow = StateGraph(ScanpyAgentState)
 
@@ -395,10 +332,17 @@ workflow.add_node("generate_code", generate_scanpy_code)  # 生成代码节点
 workflow.add_node("run_code", run_scanpy_code)            # 运行代码节点
 workflow.add_node("display_result", display_result)       # 显示结果节点
 
-# 3. 设置执行顺序（线性流程，无循环）
+# 3. 设置执行顺序（run_code同时作为critic,在运行错误时返回generate_code）
 workflow.set_entry_point("generate_code")                # 入口：先生成代码
 workflow.add_edge("generate_code", "run_code")           # 生成代码后→运行代码
-workflow.add_edge("run_code", "display_result")          # 运行代码后→显示结果
+workflow.add_conditional_edges(
+    "run_code",
+    is_continue,
+    {
+        False: "generate_code",  # 运行失败→返回生成代码节点修改
+        True: "display_result",
+    },
+)
 workflow.add_edge("display_result", END)                 # 显示结果后→结束
 
 # 4. 编译工作流（生成可执行的Agent）
