@@ -11,7 +11,7 @@ from .state import CodeAgentState
 from src.core.llm import get_llm
 from .executor import CodeExecutor
 from ._utils.docker_path import convert_to_docker_path
-
+from ._utils.base64_support import create_html_with_base64_image
 # 初始化 LLM
 llm = get_llm(model_name="qwen-plus", temperature=0.1)
 
@@ -165,20 +165,22 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
     docker_output_path = convert_to_docker_path(result_path, 'output') if result_path else '/app/output'
     
     system_prompt = f"""
-    你是专业的单细胞数据分析工程师。
-    {context_instruction}
-    
-    你的任务是：
-    1. 根据用户需求生成 Python 代码（使用 scanpy 等库）
-    2. 代码必须安全、可执行、无死循环风险
-    3. 代码需要包含必要的注释
-    4. 代码将在 Docker 容器中运行，数据路径为 {docker_data_path}，输出路径为 {docker_output_path}
-    5. 必须输出 analysis_summary 变量，格式为：analysis_summary = f"细胞总数：{{adata.n_obs}}，基因总数：{{adata.n_vars}}，聚类数量：{{len(adata.obs['leiden'].cat.categories)}}"
-    6. 必须使用 print(f"===RESULT==={{analysis_summary}}===") 输出结果标记
-    7. 如果生成图片，请保存到 {docker_output_path} 目录
-    
-    请用 ```python 代码块格式返回代码。
-    请用 ```requirements 代码块格式返回 requirements.txt 内容。
+你是专业的单细胞数据分析工程师，仅返回【纯Python代码】（无解释、无注释、无markdown）和 【纯requirement.txt包列表】（无解释、无注释），必须严格遵守：
+1. 只使用Leiden聚类（sc.tl.leiden），禁止使用Louvain聚类（sc.tl.louvain）；
+2. 完整导入所有依赖，确保代码能独立运行；
+3. 必须输出analysis_summary变量，格式为：analysis_summary = f"细胞总数：{{adata.n_obs}}，基因总数：{{adata.n_vars}}，聚类数量：{{len(adata.obs['leiden'].cat.categories)}}"
+4. UMAP图标题固定为'Clustering UMAP'，无特殊字符；
+5. 读取数据时cache=False，anndata设置allow_write_nullable_strings=True。
+6. 生成给docker环境的requirements.txt，确保包含所有代码中用到的包。
+7. 代码将在 Docker 容器中运行，数据路径为 {docker_data_path}，输出路径为 {docker_output_path}
+8. 必须使用 print(f"===RESULT==={{analysis_summary}}===") 输出结果标记
+9. 如果生成图片，请保存到 {docker_output_path} 目录
+
+格式：
+python代码全部被包括在```python 和```之间
+requirement.txt内容全部被包括在```md 和 ```之间
+注意：请严格按照上述格式返回内容，确保代码和requirements.txt清晰分隔。
+{context_instruction}
     """
     
     user_prompt = f"""
@@ -205,21 +207,32 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
         text = response.content
         
         # 提取代码块和 requirements
+        # 支持两种格式：```python 和 ```md（参考 umap_langgraph.py）
         python_pattern = r'```python\n(.*?)\n```'
-        requirements_pattern = r'```requirements\n(.*?)\n```'
+        requirements_pattern_md = r'```md\n(.*?)\n```'
+        requirements_pattern_requirements = r'```requirements\n(.*?)\n```'
         
         python_match = re.search(python_pattern, text, re.DOTALL)
-        requirements_match = re.search(requirements_pattern, text, re.DOTALL)
+        # 优先尝试 ```md 格式，如果没有则尝试 ```requirements 格式
+        requirements_match = re.search(requirements_pattern_md, text, re.DOTALL)
+        if not requirements_match:
+            requirements_match = re.search(requirements_pattern_requirements, text, re.DOTALL)
         
         if python_match:
             code = python_match.group(1).strip()
+            print("获取到了 code，前面部分内容：")
+            print(code[:300])
         else:
             # 如果没有代码块，尝试提取整个响应
+            print("没有获取到 code，尝试提取整个响应")
             code = text.strip()
         
         if requirements_match:
             requirements = requirements_match.group(1).strip()
+            print("获取到了 requirements.txt，内容：")
+            print(requirements)
         else:
+            print("没有获取到 requirements.txt，使用默认值")
             # 默认 requirements
             requirements = "scanpy>=1.9.0\nmatplotlib>=3.4.0\nnumpy>=1.21.0\npandas>=1.3.0\nscipy>=1.7.0\nanndata>=0.8.0\nigraph\nleidenalg"
         
@@ -240,16 +253,17 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
     except Exception as e:
         error_msg = f"代码生成失败: {str(e)}"
         print(f"  --> {error_msg}")
-        state["scanpy_code"] = f"# Error generating code: {e}"
-        state["requirements_txt"] = ""
+        state["scanpy_code"] = f"代码生成失败: {e}"
+        state["requirements_txt"] = f"requirements.txt 生成失败：{str(e)}"
         state["pending_contribution"] = {"error": error_msg}
+        print(f"模型调用失败：{e}")
     
     return state
 
 
 def self_reflection(state: CodeAgentState) -> CodeAgentState:
     """
-    自我检查节点（可选）
+    自我检查节点
     简单的代码质量检查
     """
     code = state.get("scanpy_code", "")
@@ -290,27 +304,23 @@ def execute_code(state: CodeAgentState) -> CodeAgentState:
     result_path = state.get("result_path", "./result")
     os.makedirs(result_path, exist_ok=True)
     
-    # 构建完整的可执行代码
-    full_code = f"""
+    # 构建完整的可执行代码（参考 umap_langgraph.py 的改进）
+    header = f"""
 # 基础库导入（确保代码独立运行）
 import sys
 import os
 sys.path.append(os.getcwd())
-
 import scanpy as sc
 import matplotlib.pyplot as plt
-import anndata
-import numpy as np
-import pandas as pd
 
 # 关键配置
-anndata.settings.allow_write_nullable_strings = True
 plt.switch_backend('Agg')  # 关闭matplotlib弹窗
 sc.settings.verbosity = 3  # 显示Scanpy详细日志
-
+"""
 # 核心分析代码（来自大模型生成）
-{code}
+    llm_code = state.get("scanpy_code", "")
 
+    footer = f"""
 # 强制输出结果标记（关键：解决list index out of range）
 try:
     # 确保即使中间步骤有警告，也能输出结果标记
@@ -329,7 +339,7 @@ except Exception as e:
     # 即使analysis_summary未定义，也输出基础细胞/基因数
     try:
         if 'adata' in locals():
-            fallback_result = f"细胞总数：{{adata.n_obs}}，基因总数：{{adata.n_vars}}（结果提取失败：{{str(e)[:50]}}）"
+            fallback_result = f"细胞总数：{{adata.n_obs}}，基因总数：{{adata.n_vars}}（聚类步骤失败：{{str(e)[:50]}}）"
             print(f"===RESULT==={{fallback_result}}===")
         else:
             print(f"===RESULT===代码执行失败，无法提取结果：{{str(e)}}===")
@@ -342,6 +352,7 @@ except Exception as e:
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_script_path = os.path.join(temp_dir, "code.py")
         temp_requirements_path = os.path.join(temp_dir, "requirements.txt")
+        full_code = header + "\n# --- LLM Generated Code ---\n" + llm_code + "\n" + footer
         
         # 将代码和 requirements 写入临时文件
         with open(temp_script_path, "w", encoding="utf-8") as f:
@@ -366,16 +377,16 @@ except Exception as e:
             # 打印执行日志
             print(f"【Docker代码执行日志】: {result.get('output', '')[:500]}...")
             
-            # 提取结果
+            # 提取结果（参考 umap_langgraph.py 的改进）
             output_str = result.get('output', '')
-            if result.get('success', False) and "===RESULT===" in output_str:
+            if "===RESULT===" in output_str:
                 # 提取结果部分
                 result_part = output_str.split("===RESULT===")[1]
                 if "===" in result_part:
                     result_part = result_part.split("===")[0]
                 state["analysis_result"] = result_part.strip()
-                state["success"] = True
-                print("  --> 代码执行成功！")
+                state["success"] = True  # 标记为成功
+                print("  --> 代码执行成功！已提取分析结果")
                 
                 # 更新 pending_contribution
                 state["pending_contribution"] = {
@@ -387,9 +398,9 @@ except Exception as e:
                     "output_files": result.get('files', [])
                 }
             else:
-                # 执行失败
+                # 如果没有找到结果标记，返回错误信息
                 error_msg = result.get('error', '未知错误')
-                state["analysis_result"] = f"代码执行失败: {error_msg}\n错误日志摘要：{output_str[:500]}"
+                state["analysis_result"] = f"代码执行完成，但未找到结果标记\\n错误日志摘要：{output_str[:500]}"
                 state["success"] = False
                 print(f"  --> 代码执行失败: {error_msg}")
                 
@@ -403,9 +414,9 @@ except Exception as e:
                 }
                 
         except Exception as e:
-            # 处理其他运行时错误
-            error_msg = f"Docker代码运行失败: {str(e)}"
-            state["analysis_result"] = error_msg
+            # 处理其他运行时错误（参考 umap_langgraph.py 的改进）
+            error_msg = f"Docker代码运行失败：{str(e)}"
+            state["analysis_result"] = f"{error_msg}\\n错误日志：{result if 'result' in locals() else '无'}"
             state["success"] = False
             print(f"  --> {error_msg}")
             
@@ -418,6 +429,55 @@ except Exception as e:
                 "success": False
             }
     
+    return state
+
+def display_result(state: CodeAgentState) -> CodeAgentState:
+    """
+    功能：展示分析结果文本+UMAP聚类图（增加容错，避免解码崩溃）
+    """
+
+    if state.get("success", False):
+        print("\n=== [Code Dev] 展现分析结果 ===")
+        # 显示文本结果（优先保证文本能看到）
+        print("单细胞分析结果：")
+        print("-"*30)
+        print(state["analysis_result"])
+
+        # 显示UMAP图（增加容错）
+        print("UMAP聚类图：")
+        print("-"*30)
+
+        # Create output path in a location where we have write permissions
+        output_html_path = f"{state['result_path']}/leiden_decoded.html"
+
+        # Check if we have write permissions to the result directory
+        import os
+        result_dir = state['result_path']
+        if not os.access(result_dir, os.W_OK):
+            # If no write access to result directory, create a temporary directory for output
+            import tempfile
+            with tempfile.TemporaryDirectory() as temp_dir:
+                output_html_path = os.path.join(temp_dir, "leiden_decoded.html")
+                print(f"Warning: No write access to {result_dir}, using temporary directory: {temp_dir}")
+
+                # Call the function to create HTML with base64 image
+                create_html_with_base64_image(f"{state['result_path']}/leiden.png", output_html_path)
+
+                # Inform user of location
+                print(f"HTML file saved at: {output_html_path}")
+                print(f"Please copy the file manually to result directory if needed.")
+        else:
+            # We have write access, proceed normally
+            create_html_with_base64_image(f"{state['result_path']}/leiden.png", output_html_path)
+    else:
+        # 显示失败原因（增加调试信息）
+        print("运行失败详情：")
+        print("-"*30)
+        print(state["analysis_result"])
+        # 打印提取的结果标记，帮助排查
+        print(f"调试信息：")
+        print(f"提取的analysis_result原始值：{state.get('analysis_result', '空')[:100]}")
+        # print(f"提取的umap_base64原始值：{state.get('umap_base64', '空')[:50]}")
     return state
 
 
@@ -459,24 +519,25 @@ workflow.add_node("generate_code", generate_code)
 workflow.add_node("self_reflection", self_reflection)
 workflow.add_node("execute_code", execute_code)
 workflow.add_node("prepare_retry", prepare_retry)
+workflow.add_node("display_result", display_result)
 
 # 定义边
 workflow.add_edge(START, "generate_code")
 workflow.add_edge("generate_code", "self_reflection")
 workflow.add_edge("self_reflection", "execute_code")
-
 # 条件边：根据执行结果决定是否重试
 workflow.add_conditional_edges(
     "execute_code",
     should_retry,
     {
         "retry": "prepare_retry",  # 准备重试
-        "end": END  # 结束
+        "end": "display_result", # 结束
     }
 )
 
 # 准备重试后，返回生成代码节点
 workflow.add_edge("prepare_retry", "generate_code")
+workflow.add_edge("display_result", END)
 
 # 编译子图
 code_agent_graph = workflow.compile()

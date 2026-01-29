@@ -48,16 +48,21 @@ class CodeExecutor:
 
         # 设置卷挂载
         self.volume_mounts = {}
-        if self.data_mount_path:
-            self.volume_mounts[self.data_mount_path] = {
-                'bind': '/app/data',
-                'mode': 'ro'  # 数据目录只读
-            }
-        # 始终挂载输出目录为可写
-        self.volume_mounts[self.output_dir] = {
-            'bind': '/app/output',
-            'mode': 'rw'  # 输出目录可读写
-        }
+        # 挂载代码文件 (将宿主机的 code.py 挂载到容器的 /app/code.py)
+        if os.path.exists(self.code_path):
+            self.volume_mounts[self.code_path] = {'bind': '/app/code.py', 'mode': 'ro'}
+
+        # 挂载数据目录
+        if self.data_dir and os.path.exists(self.data_dir):
+            data_mount_path = os.path.abspath(self.data_dir)
+            if os.path.isfile(data_mount_path):
+                data_mount_path = os.path.dirname(data_mount_path)
+            self.volume_mounts[data_mount_path] = {'bind': '/app/data', 'mode': 'ro'}
+
+        # 挂载输出目录
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+        self.volume_mounts[os.path.abspath(self.output_dir)] = {'bind': '/app/output', 'mode': 'rw'}
 
     def _check_docker_availability(self) -> bool:
         """检查 Docker 是否可用"""
@@ -77,24 +82,21 @@ class CodeExecutor:
         dockerfile_lines = [
             f"FROM {self.docker_image}",
             "WORKDIR /app",
+            "RUN mkdir -p /app/data /app/output"
         ]
 
-        # 添加 requirements 安装
+        # 只有当 requirements 变化时，build 才会耗时
         if os.path.exists(self.requirements_path):
+            # 临时复制一份用于 build
+            shutil.copy2(self.requirements_path, os.path.join(temp_dir, "requirements.txt"))
             dockerfile_lines.extend([
-                f"COPY requirements.txt .",
+                "COPY requirements.txt .",
                 "RUN pip install --no-cache-dir -r requirements.txt",
             ])
 
-        # 复制代码文件
-        dockerfile_lines.append(f"COPY code.py .")
 
-        # 注意：数据通过 volume mount 挂载，不需要在 Dockerfile 中 COPY
+        # To zhenwei：我改了一下，数据通过 volume mount 挂载，不需要在 Dockerfile 中 COPY
         # 这样可以避免数据重复，并且支持大文件
-
-        # 确保容器中 data 和 output 目录存在
-        dockerfile_lines.append("RUN mkdir -p /app/data")
-        dockerfile_lines.append("RUN mkdir -p /app/output")
 
         # 设置执行命令
         dockerfile_lines.append('CMD ["python", "code.py"]')

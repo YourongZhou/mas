@@ -15,11 +15,23 @@ llm_vision = get_llm(model_name="qwen-vl-plus", temperature=0.2)
 
 # --- 全局 System Prompt --- 
 CRITIC_SYSTEM_PROMPT = """
-你是一个资深的 AI 工作成果审核专家。
-你的任务是对其他 AI 代理的工作成果进行严格审核。
-审核标准必须严格、一致、可复现。
-如果审核通过，请只回复 "PASS"。
-如果审核不通过，请给出具体、可操作的修改建议。
+Role: Senior Bioinformatics Reviewer (Nature/Cell Standard)
+Profile:
+You are a rigorous AI auditor specializing in Computational Biology and Bioinformatics.
+Your responsibility is to review the output of other agents (Code, Literature, Data Visualization, Analysis) to ensure scientific accuracy, reproducibility, and clarity.
+
+Core Principles:
+1. Scientific Rigor: No hallucinated genes, proteins, or statistical values.
+2. Reproducibility: Code must be logical and executable; methods must be clear.
+3. Clarity: Visualizations must be publication-ready; text must be concise.
+
+Output Protocol:
+- If the work meets the standard of a high-impact journal, reply with exactly: "PASS"
+- If the work is flawed, reply in the following format:
+  [FAIL]
+  CRITICAL ISSUE: <Describe the scientific or technical error>
+  SUGGESTION: <Actionable advice to fix it>
+- Reply in Chinese.
 """
 
 
@@ -46,16 +58,36 @@ def _normalize_base64_image(image_b64: str, default_mime: str = "image/png") -> 
 
 def check_umap_image(image_base64: str, query: str) -> str:
     """审核 UMAP 图片质量"""
-    umap_system_prompt = """
-    You are an expert in embedding visualization review.
-    Task: Determine if the UMAP plot shows good clustering.
+    image_system_prompt = """
+    --- Visualization Review Task ---
+    Task: Evaluate the scientific visualization quality and relevance to the User Question.
 
-    Criteria for PASS:
-    - clusters are compact and visually separable
-    - limited overlap between clusters
-    - reasonable outliers (not dominating the plot)
-    - not a single indistinct blob
+    Step 1: Identify the Plot Type
+    - Dimension Reduction (UMAP/t-SNE/PCA)
+    - Differential Expression (Volcano Plot, MA Plot)
+    - Expression Patterns (Heatmap, Dot Plot, Violin Plot)
+    - Pathway/Enrichment (Barplot, Network)
+    - Other
+
+    Step 2: Apply Quality Criteria (General & Specific)
+
+    [Universal Criteria] (Must Have)
+    1. Labels: Axis labels (e.g., "UMAP_1", "log2FoldChange") must be visible and meaningful.
+    2. Legends: Color bars or grouping legends must be clear.
+    3. Resolution: No severe blurring that hinders interpretation.
+
+    [Type-Specific Criteria]
+    - For UMAP/t-SNE: Check for distinct clustering (compact groups), batch effects, or "single blob" issues.
+    - For Volcano Plots: Check if significance thresholds (p-value lines) and top genes are marked.
+    - For Heatmaps: Check for clear block patterns (clustering) and readable sample/gene names.
+
+    Step 3: Make a Decision
+    - Is the plot informative and scientifically valid?
+    - Does it directly answer the user's query?
     """
+
+    # 完整 System Prompt
+    full_system_prompt = f"{CRITIC_SYSTEM_PROMPT}\n{image_system_prompt}"
     
     user_prompt = f"User question: {query}"
     
@@ -67,7 +99,7 @@ def check_umap_image(image_base64: str, query: str) -> str:
     message = HumanMessage(
         content=[
             {"type": "text", "text": CRITIC_SYSTEM_PROMPT},
-            {"type": "text", "text": umap_system_prompt},
+            {"type": "text", "text": full_system_prompt},
             {"type": "text", "text": user_prompt},
             {"type": "image_url", "image_url": {"url": data_url}},
         ]
@@ -125,14 +157,13 @@ def check_docs(content: list, query: str) -> str:
     return response.content
 
 
-def check_db_result(content: str, query: str) -> str:
+def check_db(content: str, query: str) -> str:
     """审核数据库结果"""
     db_system_prompt = """
     你是一个数据分析师。
     请检查：
     1. 数据格式是否正确？
     2. 是否为空结果？
-    3. 数据是否与问题相关？
     """
     
     user_prompt = f"""
@@ -191,7 +222,7 @@ def review_contribution(state: CriticAgentState) -> CriticAgentState:
     # 检查是否是数据库结果
     elif isinstance(pending, str) or (isinstance(pending, dict) and "result" in str(pending)):
         content = pending if isinstance(pending, str) else str(pending.get("result", ""))
-        feedback = check_db_result(content, query)
+        feedback = check_db(content, query)
         state["content_type"] = "db_result"
     
     else:

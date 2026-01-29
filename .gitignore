@@ -17,4 +17,4 @@ mas_2/__pycache__/*
 mas_2/data/*
 mas_2/notebooks/cache/*
 mas_2/notebooks/result/*
-*/__pycache__/*
+**/__pycache__/
