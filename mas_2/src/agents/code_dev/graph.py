@@ -24,30 +24,30 @@ def parse_paths_from_query(user_query: str) -> dict:
         "data_path": "",
         "result_path": ""
     }
-    
+
     if not user_query:
         return paths
-    
+
     # 1. 数据路径的正则模式
     # 修复：data_path 模式增加了 ([^\n]+?) 捕获组
     data_patterns = [
-        r'数据路径[：:]\s*([^\n]+)', 
-        r'data[_\s]?path[：:]\s*([^\n]+)', 
-        r'输入路径[：:]\s*([^\n]+)', 
+        r'数据路径[：:]\s*([^\n]+)',
+        r'data[_\s]?path[：:]\s*([^\n]+)',
+        r'输入路径[：:]\s*([^\n]+)',
         r'input[_\s]?path[：:]\s*([^\n]+)',
     ]
-    
+
     # 2. 结果路径的正则模式
     # 优化：去掉了过于激进的关键词 Lookahead 断言，改用更稳健的行结束匹配
     # 这样即使路径里有 /home/data/ 这种词也不会被截断
     result_patterns = [
-        r'输出路径[：:]\s*([^\n]+)', 
-        r'结果路径[：:]\s*([^\n]+)', 
-        r'output[_\s]?path[：:]\s*([^\n]+)', 
+        r'输出路径[：:]\s*([^\n]+)',
+        r'结果路径[：:]\s*([^\n]+)',
+        r'output[_\s]?path[：:]\s*([^\n]+)',
         r'result[_\s]?path[：:]\s*([^\n]+)',
         r'保存路径[：:]\s*([^\n]+)',
     ]
-    
+
     # 尝试匹配数据路径
     for pattern in data_patterns:
         match = re.search(pattern, user_query, re.IGNORECASE)
@@ -58,7 +58,7 @@ def parse_paths_from_query(user_query: str) -> dict:
             path_str = path_str.strip('"\' ')
             paths["data_path"] = path_str
             break
-    
+
     # 尝试匹配结果路径
     for pattern in result_patterns:
         match = re.search(pattern, user_query, re.IGNORECASE)
@@ -67,7 +67,7 @@ def parse_paths_from_query(user_query: str) -> dict:
             path_str = path_str.strip('"\' ')
             paths["result_path"] = path_str
             break
-    
+
     return paths
 
 
@@ -75,7 +75,7 @@ def extract_paths_from_state(state: CodeAgentState) -> CodeAgentState:
     """
     从 state 中提取路径信息
     如果 state 中没有路径，则从 user_query 中解析
-    
+
     优先级：
     1. state 中已有的路径（如果存在）
     2. 从 user_query 中解析的路径
@@ -84,12 +84,12 @@ def extract_paths_from_state(state: CodeAgentState) -> CodeAgentState:
     # 如果 state 中已经有路径，优先使用（但允许从查询中补充缺失的路径）
     has_data_path = bool(state.get("data_path"))
     has_result_path = bool(state.get("result_path"))
-    
+
     # 从 user_query 中解析路径
     user_query = state.get("user_query", "")
     if user_query:
         parsed_paths = parse_paths_from_query(user_query)
-        
+
         # 更新 data_path（如果 state 中没有）
         if not has_data_path and parsed_paths["data_path"]:
             # 验证路径是否存在
@@ -103,7 +103,7 @@ def extract_paths_from_state(state: CodeAgentState) -> CodeAgentState:
         elif not has_data_path:
             # 如果没有解析到且 state 中也没有，保持为空字符串
             state["data_path"] = ""
-        
+
         # 更新 result_path（如果 state 中没有）
         if not has_result_path and parsed_paths["result_path"]:
             state["result_path"] = parsed_paths["result_path"]
@@ -111,11 +111,11 @@ def extract_paths_from_state(state: CodeAgentState) -> CodeAgentState:
         elif not has_result_path:
             # 如果没有解析到且 state 中也没有，使用默认值
             state["result_path"] = "./result"
-    
+
     # 确保 result_path 有默认值
     if not state.get("result_path"):
         state["result_path"] = "./result"
-    
+
     return state
 
 
@@ -125,10 +125,10 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
     调用 LLM 生成代码，写入 pending_contribution
     """
     print(f"--- [Code Dev] 正在生成代码 (迭代 {state.get('internal_iteration_count', 0) + 1}) ---")
-    
+
     # 首先从 user_query 中提取路径（如果 state 中没有）
     state = extract_paths_from_state(state)
-    
+
     # 构建 Prompt：如果有反馈，说明是修正模式
     context_instruction = ""
     if state.get("feedback"):
@@ -138,11 +138,11 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
         驳回意见/错误信息：{state['feedback']}
         请根据上述意见修改代码。
         """
-    
+
     # 获取数据路径和结果路径
     data_path = state.get('data_path', '')
     result_path = state.get('result_path', './result')
-    
+
     # 转换为 Docker 路径
     # 注意：如果 data_path 是文件，convert_to_docker_path 会返回 /app/data/filename.h5ad
     # 如果 data_path 是目录，会返回 /app/data
@@ -161,9 +161,9 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
                 docker_data_path = "/app/data"
     else:
         docker_data_path = '/app/data'
-    
+
     docker_output_path = convert_to_docker_path(result_path, 'output') if result_path else '/app/output'
-    
+
     system_prompt = f"""
 你是专业的单细胞数据分析工程师，仅返回【纯Python代码】（无解释、无注释、无markdown）和 【纯requirement.txt包列表】（无解释、无注释），必须严格遵守：
 1. 只使用Leiden聚类（sc.tl.leiden），禁止使用Louvain聚类（sc.tl.louvain）；
@@ -182,12 +182,12 @@ requirement.txt内容全部被包括在```md 和 ```之间
 注意：请严格按照上述格式返回内容，确保代码和requirements.txt清晰分隔。
 {context_instruction}
     """
-    
+
     user_prompt = f"""
     任务：{state.get('task', state.get('user_query', ''))}
     数据路径（Docker容器内）：{docker_data_path}
     结果路径（Docker容器内）：{docker_output_path}
-    
+
     请生成完整的单细胞数据分析代码，包括：
     1. 数据读取（使用 {docker_data_path}）
     2. 数据预处理和质控
@@ -196,28 +196,28 @@ requirement.txt内容全部被包括在```md 和 ```之间
     5. UMAP 可视化
     6. 结果输出（保存图片到 {docker_output_path}，输出 analysis_summary）
     """
-    
+
     messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_prompt)
     ]
-    
+
     try:
         response = llm.invoke(messages)
         text = response.content
-        
+
         # 提取代码块和 requirements
         # 支持两种格式：```python 和 ```md（参考 umap_langgraph.py）
         python_pattern = r'```python\n(.*?)\n```'
         requirements_pattern_md = r'```md\n(.*?)\n```'
         requirements_pattern_requirements = r'```requirements\n(.*?)\n```'
-        
+
         python_match = re.search(python_pattern, text, re.DOTALL)
         # 优先尝试 ```md 格式，如果没有则尝试 ```requirements 格式
         requirements_match = re.search(requirements_pattern_md, text, re.DOTALL)
         if not requirements_match:
             requirements_match = re.search(requirements_pattern_requirements, text, re.DOTALL)
-        
+
         if python_match:
             code = python_match.group(1).strip()
             print("获取到了 code，前面部分内容：")
@@ -226,7 +226,7 @@ requirement.txt内容全部被包括在```md 和 ```之间
             # 如果没有代码块，尝试提取整个响应
             print("没有获取到 code，尝试提取整个响应")
             code = text.strip()
-        
+
         if requirements_match:
             requirements = requirements_match.group(1).strip()
             print("获取到了 requirements.txt，内容：")
@@ -235,21 +235,21 @@ requirement.txt内容全部被包括在```md 和 ```之间
             print("没有获取到 requirements.txt，使用默认值")
             # 默认 requirements
             requirements = "scanpy>=1.9.0\nmatplotlib>=3.4.0\nnumpy>=1.21.0\npandas>=1.3.0\nscipy>=1.7.0\nanndata>=0.8.0\nigraph\nleidenalg"
-        
+
         # 更新状态
         state["scanpy_code"] = code
         state["requirements_txt"] = requirements
         state["internal_iteration_count"] = state.get("internal_iteration_count", 0) + 1
-        
+
         # 将代码写入 pending_contribution
         state["pending_contribution"] = {
             "code": code,
             "requirements": requirements,
             "task": state.get("task", "")
         }
-        
+
         print(f"  --> 代码生成成功，代码长度: {len(code)} 字符")
-        
+
     except Exception as e:
         error_msg = f"代码生成失败: {str(e)}"
         print(f"  --> {error_msg}")
@@ -257,7 +257,7 @@ requirement.txt内容全部被包括在```md 和 ```之间
         state["requirements_txt"] = f"requirements.txt 生成失败：{str(e)}"
         state["pending_contribution"] = {"error": error_msg}
         print(f"模型调用失败：{e}")
-    
+
     return state
 
 
@@ -269,19 +269,19 @@ def self_reflection(state: CodeAgentState) -> CodeAgentState:
     code = state.get("scanpy_code", "")
     if not code or code.startswith("# Error"):
         return state
-    
+
     print("--- [Code Dev] 进行自我检查 ---")
-    
+
     # 简单的安全检查
     dangerous_patterns = ["eval(", "exec(", "__import__", "open("]
     warnings = []
     for pattern in dangerous_patterns:
         if pattern in code:
             warnings.append(f"检测到潜在风险: {pattern}")
-    
+
     if warnings:
         print(f"  --> 警告: {', '.join(warnings)}")
-    
+
     return state
 
 
@@ -291,19 +291,19 @@ def execute_code(state: CodeAgentState) -> CodeAgentState:
     在 Docker 容器中执行生成的代码
     """
     print("--- [Code Dev] 正在执行代码 ---")
-    
+
     code = state.get("scanpy_code", "")
     requirements = state.get("requirements_txt", "")
-    
+
     if not code or code.startswith("# Error"):
         state["success"] = False
         state["analysis_result"] = "代码生成失败，无法执行"
         return state
-    
+
     # 确保结果目录存在
     result_path = state.get("result_path", "./result")
     os.makedirs(result_path, exist_ok=True)
-    
+
     # 构建完整的可执行代码（参考 umap_langgraph.py 的改进）
     header = f"""
 # 基础库导入（确保代码独立运行）
@@ -347,36 +347,36 @@ except Exception as e:
         # 终极兜底：输出空标记，避免index out of range
         print(f"===RESULT===代码执行失败，无法提取结果===")
     """
-    
+
     # 创建临时目录运行代码
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_script_path = os.path.join(temp_dir, "code.py")
         temp_requirements_path = os.path.join(temp_dir, "requirements.txt")
         full_code = header + "\n# --- LLM Generated Code ---\n" + llm_code + "\n" + footer
-        
+
         # 将代码和 requirements 写入临时文件
         with open(temp_script_path, "w", encoding="utf-8") as f:
             f.write(full_code)
-        
+
         with open(temp_requirements_path, "w", encoding="utf-8") as f:
             f.write(requirements)
-        
+
         # 获取数据路径
         data_path = state.get("data_path", "")
-        
+
         # 在 Docker 容器中执行代码
         executor = CodeExecutor(
             docker_path=temp_dir,
             data_dir=data_path if data_path and os.path.exists(data_path) else None,
             output_dir=result_path
         )
-        
+
         try:
             result = executor.execute(timeout=600)  # 10分钟超时
-            
+
             # 打印执行日志
             print(f"【Docker代码执行日志】: {result.get('output', '')[:500]}...")
-            
+
             # 提取结果（参考 umap_langgraph.py 的改进）
             output_str = result.get('output', '')
             if "===RESULT===" in output_str:
@@ -387,7 +387,7 @@ except Exception as e:
                 state["analysis_result"] = result_part.strip()
                 state["success"] = True  # 标记为成功
                 print("  --> 代码执行成功！已提取分析结果")
-                
+
                 # 更新 pending_contribution
                 state["pending_contribution"] = {
                     "code": code,
@@ -403,7 +403,7 @@ except Exception as e:
                 state["analysis_result"] = f"代码执行完成，但未找到结果标记\\n错误日志摘要：{output_str[:500]}"
                 state["success"] = False
                 print(f"  --> 代码执行失败: {error_msg}")
-                
+
                 # 更新 pending_contribution
                 state["pending_contribution"] = {
                     "code": code,
@@ -412,14 +412,14 @@ except Exception as e:
                     "error": error_msg,
                     "success": False
                 }
-                
+
         except Exception as e:
             # 处理其他运行时错误（参考 umap_langgraph.py 的改进）
             error_msg = f"Docker代码运行失败：{str(e)}"
             state["analysis_result"] = f"{error_msg}\\n错误日志：{result if 'result' in locals() else '无'}"
             state["success"] = False
             print(f"  --> {error_msg}")
-            
+
             # 更新 pending_contribution
             state["pending_contribution"] = {
                 "code": code,
@@ -428,7 +428,7 @@ except Exception as e:
                 "error": error_msg,
                 "success": False
             }
-    
+
     return state
 
 def display_result(state: CodeAgentState) -> CodeAgentState:
@@ -443,32 +443,46 @@ def display_result(state: CodeAgentState) -> CodeAgentState:
         print("-"*30)
         print(state["analysis_result"])
 
-        # 显示UMAP图（增加容错）
-        print("UMAP聚类图：")
+        # 显示所有PNG图片（增加容错）
+        print("正在处理PNG图片并创建对应的HTML文件：")
         print("-"*30)
 
-        # Create output path in a location where we have write permissions
-        output_html_path = f"{state['result_path']}/leiden_decoded.html"
+        import os
+        # Get all PNG files in the result directory
+        result_dir = state['result_path']
+        png_files = [f for f in os.listdir(result_dir) if f.lower().endswith('.png')]
 
         # Check if we have write permissions to the result directory
-        import os
-        result_dir = state['result_path']
         if not os.access(result_dir, os.W_OK):
-            # If no write access to result directory, create a temporary directory for output
-            import tempfile
+            print(f"Warning: No write access to {result_dir}, using temporary directory: {temp_dir}")
+            # If no write access to result directory, create a single temporary directory for all outputs
             with tempfile.TemporaryDirectory() as temp_dir:
-                output_html_path = os.path.join(temp_dir, "leiden_decoded.html")
-                print(f"Warning: No write access to {result_dir}, using temporary directory: {temp_dir}")
+                for png_file in png_files:
+                    png_path = os.path.join(result_dir, png_file)
 
-                # Call the function to create HTML with base64 image
-                create_html_with_base64_image(f"{state['result_path']}/leiden.png", output_html_path)
+                    # Generate corresponding HTML filename (e.g., leiden.png -> leiden_decoded.html)
+                    base_name = os.path.splitext(png_file)[0]
+                    html_filename = f"{base_name}_decoded.html"
+                    output_html_path = os.path.join(temp_dir, html_filename)
 
-                # Inform user of location
-                print(f"HTML file saved at: {output_html_path}")
-                print(f"Please copy the file manually to result directory if needed.")
+                    # Call the function to create HTML with base64 image
+                    create_html_with_base64_image(png_path, output_html_path)
+
+                    # Inform user of location
+                    print(f"HTML file saved at: {output_html_path}")
+                    print(f"Please copy the file manually to result directory if needed.")
         else:
-            # We have write access, proceed normally
-            create_html_with_base64_image(f"{state['result_path']}/leiden.png", output_html_path)
+            # We have write access, proceed normally for each PNG file
+            for png_file in png_files:
+                png_path = os.path.join(result_dir, png_file)
+
+                # Generate corresponding HTML filename (e.g., leiden.png -> leiden_decoded.html)
+                base_name = os.path.splitext(png_file)[0]
+                html_filename = f"{base_name}_decoded.html"
+                output_html_path = os.path.join(result_dir, html_filename)
+
+                create_html_with_base64_image(png_path, output_html_path)
+                print(f"Created HTML file: {html_filename} for {png_file}")
     else:
         # 显示失败原因（增加调试信息）
         print("运行失败详情：")
@@ -489,7 +503,7 @@ def should_retry(state: CodeAgentState) -> str:
     max_retries = 3
     iteration_count = state.get("internal_iteration_count", 0)
     success = state.get("success", False)
-    
+
     if success:
         return "end"
     elif iteration_count < max_retries:
