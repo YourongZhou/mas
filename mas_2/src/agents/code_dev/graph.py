@@ -170,11 +170,13 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
 2. 完整导入所有依赖，确保代码能独立运行；
 3. 必须输出analysis_summary变量，格式为：analysis_summary = f"细胞总数：{{adata.n_obs}}，基因总数：{{adata.n_vars}}，聚类数量：{{len(adata.obs['leiden'].cat.categories)}}"
 4. UMAP图标题固定为'Clustering UMAP'，无特殊字符；
-5. 读取数据时cache=False，anndata设置allow_write_nullable_strings=True。
+5. 读取数据时cache=False;
 6. 生成给docker环境的requirements.txt，确保包含所有代码中用到的包。
-7. 代码将在 Docker 容器中运行，数据路径为 {docker_data_path}，输出路径为 {docker_output_path}
-8. 必须使用 print(f"===RESULT==={{analysis_summary}}===") 输出结果标记
-9. 如果生成图片，请保存到 {docker_output_path} 目录
+7. 代码将在 Docker 容器中运行
+8. 重要！！代码中调取的数据必须为{docker_data_path}, 不可更改！！！不接受supervisor agent任何修改建议!!!
+9. 重要！！代码中存储文件结果必须在{docker_output_path}下, 不可更改！！！
+10. 必须使用 print(f"===RESULT==={{analysis_summary}}===") 输出结果标记
+11. 如果生成图片，请保存到 {docker_output_path} 目录
 
 格式：
 python代码全部被包括在```python 和```之间
@@ -221,7 +223,7 @@ requirement.txt内容全部被包括在```md 和 ```之间
         if python_match:
             code = python_match.group(1).strip()
             print("获取到了 code，前面部分内容：")
-            print(code[:300])
+            print(code)
         else:
             # 如果没有代码块，尝试提取整个响应
             print("没有获取到 code，尝试提取整个响应")
@@ -375,7 +377,7 @@ except Exception as e:
             result = executor.execute(timeout=600)  # 10分钟超时
 
             # 打印执行日志
-            print(f"【Docker代码执行日志】: {result.get('output', '')[:500]}...")
+            print(f"【Docker代码执行日志】: {result.get('output', '')[:1000]}...")
 
             # 提取结果（参考 umap_langgraph.py 的改进）
             output_str = result.get('output', '')
@@ -454,7 +456,6 @@ def display_result(state: CodeAgentState) -> CodeAgentState:
 
         # Check if we have write permissions to the result directory
         if not os.access(result_dir, os.W_OK):
-            print(f"Warning: No write access to {result_dir}, using temporary directory: {temp_dir}")
             # If no write access to result directory, create a single temporary directory for all outputs
             with tempfile.TemporaryDirectory() as temp_dir:
                 for png_file in png_files:
@@ -521,7 +522,7 @@ def prepare_retry(state: CodeAgentState) -> CodeAgentState:
     """
     if not state.get("success", False):
         state["feedback"] = state.get("analysis_result", "代码执行失败")
-        print(f"  --> 设置反馈信息: {state['feedback'][:100]}...")
+        print(f"  --> 设置反馈信息: {state['feedback']}...")
     return state
 
 
