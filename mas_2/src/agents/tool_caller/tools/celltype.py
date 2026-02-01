@@ -13,6 +13,8 @@ import re
 import requests
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Literal, Tuple, Union
+from langchain_core.tools import tool
+
 
 from langchain_core.messages import SystemMessage, HumanMessage
 from src.core.llm import get_llm  # 使用新的 LLM 工厂
@@ -193,6 +195,7 @@ Output JSON only:
 # 4. 主执行逻辑 (工具入口)
 # =========================
 
+@tool
 def run_celltype_annotation(args: Dict[str, Any]) -> Dict[str, Any]:
     """
     [Tool Function] 执行细胞类型注释
@@ -268,17 +271,3 @@ def run_celltype_annotation(args: Dict[str, Any]) -> Dict[str, Any]:
             "llm_expert": asdict(res_llm)
         }
     }
-
-# =========================
-# 5. 注册定义
-# =========================
-
-CELLTYPE_DEF = {
-    "name": "annotate_celltype",
-    "description": (
-        "Identify cell types based on a list of marker genes using a hybrid engine (Enrichr Database + LLM Expert). "
-        "Use this when the user asks to 'annotate', 'identify', or 'predict' cell types from gene sets. "
-        "Input arguments must contain 'gene_list' (a list of gene symbols)."
-    ),
-    "func": run_celltype_annotation
-}

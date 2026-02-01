@@ -19,6 +19,7 @@ import json
 import ast
 import gseapy as gp
 import pandas as pd
+from langchain_core.tools import tool
 from typing import List, Dict, Any, Union
 
 # =========================
@@ -67,6 +68,7 @@ def flatten_input(data: Any) -> str:
 # =========================
 # 核心执行函数
 # =========================
+@tool
 def gene_set_enrichment(
     gene_list: Union[List[str], str, Any], # 放宽类型限制以兼容 Agent 的各种输出
     organism: str = "human",
@@ -219,17 +221,3 @@ def gene_set_enrichment(
         "top_terms": top_terms,
         "summary": summary_text,
     }
-
-
-# =========================
-# ToolDefinition (给 Agent 注册用)
-# =========================
-ENRICHMENT_DEF = {
-    "name": "gene_set_enrichment",
-    "description": (
-        "Perform functional enrichment analysis (ORA) for a list of human genes using Enrichr. "
-        "Automatically cleans messy inputs, identifies enriched pathways (GO/KEGG), and saves plots to './figs'. "
-        "Input: Can be a list of gene symbols, a comma-separated string, or natural text containing genes."
-    ),
-    "func": gene_set_enrichment,
-}

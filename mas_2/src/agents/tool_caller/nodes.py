@@ -6,7 +6,7 @@ from langchain_core.messages import HumanMessage
 from .state import ToolCallerAgentState
 from src.core.llm import get_llm
 from .prompts import get_decision_system_prompt, get_interpret_system_prompt
-from .tools import TOOL_MAP
+from .tools import TOOL_MAP # 确保这导入的是包含 BaseTool 对象的字典
 
 # 初始化 LLM
 llm = get_llm(model_name="qwen-plus", temperature=0.1)
@@ -17,14 +17,12 @@ def decision_node(state: ToolCallerAgentState) -> ToolCallerAgentState:
     [节点 1] 决策节点：决定调用哪个工具，准备什么参数
     """
     print("\n=== [Tool Caller - Decision Node] ===")
-    # 优先使用 user_query，如果没有则使用 messages 的最后一条
     user_input = state.get("user_query", "")
+    
+    # 回退策略：如果 user_query 为空，尝试从 messages 历史中取最后一条
     if not user_input and state.get("messages"):
         last_msg = state["messages"][-1]
-        if hasattr(last_msg, "content"):
-            user_input = last_msg.content
-        else:
-            user_input = str(last_msg)
+        user_input = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
     
     # 1. 获取动态生成的 Prompt
     system_msg = get_decision_system_prompt()
@@ -35,7 +33,6 @@ def decision_node(state: ToolCallerAgentState) -> ToolCallerAgentState:
     
     # 3. 解析 JSON
     try:
-        # 清理一下可能的 markdown 格式 ```json ... ```
         content = response.content.replace("```json", "").replace("```", "").strip()
         decision = json.loads(content)
     except Exception as e:
@@ -55,20 +52,20 @@ def decision_node(state: ToolCallerAgentState) -> ToolCallerAgentState:
 def tool_execution_node(state: ToolCallerAgentState) -> ToolCallerAgentState:
     """
     [节点 2] 通用工具执行节点
-    根据 tool_name 动态查找并运行函数
+    根据 tool_name 动态查找并运行函数 (适配 LangChain BaseTool)
     """
     print("\n=== [Tool Caller - Tool Execution Node] ===")
     name = state.get("tool_name")
     args = state.get("tool_args", {})
 
-    # 从注册表中查找工具
-    tool_def = TOOL_MAP.get(name)
+    # 1. 从注册表中查找工具对象
+    tool_instance = TOOL_MAP.get(name)
     
-    if tool_def:
-        # 执行工具函数
-        func = tool_def["func"]
+    if tool_instance:
         try:
-            result = func(args)
+            # 使用 LangChain 标准 invoke 方法执行
+            # invoke 会自动处理参数验证
+            result = tool_instance.invoke(args)
             print(f"Tool '{name}' executed successfully")
         except Exception as e:
             result = f"Tool Execution Error: {str(e)}"
@@ -100,7 +97,6 @@ def interpret_node(state: ToolCallerAgentState) -> ToolCallerAgentState:
 
     system_msg = get_interpret_system_prompt()
     
-    # 构建包含上下文的 Prompt
     user_query = state.get("user_query", "")
     context_content = (
         f"User Input: {user_query}\n"
@@ -111,10 +107,8 @@ def interpret_node(state: ToolCallerAgentState) -> ToolCallerAgentState:
     response = llm.invoke([system_msg, HumanMessage(content=context_content)])
     answer = response.content
 
-    # 将结果写入 pending_contribution
     return {
         **state,
         "tool_final_answer": answer,
         "pending_contribution": answer
-    }
-
+    }  
