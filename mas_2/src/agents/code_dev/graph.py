@@ -13,7 +13,7 @@ from .executor import CodeExecutor
 from ._utils.docker_path import convert_to_docker_path
 from ._utils.base64_support import create_html_with_base64_image
 # 初始化 LLM
-llm = get_llm(model_name="qwen-plus", temperature=0.1)
+llm = get_llm(temperature=0.1)
 
 
 def parse_paths_from_query(user_query: str) -> dict:
@@ -139,9 +139,33 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
         请根据上述意见修改代码。
         """
 
+    # 获取当前步骤的输入、预期输出和文件路径
+    current_step_input = state.get('current_step_input', '')
+    current_step_expected_output = state.get('current_step_expected_output', '')
+    current_step_file_paths = state.get('current_step_file_paths', {})
+    
+    # 从计划中获取文件路径，如果存在则优先使用
+    input_files = current_step_file_paths.get('input_files', []) if current_step_file_paths else []
+    output_files = current_step_file_paths.get('output_files', []) if current_step_file_paths else []
+    
     # 获取数据路径和结果路径
-    data_path = state.get('data_path', '')
+    # 优先使用计划中指定的输入文件，否则使用原有的data_path
+    if input_files:
+        # 使用计划中指定的第一个输入文件作为数据路径
+        data_path = input_files[0]
+    else:
+        data_path = state.get('data_path', '')
+    
     result_path = state.get('result_path', './result')
+    
+    # 如果计划中指定了输出文件路径，使用第一个作为参考路径
+    if output_files:
+        # 从输出文件路径中提取目录路径
+        first_output = output_files[0]
+        if os.path.isabs(first_output):
+            result_path = os.path.dirname(first_output)
+        else:
+            result_path = os.path.dirname(first_output) if os.path.dirname(first_output) else result_path
 
     # 转换为 Docker 路径
     # 注意：如果 data_path 是文件，convert_to_docker_path 会返回 /app/data/filename.h5ad
@@ -170,13 +194,13 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
 2. 完整导入所有依赖，确保代码能独立运行；
 3. 必须输出analysis_summary变量，格式为：analysis_summary = f"细胞总数：{{adata.n_obs}}，基因总数：{{adata.n_vars}}，聚类数量：{{len(adata.obs['leiden'].cat.categories)}}"
 4. UMAP图标题固定为'Clustering UMAP'，无特殊字符；
-5. 读取数据时cache=False;
-6. 生成给docker环境的requirements.txt，确保包含所有代码中用到的包。
-7. 代码将在 Docker 容器中运行
-8. 重要！！代码中调取的数据必须为{docker_data_path}, 不可更改！！！不接受supervisor agent任何修改建议!!!
-9. 重要！！代码中存储文件结果必须在{docker_output_path}下, 不可更改！！！
-10. 必须使用 print(f"===RESULT==={{analysis_summary}}===") 输出结果标记
-11. 如果生成图片，请保存到 {docker_output_path} 目录
+5. 生成给docker环境的requirements.txt，确保包含所有代码中用到的包。
+6. 代码将在 Docker 容器中运行
+7. 重要！！代码中调取的数据必须为{docker_data_path}, 不可更改！！！不接受supervisor agent任何关于调取数据的修改建议!!!
+8. 重要！！代码中存储文件结果必须在{docker_output_path}下, 不可更改！！！
+9. 必须使用 print(f"===RESULT==={{analysis_summary}}===") 输出结果标记
+10. 如果生成图片，请保存到 {docker_output_path} 目录
+11. 根据数据格式来判断用什么方法进行读取，如是h5ad格式，使用sc.read_h5ad。
 
 格式：
 python代码全部被包括在```python 和```之间
@@ -185,18 +209,30 @@ requirement.txt内容全部被包括在```md 和 ```之间
 {context_instruction}
     """
 
+    # 构建任务描述，优先使用当前步骤的输入
+    task_description = current_step_input if current_step_input else state.get('task', state.get('user_query', ''))
+    
+    # 构建预期输出说明
+    expected_output_note = ""
+    if current_step_expected_output:
+        expected_output_note = f"\n\n【预期输出要求】\n{current_step_expected_output}\n请确保生成的代码能够满足上述要求。"
+    
+    # 构建文件路径说明
+    file_paths_note = ""
+    if input_files:
+        file_paths_note += f"\n【输入文件】\n" + "\n".join([f"- {f}" for f in input_files])
+    if output_files:
+        file_paths_note += f"\n【必须生成的输出文件】\n" + "\n".join([f"- {f}" for f in output_files])
+        # 确保输出文件保存到指定路径
+        docker_output_paths = [convert_to_docker_path(f, 'output') for f in output_files]
+        file_paths_note += f"\n【Docker容器内输出路径】\n" + "\n".join([f"- {p}" for p in docker_output_paths])
+    
     user_prompt = f"""
-    任务：{state.get('task', state.get('user_query', ''))}
+    任务：{task_description}
     数据路径（Docker容器内）：{docker_data_path}
     结果路径（Docker容器内）：{docker_output_path}
-
-    请生成完整的单细胞数据分析代码，包括：
-    1. 数据读取（使用 {docker_data_path}）
-    2. 数据预处理和质控
-    3. 标准化和降维
-    4. Leiden 聚类（使用 sc.tl.leiden，不要使用 Louvain）
-    5. UMAP 可视化
-    6. 结果输出（保存图片到 {docker_output_path}，输出 analysis_summary）
+    {file_paths_note}
+    {expected_output_note}
     """
 
     messages = [
@@ -304,6 +340,15 @@ def execute_code(state: CodeAgentState) -> CodeAgentState:
 
     # 确保结果目录存在
     result_path = state.get("result_path", "./result")
+    
+    # 如果计划中指定了输出文件路径，确保对应的目录存在
+    current_step_file_paths = state.get("current_step_file_paths", {})
+    output_files = current_step_file_paths.get("output_files", []) if current_step_file_paths else []
+    if output_files:
+        for output_file in output_files:
+            output_dir = os.path.dirname(output_file) if os.path.dirname(output_file) else result_path
+            os.makedirs(output_dir, exist_ok=True)
+    
     os.makedirs(result_path, exist_ok=True)
 
     # 构建完整的可执行代码（参考 umap_langgraph.py 的改进）
@@ -314,6 +359,20 @@ import os
 sys.path.append(os.getcwd())
 import scanpy as sc
 import matplotlib.pyplot as plt
+
+# --- DEBUG START: 检查挂载情况 ---
+print("DEBUG: Checking /app/data contents...")
+try:
+    if os.path.exists('/app/data'):
+        print(f"DEBUG: Files in /app/data: {{os.listdir('/app/data')}}")
+    else:
+        print("DEBUG: /app/data does not exist!")
+    
+    if os.path.exists('/app/output'):
+        print(f"DEBUG: Files in /app/output: {{os.listdir('/app/output')}}")
+except Exception as e:
+    print(f"DEBUG: Error checking directories: {{e}}")
+# --- DEBUG END ---
 
 # 关键配置
 plt.switch_backend('Agg')  # 关闭matplotlib弹窗
@@ -363,13 +422,78 @@ except Exception as e:
         with open(temp_requirements_path, "w", encoding="utf-8") as f:
             f.write(requirements)
 
-        # 获取数据路径
+        # 智能确定数据路径：检查输入文件的实际位置
         data_path = state.get("data_path", "")
+        current_step_file_paths = state.get("current_step_file_paths", {})
+        input_files = current_step_file_paths.get("input_files", []) if current_step_file_paths else []
+        
+        # 如果计划中指定了输入文件，检查它们实际存在的位置
+        actual_data_path = data_path
+        if input_files:
+            # 检查第一个输入文件的实际位置
+            first_input = input_files[0]
+            
+            # 如果输入文件路径是绝对路径且存在，使用其所在目录
+            if os.path.isabs(first_input) and os.path.exists(first_input):
+                actual_data_path = os.path.dirname(first_input) if os.path.isfile(first_input) else first_input
+                print(f"  --> 检测到输入文件: {first_input}")
+                print(f"  --> 使用输入文件所在目录作为数据路径: {actual_data_path}")
+            # 如果输入文件路径是相对路径，尝试在 result_path 中查找
+            elif not os.path.isabs(first_input):
+                # 尝试在 result_path 中查找（可能是上一轮的输出）
+                candidate_paths = [
+                    os.path.join(result_path, first_input),  # result_path/input_file
+                    os.path.join(result_path, os.path.basename(first_input)),  # result_path/filename
+                    first_input  # 直接使用相对路径
+                ]
+                
+                for candidate in candidate_paths:
+                    if os.path.exists(candidate):
+                        actual_data_path = os.path.dirname(candidate) if os.path.isfile(candidate) else candidate
+                        print(f"  --> 在 result_path 中找到输入文件: {candidate}")
+                        print(f"  --> 使用 result_path 作为数据路径: {actual_data_path}")
+                        break
+                else:
+                    # 如果都没找到，检查是否在原始 data_path 中
+                    if data_path and os.path.exists(data_path):
+                        candidate_in_data = os.path.join(data_path, first_input) if os.path.isdir(data_path) else None
+                        if candidate_in_data and os.path.exists(candidate_in_data):
+                            actual_data_path = data_path
+                            print(f"  --> 在原始 data_path 中找到输入文件: {candidate_in_data}")
+                        else:
+                            # 如果还是找不到，使用 result_path（因为可能是上一轮的输出）
+                            actual_data_path = result_path
+                            print(f"  --> 未找到输入文件，使用 result_path 作为数据路径: {actual_data_path}")
+            # 如果输入文件路径是绝对路径但不存在，检查是否在 result_path 中
+            elif os.path.isabs(first_input) and not os.path.exists(first_input):
+                # 尝试在 result_path 中查找文件名
+                filename = os.path.basename(first_input)
+                candidate_in_result = os.path.join(result_path, filename)
+                if os.path.exists(candidate_in_result):
+                    actual_data_path = result_path
+                    print(f"  --> 输入文件不存在，但在 result_path 中找到同名文件: {candidate_in_result}")
+                    print(f"  --> 使用 result_path 作为数据路径: {actual_data_path}")
+        
+        # 如果 actual_data_path 为空或不存在，但有 result_path，使用 result_path
+        if not actual_data_path or not os.path.exists(actual_data_path):
+            if result_path and os.path.exists(result_path):
+                actual_data_path = result_path
+                print(f"  --> 数据路径无效，使用 result_path 作为数据路径: {actual_data_path}")
+        
+        # 确保数据路径存在
+        if actual_data_path and not os.path.exists(actual_data_path):
+            print(f"  --> 警告：数据路径不存在: {actual_data_path}，将尝试创建")
+            try:
+                os.makedirs(actual_data_path, exist_ok=True)
+            except Exception as e:
+                print(f"  --> 无法创建数据路径: {e}")
 
         # 在 Docker 容器中执行代码
+        # 传递 input_files 以便 executor 智能确定需要挂载的目录
         executor = CodeExecutor(
             docker_path=temp_dir,
-            data_dir=data_path if data_path and os.path.exists(data_path) else None,
+            data_dir=actual_data_path if actual_data_path and os.path.exists(actual_data_path) else None,
+            input_files=input_files if input_files else None,
             output_dir=result_path
         )
 
@@ -377,11 +501,20 @@ except Exception as e:
             result = executor.execute(timeout=600)  # 10分钟超时
 
             # 打印执行日志
-            print(f"【Docker代码执行日志】: {result.get('output', '')[:1000]}...")
-
-            # 提取结果（参考 umap_langgraph.py 的改进）
             output_str = result.get('output', '')
-            if "===RESULT===" in output_str:
+            print(f"【Docker代码执行日志】: {output_str[:1000]}...")
+
+            # 检查执行是否成功（从executor返回的success字段）
+            executor_success = result.get('success', True)
+            
+            # 检查output中是否包含错误信息（即使executor返回success=True，代码执行也可能失败）
+            has_error_in_output = any(keyword in output_str for keyword in [
+                'Traceback', 'Error:', 'Exception:', 'TypeError', 'ValueError', 
+                'AttributeError', 'NameError', 'KeyError', 'IndexError'
+            ])
+            
+            # 提取结果（参考 umap_langgraph.py 的改进）
+            if executor_success and "===RESULT===" in output_str and not has_error_in_output:
                 # 提取结果部分
                 result_part = output_str.split("===RESULT===")[1]
                 if "===" in result_part:
@@ -400,11 +533,61 @@ except Exception as e:
                     "output_files": result.get('files', [])
                 }
             else:
-                # 如果没有找到结果标记，返回错误信息
-                error_msg = result.get('error', '未知错误')
-                state["analysis_result"] = f"代码执行完成，但未找到结果标记\\n错误日志摘要：{output_str[:500]}"
+                # 执行失败或没有找到结果标记
+                # 优先使用executor返回的error字段，否则从output中提取错误信息
+                error_msg = result.get('error', '')
+                
+                # 如果没有error字段，尝试从output中提取错误信息
+                if not error_msg and output_str:
+                    # 优先提取完整的Traceback信息
+                    if 'Traceback' in output_str:
+                        # 提取从Traceback到最后一个错误行的内容
+                        traceback_match = re.search(
+                            r'(Traceback \(most recent call last\):.*?)(?=\n\n|\n[A-Z][a-z]+:|\Z)',
+                            output_str,
+                            re.DOTALL
+                        )
+                        if traceback_match:
+                            error_msg = traceback_match.group(1).strip()
+                            # 如果traceback太长，只保留最后的关键部分
+                            if len(error_msg) > 500:
+                                lines = error_msg.split('\n')
+                                # 保留前3行（Traceback开始）和最后5行（错误信息）
+                                error_msg = '\n'.join(lines[:3] + ['...'] + lines[-5:])
+                        else:
+                            # 如果没找到完整traceback，提取包含错误的行
+                            lines = output_str.split('\n')
+                            error_lines = []
+                            for i, line in enumerate(lines):
+                                if any(keyword in line for keyword in [
+                                    'TypeError', 'ValueError', 'AttributeError', 
+                                    'NameError', 'KeyError', 'IndexError', 'Error:'
+                                ]):
+                                    # 包含这一行和前面几行上下文
+                                    start = max(0, i - 3)
+                                    error_lines = lines[start:i+1]
+                                    break
+                            if error_lines:
+                                error_msg = '\n'.join(error_lines).strip()
+                    
+                    # 如果还是没找到，使用output的前500字符作为错误信息
+                    if not error_msg:
+                        error_msg = output_str[:500].strip()
+                        if len(output_str) > 500:
+                            error_msg += "..."
+                
+                # 如果仍然没有错误信息，使用默认值
+                if not error_msg:
+                    error_msg = '代码执行失败，但未找到具体错误信息'
+                
+                # 构建错误信息
+                if "===RESULT===" not in output_str:
+                    state["analysis_result"] = f"代码执行失败\\n错误信息：{error_msg}"
+                else:
+                    state["analysis_result"] = f"代码执行完成，但未找到结果标记\\n错误日志摘要：{error_msg}"
+                
                 state["success"] = False
-                print(f"  --> 代码执行失败: {error_msg}")
+                print(f"  --> 代码执行失败: {error_msg[:200]}...")
 
                 # 更新 pending_contribution
                 state["pending_contribution"] = {
@@ -412,7 +595,8 @@ except Exception as e:
                     "requirements": requirements,
                     "task": state.get("task", ""),
                     "error": error_msg,
-                    "success": False
+                    "success": False,
+                    "output": output_str[:1000] if output_str else ""  # 保存部分输出用于调试
                 }
 
         except Exception as e:

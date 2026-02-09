@@ -9,7 +9,7 @@ from .prompts import get_decision_system_prompt, get_interpret_system_prompt
 from .tools import TOOL_MAP # 确保这导入的是包含 BaseTool 对象的字典
 
 # 初始化 LLM
-llm = get_llm(model_name="qwen-plus", temperature=0.1)
+llm = get_llm(temperature=0.1)
 
 
 def decision_node(state: ToolCallerAgentState) -> ToolCallerAgentState:
@@ -17,12 +17,27 @@ def decision_node(state: ToolCallerAgentState) -> ToolCallerAgentState:
     [节点 1] 决策节点：决定调用哪个工具，准备什么参数
     """
     print("\n=== [Tool Caller - Decision Node] ===")
-    user_input = state.get("user_query", "")
+    
+    # 优先使用当前步骤的输入
+    current_step_input = state.get("current_step_input", "")
+    current_step_expected_output = state.get("current_step_expected_output", "")
+    
+    # 构建用户输入：优先使用当前步骤输入，否则使用user_query
+    if current_step_input:
+        user_input = current_step_input
+        print(f"  --> 使用计划步骤输入: {user_input[:100]}...")
+    else:
+        user_input = state.get("user_query", "")
     
     # 回退策略：如果 user_query 为空，尝试从 messages 历史中取最后一条
     if not user_input and state.get("messages"):
         last_msg = state["messages"][-1]
         user_input = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+    
+    # 如果有预期输出，添加到用户输入中
+    if current_step_expected_output:
+        user_input += f"\n\n【预期输出要求】\n{current_step_expected_output}"
+        print(f"  --> 包含预期输出要求: {current_step_expected_output[:100]}...")
     
     # 1. 获取动态生成的 Prompt
     system_msg = get_decision_system_prompt()

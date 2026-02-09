@@ -1,14 +1,18 @@
 {
-  "total_steps": 1,
+  "total_steps": 5,
   "node_sequence": [
-    "supervisor"
+    "supervisor",
+    "code_dev",
+    "critic",
+    "supervisor",
+    "finalize"
   ],
   "final_state": {
     "final_answer": "",
-    "code_solution": "",
+    "code_solution": "{'code': 'import scanpy as sc\\nimport pandas as pd\\nimport os\\n\\n# 设置路径\\ninput_path = \"/app/data/pbmc3k.h5ad\"\\noutput_path = \"/app/output\"\\n\\n# 读取数据\\nadata = sc.read_hdf5(input_path, cache=False)\\n\\n# 质控\\nsc.pp.filter_cells(adata, min_genes=200)\\nsc.pp.filter_genes(adata, min_cells=3)\\n\\n# 标准化\\nsc.pp.normalize_total(adata, target_sum=1e4)\\nsc.pp.log1p(adata)\\n\\n# PCA降维\\nsc.tl.pca(adata, n_comps=50)\\n\\n# UMAP可视化\\nsc.tl.umap(adata)\\n\\n# Leiden聚类\\nsc.tl.leiden(adata, resolution=0.5)\\n\\n# 保存UMAP图\\nsc.pl.umap(adata, color=\\'leiden\\', title=\\'Clustering UMAP\\', show=False)\\nplt.savefig(os.path.join(output_path, \"clustering_umap.png\"))\\n\\n# 差异表达分析\\nsc.tl.rank_genes_groups(adata, \\'leiden\\', method=\\'wilcoxon\\')\\n\\n# 获取每个聚类的top10差异基因\\ncluster_results = {}\\nfor cluster in adata.obs[\\'leiden\\'].unique():\\n    genes = adata.uns[\\'rank_genes_groups\\'][\\'names\\'][cluster]\\n    cluster_results[cluster] = genes[:10]\\n\\n# 生成分析摘要\\nanalysis_summary = f\"细胞总数：{adata.n_obs}，基因总数：{adata.n_vars}，聚类数量：{len(ad",
     "rag_context": "",
     "final_report": ""
   },
-  "generated_codes_count": 0,
+  "generated_codes_count": 4,
   "celltype_results_count": 0
 }

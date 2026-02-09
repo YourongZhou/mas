@@ -84,8 +84,21 @@ def search_documents(state: RAGAgentState) -> RAGAgentState:
     检索文档节点
     从向量库中检索相关文档
     """
-    query = state.get("search_query") or state.get("user_query", "")
-    print(f"--- [RAG Researcher] 正在查询向量库: {query} ---")
+    # 优先使用当前步骤的输入作为查询内容
+    current_step_input = state.get("current_step_input", "")
+    current_step_expected_output = state.get("current_step_expected_output", "")
+    
+    # 构建查询：如果有当前步骤输入，使用它；否则使用search_query或user_query
+    if current_step_input:
+        query = current_step_input
+        print(f"--- [RAG Researcher] 正在查询向量库（根据计划步骤）: {query[:100]}... ---")
+    else:
+        query = state.get("search_query") or state.get("user_query", "")
+        print(f"--- [RAG Researcher] 正在查询向量库: {query} ---")
+    
+    # 如果有预期输出，在日志中显示
+    if current_step_expected_output:
+        print(f"  --> 预期输出要求: {current_step_expected_output[:100]}...")
     
     docs = _vector_search(query, top_k=TOP_K)
     

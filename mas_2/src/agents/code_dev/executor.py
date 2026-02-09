@@ -15,57 +15,111 @@ logging.basicConfig(level=logging.INFO)
 class CodeExecutor:
     """使用 Docker 容器执行代码的执行器"""
     
-    def __init__(self, docker_path: str, data_dir: str = None, output_dir: str = None):
+    def __init__(self, docker_path: str, data_dir: str = None, data_dirs: list = None, 
+                 output_dir: str = None, input_files: list = None):
         """
         初始化代码执行器
-        
-        Args:
-            docker_path: 包含 code.py 和 requirements.txt 的目录路径
-            data_dir: 数据目录路径（将被挂载到容器的 /app/data）
-            output_dir: 输出目录路径（将被挂载到容器的 /app/output）
         """
         self.docker_available = self._check_docker_availability()
         self.code_path = f"{docker_path}/code.py"
         self.requirements_path = f"{docker_path}/requirements.txt"
-        self.data_dir = data_dir
         self.output_dir = output_dir if output_dir else "/tmp/output"  # 默认输出目录
         self.docker_image = "python:3.13-slim"
         self.logger = logging.getLogger(__name__)
         
-        # 处理数据路径：如果是文件，使用文件所在目录；如果是目录，直接使用
-        self.data_mount_path = None
+        # --- 关键修改 1：使用列表存储挂载信息，避免字典 Key 冲突 ---
+        self.volume_mounts = []
+        
+        # 处理数据目录：支持单个或多个目录
+        # 确保 self.data_dirs 是有序列表，且 data_dir 始终在第一个
+        self.data_dirs = []
+        if data_dirs:
+            self.data_dirs = [d for d in data_dirs if d and os.path.exists(d)]
+        elif data_dir:
+            self.data_dirs = [data_dir] if os.path.exists(data_dir) else []
+        
+        if input_files:
+            self._determine_data_dirs_from_input_files(input_files)
+        
+        self.data_mount_path = self.data_dirs[0] if self.data_dirs else None
         self.data_file_name = None
-        if self.data_dir and os.path.exists(self.data_dir):
-            if os.path.isfile(self.data_dir):
-                # 如果是文件，挂载文件所在的目录，并记录文件名
-                self.data_mount_path = os.path.dirname(os.path.abspath(self.data_dir))
-                self.data_file_name = os.path.basename(self.data_dir)
-                self.logger.info(f"数据路径是文件，将挂载目录: {self.data_mount_path}, 文件名: {self.data_file_name}")
-            elif os.path.isdir(self.data_dir):
-                # 如果是目录，直接挂载目录
-                self.data_mount_path = os.path.abspath(self.data_dir)
-                self.logger.info(f"数据路径是目录，将挂载: {self.data_mount_path}")
-
-        # 设置卷挂载
-        self.volume_mounts = {}
+        
         # 挂载代码文件 (将宿主机的 code.py 挂载到容器的 /app/code.py)
         if os.path.exists(self.code_path):
-            self.volume_mounts[self.code_path] = {'bind': '/app/code.py', 'mode': 'ro'}
+            # 格式: host_path:container_path:mode
+            mount_str = f"{os.path.abspath(self.code_path)}:/app/code.py:ro"
+            self.volume_mounts.append(mount_str)
 
-        # 挂载数据目录
-        if self.data_dir and os.path.exists(self.data_dir):
-            data_mount_path = os.path.abspath(self.data_dir)
+        # 挂载数据目录（支持多个）
+        for idx, data_dir_path in enumerate(self.data_dirs):
+            if not os.path.exists(data_dir_path):
+                continue
+                
+            data_mount_path = os.path.abspath(data_dir_path)
             if os.path.isfile(data_mount_path):
                 data_mount_path = os.path.dirname(data_mount_path)
-            self.volume_mounts[data_mount_path] = {'bind': '/app/data', 'mode': 'ro'}
+                if idx == 0:
+                    self.data_file_name = os.path.basename(data_dir_path)
+            
+            if idx == 0:
+                bind_path = '/app/data'
+            else:
+                bind_path = f'/app/data{idx}'
+            
+            # --- 关键修改 2：追加到列表，允许同一个 host path 挂载到多个位置 ---
+            # 使用 rw 模式
+            mount_str = f"{data_mount_path}:{bind_path}:rw"
+            self.volume_mounts.append(mount_str)
+            self.logger.info(f"数据目录挂载: {data_mount_path} -> {bind_path}")
 
         # 挂载输出目录
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
-        self.volume_mounts[os.path.abspath(self.output_dir)] = {'bind': '/app/output', 'mode': 'rw'}
+            
+        # --- 关键修改 3：追加输出目录挂载 ---
+        mount_str = f"{os.path.abspath(self.output_dir)}:/app/output:rw"
+        self.volume_mounts.append(mount_str)
+    
+    def _determine_data_dirs_from_input_files(self, input_files: list):
+        """
+        根据输入文件列表智能确定需要挂载的数据目录
+        """
+        if not input_files:
+            return
+        
+        existing_set = {os.path.abspath(d) for d in self.data_dirs}
+        dirs_to_add = []
+        
+        for input_file in input_files:
+            if not input_file:
+                continue
+            
+            found_dir = None
+            if os.path.isabs(input_file) and os.path.exists(input_file):
+                file_dir = os.path.dirname(input_file) if os.path.isfile(input_file) else input_file
+                found_dir = os.path.abspath(file_dir)
+            elif not os.path.isabs(input_file):
+                for existing_dir in self.data_dirs:
+                    candidate = os.path.join(existing_dir, input_file)
+                    if os.path.exists(candidate):
+                        found_dir = None
+                        break
+                    if os.path.isfile(existing_dir):
+                        existing_dir = os.path.dirname(existing_dir)
+                    candidate = os.path.join(existing_dir, os.path.basename(input_file))
+                    if os.path.exists(candidate):
+                        found_dir = None
+                        break
+            
+            if found_dir and found_dir not in existing_set:
+                dirs_to_add.append(found_dir)
+                existing_set.add(found_dir)
+        
+        if dirs_to_add:
+            self.data_dirs.extend(dirs_to_add)
+            self.logger.info(f"根据输入文件追加挂载目录: {dirs_to_add}")
 
     def _check_docker_availability(self) -> bool:
-        """检查 Docker 是否可用"""
         try:
             self.client = docker.from_env()
             return True
@@ -77,28 +131,19 @@ class CodeExecutor:
             return False
 
     def _create_dockerfile(self, temp_dir: str, output_mount_path: str | None = None):
-        """创建 Dockerfile"""
-        # 构建 Dockerfile
         dockerfile_lines = [
             f"FROM {self.docker_image}",
             "WORKDIR /app",
             "RUN mkdir -p /app/data /app/output"
         ]
 
-        # 只有当 requirements 变化时，build 才会耗时
         if os.path.exists(self.requirements_path):
-            # 临时复制一份用于 build
             shutil.copy2(self.requirements_path, os.path.join(temp_dir, "requirements.txt"))
             dockerfile_lines.extend([
                 "COPY requirements.txt .",
                 "RUN pip install --no-cache-dir -r requirements.txt",
             ])
 
-
-        # To zhenwei：我改了一下，数据通过 volume mount 挂载，不需要在 Dockerfile 中 COPY
-        # 这样可以避免数据重复，并且支持大文件
-
-        # 设置执行命令
         dockerfile_lines.append('CMD ["python", "code.py"]')
 
         dockerfile_content = "\n".join(dockerfile_lines)
@@ -109,11 +154,7 @@ class CodeExecutor:
         return dockerfile_path
 
     def _prepare_temp_directory(self, temp_dir: str) -> None:
-        """准备临时目录内容"""
-        # 复制代码文件
         shutil.copy2(self.code_path, os.path.join(temp_dir, 'code.py'))
-
-        # 复制requirements.txt（如果存在）
         if os.path.exists(self.requirements_path):
             shutil.copy2(self.requirements_path, os.path.join(temp_dir, 'requirements.txt'))
 
@@ -123,14 +164,6 @@ class CodeExecutor:
                 timeout: int | None = 300) -> dict:
         """
         使用卷挂载执行代码
-
-        Args:
-            environment_vars: 环境变量
-            mem_limit: 内存限制
-            timeout: 执行超时时间（秒）
-
-        Returns:
-            包含执行结果的字典
         """
         if not self.docker_available:
             return {
@@ -142,73 +175,49 @@ class CodeExecutor:
 
         with tempfile.TemporaryDirectory() as temp_dir:
             try:
-                # 准备文件
                 self._prepare_temp_directory(temp_dir)
-
-                # 生成唯一的镜像标签
                 import uuid
                 image_tag = f"code-executor-{uuid.uuid4().hex[:8]}"
 
-                # 构建Docker镜像
                 self.logger.info(f"构建Docker镜像: {image_tag}")
+                self._create_dockerfile(temp_dir)
 
-                dockerfile_path = self._create_dockerfile(temp_dir)
-
-                build_logs = self.client.images.build(
+                self.client.images.build(
                     path=temp_dir,
                     tag=image_tag,
                     rm=True,
                     forcerm=True
                 )
 
-                # 解析卷挂载
-                volumes = {}
-                if self.volume_mounts:
-                    for host_path, container_path in self.volume_mounts.items():
-                        if isinstance(container_path, dict):
-                            # 已经是Docker SDK格式
-                            volumes[host_path] = container_path
-                        else:
-                            # 转换为Docker SDK格式
-                            volumes[host_path] = {
-                                'bind': container_path,
-                                'mode': 'rw'
-                            }
+                # --- 关键修改 4：不需要解析 volumes 字典，直接使用列表 ---
+                # self.volume_mounts 已经是符合 Docker SDK 格式的列表了
 
-                # 准备环境变量
                 env_vars = {
-                    'PYTHONUNBUFFERED': '1',  # 实时输出
-                    'DEBIAN_FRONTEND': 'noninteractive',  # 非交互模式
-                    'MPLCONFIGDIR': '/tmp/matplotlib',  # Matplotlib缓存
-                    'NUMBA_CACHE_DIR': '/tmp/numba',    # Numba缓存
-                    'HOME': '/tmp',                     # HOME目录
-                    'PYTHONPYCACHEPREFIX': '/tmp/__pycache__',  # Python缓存
+                    'PYTHONUNBUFFERED': '1',
+                    'DEBIAN_FRONTEND': 'noninteractive',
+                    'MPLCONFIGDIR': '/tmp/matplotlib',
+                    'NUMBA_CACHE_DIR': '/tmp/numba',
+                    'HOME': '/tmp',
+                    'PYTHONPYCACHEPREFIX': '/tmp/__pycache__',
                 }
                 if environment_vars:
                     env_vars.update(environment_vars)
 
-                # 运行容器
                 self.logger.info(f"运行容器，镜像: {image_tag}")
-                if self.data_mount_path:
-                    self.logger.info(f"数据目录挂载: {self.data_mount_path} -> /app/data")
-                    if self.data_file_name:
-                        self.logger.info(f"数据文件名: {self.data_file_name} (在容器内路径: /app/data/{self.data_file_name})")
-
+                
                 user = f"{os.getuid()}:{os.getgid()}"
-                print(f"Using user: {user}")
-
+                
                 container = self.client.containers.run(
                     image=image_tag,
-                    volumes=volumes,
+                    volumes=self.volume_mounts,  # <--- 直接传列表
                     environment=env_vars,
                     user=user,
                     mem_limit=mem_limit,
                     network_mode='bridge',
                     detach=True,
-                    auto_remove=False  # 手动控制删除
+                    auto_remove=False
                 )
 
-                # 等待容器完成
                 try:
                     container.wait(timeout=timeout)
                 except Exception as e:
@@ -223,10 +232,8 @@ class CodeExecutor:
                         'files': []
                     }
 
-                # 获取容器输出
                 logs = container.logs().decode('utf-8').strip()
 
-                # 收集输出文件信息
                 output_files = []
                 if self.output_dir:
                     output_path = Path(self.output_dir)
@@ -239,7 +246,6 @@ class CodeExecutor:
                                 'size_mb': file_path.stat().st_size / (1024 * 1024)
                             })
 
-                # 清理
                 container.remove(force=True)
                 self.client.images.remove(image=image_tag, force=True)
 
@@ -267,4 +273,3 @@ class CodeExecutor:
                     'output': '',
                     'files': []
                 }
-

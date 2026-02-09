@@ -10,7 +10,7 @@ from .state import CriticAgentState
 from src.core.llm import get_llm
 
 # 初始化 LLM
-llm = get_llm(model_name="qwen-plus", temperature=0.5)
+llm = get_llm(temperature=0.5)
 llm_vision = get_llm(model_name="qwen-vl-plus", temperature=0.2)
 
 # --- 全局 System Prompt --- 
@@ -56,7 +56,8 @@ def _normalize_base64_image(image_b64: str, default_mime: str = "image/png") -> 
     return f"data:{default_mime};base64,{b64}"
 
 
-def check_umap_image(image_base64: str, query: str) -> str:
+def check_umap_image(image_base64: str, query: str, expected_output: str = None, 
+                     step_context: dict = None) -> str:
     """审核 UMAP 图片质量"""
     image_system_prompt = """
     --- Visualization Review Task ---
@@ -89,7 +90,25 @@ def check_umap_image(image_base64: str, query: str) -> str:
     # 完整 System Prompt
     full_system_prompt = f"{CRITIC_SYSTEM_PROMPT}\n{image_system_prompt}"
     
-    user_prompt = f"User question: {query}"
+    # 构建步骤上下文信息
+    step_context_note = ""
+    if step_context:
+        step_name = step_context.get("step_name", "")
+        step_num = step_context.get("step_num", "")
+        total_steps = step_context.get("total_steps", "")
+        step_context_note = f"\n\n【重要上下文】这是多步骤任务中的一步：\n"
+        if step_num and total_steps:
+            step_context_note += f"- 当前步骤：步骤 {step_num}/{total_steps}\n"
+        if step_name:
+            step_context_note += f"- 步骤名称：{step_name}\n"
+        step_context_note += "- 请只关注当前步骤的验收标准，不要要求完成整个任务的所有步骤。\n"
+        step_context_note += "- 只要当前步骤的输出满足其验收标准，就应该通过审核。\n"
+    
+    expected_output_note = ""
+    if expected_output:
+        expected_output_note = f"\n\n【当前步骤的验收标准】\n{expected_output}\n请特别关注图片是否能够满足上述验收标准。"
+    
+    user_prompt = f"User question: {query}{step_context_note}{expected_output_note}"
     
     try:
         data_url = _normalize_base64_image(image_base64)
@@ -108,7 +127,8 @@ def check_umap_image(image_base64: str, query: str) -> str:
     return response.content
 
 
-def check_code(content: str, query: str) -> str:
+def check_code(content: str, query: str, expected_output: str = None, 
+               step_context: dict = None) -> str:
     """审核代码"""
     code_system_prompt = """
     你是一个资深代码审查员。
@@ -119,9 +139,28 @@ def check_code(content: str, query: str) -> str:
     4. 代码逻辑是否合理？
     """
     
+    # 构建步骤上下文信息
+    step_context_note = ""
+    if step_context:
+        step_name = step_context.get("step_name", "")
+        step_num = step_context.get("step_num", "")
+        total_steps = step_context.get("total_steps", "")
+        step_context_note = f"\n\n【重要上下文】这是多步骤任务中的一步：\n"
+        if step_num and total_steps:
+            step_context_note += f"- 当前步骤：步骤 {step_num}/{total_steps}\n"
+        if step_name:
+            step_context_note += f"- 步骤名称：{step_name}\n"
+        step_context_note += "- 请只关注当前步骤的验收标准，不要要求完成整个任务的所有步骤。\n"
+        step_context_note += "- 只要当前步骤的代码能够满足其验收标准，就应该通过审核。\n"
+    
+    expected_output_note = ""
+    if expected_output:
+        expected_output_note = f"\n\n【当前步骤的验收标准】\n{expected_output}\n请特别关注代码是否能够满足上述验收标准。"
+    
     user_prompt = f"""
     用户问题: {query}
     待审核代码: {content}
+    {step_context_note}{expected_output_note}
     """
     
     response = llm.invoke([
@@ -132,7 +171,8 @@ def check_code(content: str, query: str) -> str:
     return response.content
 
 
-def check_docs(content: list, query: str) -> str:
+def check_docs(content: list, query: str, expected_output: str = None, 
+              step_context: dict = None) -> str:
     """审核文献"""
     docs_str = "\n".join(content) if isinstance(content, list) else str(content)
     
@@ -144,9 +184,28 @@ def check_docs(content: list, query: str) -> str:
     3. 文献质量是否可靠？
     """
     
+    # 构建步骤上下文信息
+    step_context_note = ""
+    if step_context:
+        step_name = step_context.get("step_name", "")
+        step_num = step_context.get("step_num", "")
+        total_steps = step_context.get("total_steps", "")
+        step_context_note = f"\n\n【重要上下文】这是多步骤任务中的一步：\n"
+        if step_num and total_steps:
+            step_context_note += f"- 当前步骤：步骤 {step_num}/{total_steps}\n"
+        if step_name:
+            step_context_note += f"- 步骤名称：{step_name}\n"
+        step_context_note += "- 请只关注当前步骤的验收标准，不要要求完成整个任务的所有步骤。\n"
+        step_context_note += "- 只要当前步骤检索到的文献能够满足其验收标准，就应该通过审核。\n"
+    
+    expected_output_note = ""
+    if expected_output:
+        expected_output_note = f"\n\n【当前步骤的验收标准】\n{expected_output}\n请特别关注检索到的文献是否能够满足上述验收标准。"
+    
     user_prompt = f"""
     用户问题: {query}
     检索到的文献: {docs_str}
+    {step_context_note}{expected_output_note}
     """
     
     response = llm.invoke([
@@ -157,18 +216,39 @@ def check_docs(content: list, query: str) -> str:
     return response.content
 
 
-def check_db(content: str, query: str) -> str:
+def check_db(content: str, query: str, expected_output: str = None, 
+            step_context: dict = None) -> str:
     """审核数据库结果"""
     db_system_prompt = """
     你是一个数据分析师。
     请检查：
     1. 数据格式是否正确？
     2. 是否为空结果？
+    3. 结果是否满足预期要求？
     """
+    
+    # 构建步骤上下文信息
+    step_context_note = ""
+    if step_context:
+        step_name = step_context.get("step_name", "")
+        step_num = step_context.get("step_num", "")
+        total_steps = step_context.get("total_steps", "")
+        step_context_note = f"\n\n【重要上下文】这是多步骤任务中的一步：\n"
+        if step_num and total_steps:
+            step_context_note += f"- 当前步骤：步骤 {step_num}/{total_steps}\n"
+        if step_name:
+            step_context_note += f"- 步骤名称：{step_name}\n"
+        step_context_note += "- 请只关注当前步骤的验收标准，不要要求完成整个任务的所有步骤。\n"
+        step_context_note += "- 只要当前步骤的查询结果能够满足其验收标准，就应该通过审核。\n"
+    
+    expected_output_note = ""
+    if expected_output:
+        expected_output_note = f"\n\n【当前步骤的验收标准】\n{expected_output}\n请特别关注查询结果是否能够满足上述验收标准。"
     
     user_prompt = f"""
     用户问题: {query}
     数据库查询结果: {content}
+    {step_context_note}{expected_output_note}
     """
     
     response = llm.invoke([
@@ -188,7 +268,27 @@ def review_contribution(state: CriticAgentState) -> CriticAgentState:
     query = state.get("user_query", "")
     last_worker = state.get("last_worker", "")
     
+    # 获取当前步骤的预期输出和计划信息
+    expected_output = state.get("current_step_expected_output")
+    plan = state.get("plan", [])
+    current_step_index = state.get("current_step_index", 0)
+    
+    # 构建步骤上下文信息
+    step_context = None
+    if plan and current_step_index < len(plan):
+        current_step = plan[current_step_index]
+        step_context = {
+            "step_name": current_step.name,
+            "step_num": str(current_step_index + 1),
+            "total_steps": str(len(plan)),
+            "step_description": current_step.description
+        }
+    
     print(f"--- [Critic] 正在审核 {last_worker} 的产出 ---")
+    if step_context:
+        print(f"  --> 步骤 {step_context['step_num']}/{step_context['total_steps']}: {step_context['step_name']}")
+    if expected_output:
+        print(f"  --> 验收标准: {expected_output[:100]}...")
     
     if pending is None:
         feedback = "未找到待审核内容"
@@ -204,35 +304,35 @@ def review_contribution(state: CriticAgentState) -> CriticAgentState:
         "umap_base64" in pending or "image_base64" in pending
     ):
         image_b64 = pending.get("umap_base64") or pending.get("image_base64")
-        feedback = check_umap_image(image_b64, query)
+        feedback = check_umap_image(image_b64, query, expected_output, step_context)
         state["content_type"] = "image"
     
     # 检查是否是代码
     elif isinstance(pending, dict) and "code" in pending:
         code = pending.get("code", "")
-        feedback = check_code(code, query)
+        feedback = check_code(code, query, expected_output, step_context)
         state["content_type"] = "code"
     
     # 检查是否是文档列表
     elif isinstance(pending, list) or (isinstance(pending, dict) and "docs" in str(pending)):
         docs = pending if isinstance(pending, list) else pending.get("docs", [])
-        feedback = check_docs(docs, query)
+        feedback = check_docs(docs, query, expected_output, step_context)
         state["content_type"] = "docs"
     
     # 检查是否是数据库结果
     elif isinstance(pending, str) or (isinstance(pending, dict) and "result" in str(pending)):
         content = pending if isinstance(pending, str) else str(pending.get("result", ""))
-        feedback = check_db(content, query)
+        feedback = check_db(content, query, expected_output, step_context)
         state["content_type"] = "db_result"
     
     else:
         # 通用审核
         content_str = str(pending)
         if "code" in content_str.lower() or "def " in content_str or "import " in content_str:
-            feedback = check_code(content_str, query)
+            feedback = check_code(content_str, query, expected_output, step_context)
             state["content_type"] = "code"
         else:
-            feedback = check_docs([content_str], query)
+            feedback = check_docs([content_str], query, expected_output, step_context)
             state["content_type"] = "docs"
     
     # 判断是否通过
