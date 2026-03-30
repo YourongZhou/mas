@@ -13,7 +13,7 @@ except ImportError:
         """简单的消息合并函数"""
         return left + right
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 class PlanStep(BaseModel):
     """定义单个执行步骤"""
@@ -27,6 +27,14 @@ class PlanStep(BaseModel):
         default=None,
         description="可选：绑定的 workflow 技能 id（mas_2/workflows/<id>/SKILL.md），与领域 SOP 对齐",
     )
+
+    @field_validator("acceptance_criteria", mode="before")
+    @classmethod
+    def normalize_acceptance_criteria(cls, value):
+        # 兼容部分 API 返回 list[str] 的情况，统一归一化为单个字符串。
+        if isinstance(value, list):
+            return "\n".join(str(item).strip() for item in value if str(item).strip())
+        return value
 
 class GlobalState(TypedDict):
     """

@@ -173,22 +173,22 @@ class CodeExecutor:
                 env_vars = {
                     'PYTHONUNBUFFERED': '1',
                     'DEBIAN_FRONTEND': 'noninteractive',
-                    'MPLCONFIGDIR': '/app/output/.mas_mpl',
-                    'NUMBA_CACHE_DIR': '/app/output/.mas_numba',
+                    'MPLCONFIGDIR': '/tmp/mas_runtime/.mas_mpl',
+                    'NUMBA_CACHE_DIR': '/tmp/mas_runtime/.mas_numba',
                     'HOME': '/tmp',
-                    'PYTHONPYCACHEPREFIX': '/app/output/.mas_pycache',
+                    'PYTHONPYCACHEPREFIX': '/tmp/mas_runtime/.mas_pycache',
                     'PIP_DISABLE_PIP_VERSION_CHECK': '1',
                 }
                 if environment_vars:
                     env_vars.update(environment_vars)
 
                 # set -e：pip 失败则不再执行 python，避免「装包失败仍跑代码」导致 ModuleNotFoundError 误导。
-                # --target /app/output/.mas_pydeps：依赖装在挂载卷上，避免容器 /tmp 爆满与非 root 下 user-site 不一致。
-                # TMPDIR 指向 /app/output：pip 解压大 wheel 时不占满容器临时层。
+                # 运行时依赖与缓存写入容器 /tmp，避免污染宿主输出目录并减少文件监听噪声。
                 _container_script = """set -e
 export PYTHONPATH="/app/workflow${PYTHONPATH:+:$PYTHONPATH}"
-DEPS=/app/output/.mas_pydeps
-export TMPDIR=/app/output/.mas_tmp
+RUNTIME_ROOT=/tmp/mas_runtime
+DEPS="$RUNTIME_ROOT/.mas_pydeps"
+export TMPDIR="$RUNTIME_ROOT/.mas_tmp"
 mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPREFIX"
 if [ -f /app/requirements.txt ] && [ -s /app/requirements.txt ]; then
   python -m pip install --no-cache-dir --upgrade -r /app/requirements.txt --target "$DEPS"
@@ -239,6 +239,8 @@ python /app/code.py"""
                     output_path = Path(self.output_dir)
                     for file_path in output_path.rglob('*'):
                         if file_path.is_file():
+                            if any(part.startswith('.mas_') for part in file_path.parts):
+                                continue
                             output_files.append({
                                 'path': str(file_path),
                                 'name': file_path.name,

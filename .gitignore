@@ -18,11 +18,11 @@ mas_2/data/*
 mas_2/notebooks/cache/*
 mas_2/notebooks/result/*
 mas_2/chroma_db/*
-mas_2/.chainlit/*
 mas_2/results/*
 mas_2/result/*
 mas_2/rag_docs/*
 mas_2/tmp_minerU_md/*
 mas_2/*.ipynb
+mas_2/workflows/*
 **/__pycache__/
 mas_2/workflows/*
