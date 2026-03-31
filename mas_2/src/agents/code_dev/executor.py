@@ -17,9 +17,9 @@ logging.basicConfig(level=logging.INFO)
 class CodeExecutor:
     """使用 Docker 容器执行代码的执行器"""
     
-    def __init__(self, docker_path: str, data_dir: str = None, data_dirs: list = None,
+    def __init__(self, docker_path: str = None, data_dir: str = None, data_dirs: list = None,
                  output_dir: str = None, input_files: list = None,
-                 workflow_host_path: str = None):
+                 workflow_host_path: str = None, container_id: str = None):
         """
         初始化代码执行器
 
@@ -27,10 +27,11 @@ class CodeExecutor:
         """
         self.logger = logging.getLogger(__name__)
         self.docker_available = self._check_docker_availability()
-        self.code_path = f"{docker_path}/code.py"
-        self.requirements_path = f"{docker_path}/requirements.txt"
+        self.code_path = f"{docker_path}/code.py" if docker_path else None
+        self.requirements_path = f"{docker_path}/requirements.txt" if docker_path else None
         self.output_dir = output_dir if output_dir else "/tmp/output"  # 默认输出目录
         self.docker_image = "python:3.13-slim"
+        self.container_id = container_id
         
         # --- 关键修改 1：使用列表存储挂载信息，避免字典 Key 冲突 ---
         self.volume_mounts = []
@@ -49,16 +50,7 @@ class CodeExecutor:
         self.data_mount_path = self.data_dirs[0] if self.data_dirs else None
         self.data_file_name = None
         
-        # 挂载代码文件 (将宿主机的 code.py 挂载到容器的 /app/code.py)
-        if os.path.exists(self.code_path):
-            # 格式: host_path:container_path:mode
-            mount_str = f"{os.path.abspath(self.code_path)}:/app/code.py:ro"
-            self.volume_mounts.append(mount_str)
-
-        # 挂载 requirements 文件（如存在）
-        if os.path.exists(self.requirements_path):
-            mount_str = f"{os.path.abspath(self.requirements_path)}:/app/requirements.txt:ro"
-            self.volume_mounts.append(mount_str)
+        # (不再挂载 code.py 和 requirements.txt，改为运行时推送)
 
         # 挂载数据目录（支持多个）
         for idx, data_dir_path in enumerate(self.data_dirs):
@@ -80,7 +72,8 @@ class CodeExecutor:
             # 使用 rw 模式
             mount_str = f"{data_mount_path}:{bind_path}:rw"
             self.volume_mounts.append(mount_str)
-            self.logger.info(f"数据目录挂载: {data_mount_path} -> {bind_path}")
+            if not self.container_id:
+                self.logger.info(f"数据目录挂载: {data_mount_path} -> {bind_path}")
 
         # 挂载输出目录
         if not os.path.exists(self.output_dir):
@@ -94,7 +87,8 @@ class CodeExecutor:
         if workflow_host_path and os.path.isdir(workflow_host_path):
             wf = os.path.abspath(workflow_host_path)
             self.volume_mounts.append(f"{wf}:/app/workflow:ro")
-            self.logger.info(f"Workflow 目录挂载: {wf} -> /app/workflow")
+            if not self.container_id:
+                self.logger.info(f"Workflow 目录挂载: {wf} -> /app/workflow")
     
     def _determine_data_dirs_from_input_files(self, input_files: list):
         """
@@ -192,11 +186,13 @@ class CodeExecutor:
         return "\n".join(lines[-20:]).strip()[-max_chars:]
 
     def execute(self,
+                code_str: str = None,
+                requirements_str: str = None,
                 environment_vars: dict | None = None,
                 mem_limit: str | None = '4g',
-                timeout: int | None = 300) -> dict:
+                timeout: int | None = 600) -> dict:
         """
-        使用卷挂载执行代码
+        使用复用或新建的容器执行代码
         """
         if not self.docker_available:
             return {
@@ -206,11 +202,19 @@ class CodeExecutor:
                 'files': []
             }
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            container = None
-            try:
-                self._prepare_temp_directory(temp_dir)
+        container = None
+        try:
+            # 1. 尝试获取已有容器
+            if self.container_id:
+                try:
+                    container = self.client.containers.get(self.container_id)
+                    if container.status != 'running':
+                        container.start()
+                except docker.errors.NotFound:
+                    container = None
 
+            # 2. 如果无复用容器则新建
+            if container is None:
                 env_vars = {
                     'PYTHONUNBUFFERED': '1',
                     'DEBIAN_FRONTEND': 'noninteractive',
@@ -223,27 +227,10 @@ class CodeExecutor:
                 if environment_vars:
                     env_vars.update(environment_vars)
 
-                # set -e：pip 失败则不再执行 python，避免「装包失败仍跑代码」导致 ModuleNotFoundError 误导。
-                # 运行时依赖与缓存写入容器 /tmp，避免污染宿主输出目录并减少文件监听噪声。
-                _container_script = """set -e
-export PYTHONPATH="/app/workflow${PYTHONPATH:+:$PYTHONPATH}"
-RUNTIME_ROOT=/tmp/mas_runtime
-DEPS="$RUNTIME_ROOT/.mas_pydeps"
-export TMPDIR="$RUNTIME_ROOT/.mas_tmp"
-mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPREFIX"
-if [ -f /app/requirements.txt ] && [ -s /app/requirements.txt ]; then
-  python -m pip install --no-cache-dir --upgrade -r /app/requirements.txt --target "$DEPS"
-fi
-export PYTHONPATH="$DEPS:$PYTHONPATH"
-python /app/code.py"""
-                command = "bash -lc " + shlex.quote(_container_script)
-
-                self.logger.info(f"运行容器，镜像: {self.docker_image}")
-                
                 run_kwargs = {
                     'image': self.docker_image,
-                    'command': command,
-                    'volumes': self.volume_mounts,  # <--- 直接传列表
+                    'command': ['sleep', 'infinity'],
+                    'volumes': self.volume_mounts,
                     'environment': env_vars,
                     'mem_limit': mem_limit,
                     'network_mode': 'bridge',
@@ -254,77 +241,119 @@ python /app/code.py"""
                     try:
                         run_kwargs['user'] = f"{os.getuid()}:{os.getgid()}"
                     except Exception as e:
-                        self.logger.warning(f"无法获取当前用户 UID/GID，将使用 Docker 默认用户: {e}")
+                        self.logger.warning(f"无法获取当前用户 UID/GID: {e}")
 
+                self.logger.info(f"运行驻留容器，镜像: {self.docker_image}")
                 container = self.client.containers.run(**run_kwargs)
+                self.container_id = container.id
 
-                try:
-                    wait_result = container.wait(timeout=timeout)
-                except Exception as e:
-                    self.logger.warning(f"容器等待超时或出错: {e}")
-                    try:
-                        container.stop(timeout=10)
-                    except Exception as stop_err:
-                        self.logger.warning(f"容器停止失败: {stop_err}")
-                    return {
-                        'success': False,
-                        'error': f'执行超时: {e}',
-                        'output': '',
-                        'files': []
-                    }
+            # 3. 将代码和 requirements 放入容器内
+            import tarfile
+            import io
+            pw_tarstream = io.BytesIO()
+            with tarfile.open(fileobj=pw_tarstream, mode='w') as tar:
+                # 写入 code.py
+                code_content = code_str or ""
+                if not code_content and self.code_path and os.path.exists(self.code_path):
+                    with open(self.code_path, 'r', encoding='utf-8') as f:
+                        code_content = f.read()
+                if code_content:
+                    c_bytes = code_content.encode('utf-8')
+                    tinfo = tarfile.TarInfo(name='code.py')
+                    tinfo.size = len(c_bytes)
+                    tar.addfile(tinfo, io.BytesIO(c_bytes))
 
-                logs = container.logs().decode('utf-8', errors='replace').strip()
-                status_code = 0
-                if isinstance(wait_result, dict):
-                    status_code = int(wait_result.get('StatusCode', 0) or 0)
-                elif isinstance(wait_result, int):
-                    status_code = wait_result
+                # 写入 requirements.txt
+                req_content = requirements_str or ""
+                if not req_content and self.requirements_path and os.path.exists(self.requirements_path):
+                    with open(self.requirements_path, 'r', encoding='utf-8') as f:
+                        req_content = f.read()
+                if req_content:
+                    r_bytes = req_content.encode('utf-8')
+                    tinfo = tarfile.TarInfo(name='requirements.txt')
+                    tinfo.size = len(r_bytes)
+                    tar.addfile(tinfo, io.BytesIO(r_bytes))
 
-                output_files = []
-                if self.output_dir:
-                    output_path = Path(self.output_dir)
-                    for file_path in output_path.rglob('*'):
-                        if file_path.is_file():
-                            if any(part.startswith('.mas_') for part in file_path.parts):
-                                continue
-                            output_files.append({
-                                'path': str(file_path),
-                                'name': file_path.name,
-                                'size': file_path.stat().st_size,
-                                'size_mb': file_path.stat().st_size / (1024 * 1024)
-                            })
+            pw_tarstream.seek(0)
+            self.logger.info(f"正在将最新代码与依赖推送到容器 {self.container_id[:12]} 内的 /app 目录...")
+            container.put_archive('/app', pw_tarstream.read())
 
-                if status_code != 0:
-                    err = self._extract_error_summary(logs)
-                    if not err:
-                        err = f"容器退出码非0: {status_code}"
-                    return {
-                        'success': False,
-                        'error': err,
-                        'output': logs,
-                        'files': output_files,
-                        'container_id': container.id[:12],
-                        'exit_code': status_code,
-                    }
+            # 4. 执行代码 (使用 timeout 命令限制执行时间)
+            _container_script = """set -e
+export PYTHONPATH="/app/workflow${PYTHONPATH:+:$PYTHONPATH}"
+RUNTIME_ROOT=/tmp/mas_runtime
+DEPS="$RUNTIME_ROOT/.mas_pydeps"
+export TMPDIR="$RUNTIME_ROOT/.mas_tmp"
+mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPREFIX"
+if [ -f /app/requirements.txt ] && [ -s /app/requirements.txt ]; then
+  python -m pip install -r /app/requirements.txt --target "$DEPS"
+fi
+export PYTHONPATH="$DEPS:$PYTHONPATH"
+python /app/code.py"""
 
-                return {
-                    'success': True,
-                    'output': logs,
-                    'files': output_files,
-                    'container_id': container.id[:12],
-                    'exit_code': status_code,
-                }
-            except Exception as e:
-                self.logger.error(f"执行失败: {e}")
+            command = f"timeout {timeout} bash -lc " + shlex.quote(_container_script)
+            
+            user = f"{os.getuid()}:{os.getgid()}" if hasattr(os, 'getuid') else ''
+            
+            self.logger.info(f"正在容器 {self.container_id[:12]} 内执行代码 (超时设置: {timeout}s)...")
+            exec_result = container.exec_run(
+                cmd=command,
+                user=user,
+                demux=False
+            )
+            
+            status_code = exec_result.exit_code
+            logs = exec_result.output.decode('utf-8', errors='replace').strip() if exec_result.output else ""
+
+            if status_code == 124: # timeout 命令的超时退出码
                 return {
                     'success': False,
-                    'error': str(e),
-                    'output': '',
-                    'files': []
+                    'error': f'执行超时 ({timeout}s)',
+                    'output': logs,
+                    'files': [],
+                    'container_id': self.container_id,
                 }
-            finally:
-                if container is not None:
-                    try:
-                        container.remove(force=True)
-                    except Exception as remove_container_err:
-                        self.logger.warning(f"容器清理失败: {remove_container_err}")
+
+            output_files = []
+            if self.output_dir:
+                output_path = Path(self.output_dir)
+                for file_path in output_path.rglob('*'):
+                    if file_path.is_file():
+                        if any(part.startswith('.mas_') for part in file_path.parts):
+                            continue
+                        output_files.append({
+                            'path': str(file_path),
+                            'name': file_path.name,
+                            'size': file_path.stat().st_size,
+                            'size_mb': file_path.stat().st_size / (1024 * 1024)
+                        })
+
+            if status_code != 0:
+                err = self._extract_error_summary(logs)
+                if not err:
+                    err = f"容器退出码非0: {status_code}"
+                return {
+                    'success': False,
+                    'error': err,
+                    'output': logs,
+                    'files': output_files,
+                    'container_id': self.container_id,
+                    'exit_code': status_code,
+                }
+
+            return {
+                'success': True,
+                'output': logs,
+                'files': output_files,
+                'container_id': self.container_id,
+                'exit_code': status_code,
+            }
+        except Exception as e:
+            self.logger.error(f"执行失败: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'output': '',
+                'files': [],
+                'container_id': self.container_id
+            }

@@ -24,5 +24,6 @@ mas_2/rag_docs/*
 mas_2/tmp_minerU_md/*
 mas_2/*.ipynb
 mas_2/workflows/*
+mas_2/logs/*
 **/__pycache__/
 mas_2/workflows/*
