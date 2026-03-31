@@ -246,11 +246,20 @@ def extract_paths_from_state(state: CodeAgentState) -> CodeAgentState:
     优先级：
     1. state 中已有的路径（如果存在）
     2. 从 user_query 中解析的路径
-    3. 默认值（result_path 默认为 "./result"）
+    3. 默认值（result_path 会为每个任务生成唯一的隔离目录，例如 "./result/<task_id>"）
     """
+    import uuid
+    # 获取或生成任务唯一 ID
+    task_id = state.get("task_id")
+    if not task_id:
+        task_id = uuid.uuid4().hex[:8]
+        state["task_id"] = task_id
+
     # 如果 state 中已经有路径，优先使用（但允许从查询中补充缺失的路径）
     has_data_path = bool(state.get("data_path"))
     has_result_path = bool(state.get("result_path"))
+
+    default_result_path = os.path.join(".", "result", task_id).replace("\\", "/")
 
     # 从 user_query 中解析路径
     user_query = state.get("user_query", "")
@@ -277,11 +286,13 @@ def extract_paths_from_state(state: CodeAgentState) -> CodeAgentState:
             print(f"  --> 从用户查询中解析到结果路径: {parsed_paths['result_path']}")
         elif not has_result_path:
             # 如果没有解析到且 state 中也没有，使用默认值
-            state["result_path"] = "./result"
+            state["result_path"] = default_result_path
+            print(f"  --> 为当前任务分配默认结果隔离路径: {state['result_path']}")
 
     # 确保 result_path 有默认值
     if not state.get("result_path"):
-        state["result_path"] = "./result"
+        state["result_path"] = default_result_path
+        print(f"  --> 为当前任务分配默认结果隔离路径: {state['result_path']}")
 
     return state
 

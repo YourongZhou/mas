@@ -215,6 +215,25 @@ def make_decision(state: SupervisorAgentState) -> SupervisorAgentState:
     
     # 获取当前状态
     user_query = state.get("user_query", "")
+
+    # 判断并初始化 result_path 和 task_id
+    result_path = state.get("result_path")
+    if not result_path:
+        # 如果尚未提取路径，则尝试解析并生成结果路径目录
+        try:
+            from src.agents.code_dev.graph import extract_paths_from_state
+            # typed dict 转换为包含 CodeAgentState 特有字段的假 dict，或者直接传因为 python dict 是鸭子类型
+            state = extract_paths_from_state(state)
+        except Exception as e:
+            # 万一模块导入出错，提供后备处理
+            import os
+            import uuid
+            task_id = state.get("task_id", uuid.uuid4().hex[:8])
+            state["task_id"] = task_id
+            state["result_path"] = os.path.join(".", "result", task_id).replace("\\", "/")
+            
+    # 从中读出最新的 plan 和由于上方代码可能更新出的 result_path
+    result_path = state.get("result_path", "./result")
     plan = state.get("plan", [])
     current_step_index = state.get("current_step_index", 0)
     rag_context = state.get("rag_context", "")
@@ -223,7 +242,6 @@ def make_decision(state: SupervisorAgentState) -> SupervisorAgentState:
     is_approved = state.get("is_approved", False)
     last_worker = state.get("last_worker", "")
     pending_contribution = state.get("pending_contribution")
-    result_path = state.get("result_path", "./result")
     
     # 如果计划为空，先生成计划
     if not plan:

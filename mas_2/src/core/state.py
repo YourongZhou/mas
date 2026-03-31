@@ -48,6 +48,8 @@ class GlobalState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     # 用户的原始查询
     user_query: str
+    # 任务唯一 ID（用于隔离不同任务的结果）
+    task_id: str
 
     # === 任务执行字段 ===
     plan: List[PlanStep]          # 完整的计划列表
