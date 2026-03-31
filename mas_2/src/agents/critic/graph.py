@@ -102,15 +102,15 @@ def check_umap_image(image_base64: str, query: str, expected_output: str = None,
     except ValueError as exc:
         return f"INVALID_IMAGE: {exc}"
 
-    message = HumanMessage(
-        content=[
-            {"type": "text", "text": CRITIC_SYSTEM_PROMPT},
-            {"type": "text", "text": full_system_prompt},
-            {"type": "text", "text": user_prompt},
-            {"type": "image_url", "image_url": {"url": data_url}},
-        ]
-    )
-    response = llm_vision.invoke([message])
+    response = llm_vision.invoke([
+        SystemMessage(content=full_system_prompt),
+        HumanMessage(
+            content=[
+                {"type": "text", "text": user_prompt},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]
+        ),
+    ])
     return response.content
 
 
@@ -173,9 +173,9 @@ def check_code(content: str, query: str, execution_result: str = None,
     {step_context_note}{expected_output_note}{skill_extra}
     """
     
+    merged_system_prompt = f"{CRITIC_SYSTEM_PROMPT}\n\n{code_system_prompt}"
     response = llm.invoke([
-        SystemMessage(content=CRITIC_SYSTEM_PROMPT),
-        SystemMessage(content=code_system_prompt),
+        SystemMessage(content=merged_system_prompt),
         HumanMessage(content=user_prompt)
     ])
     return response.content
@@ -209,9 +209,9 @@ def check_docs(content: list, query: str, expected_output: str = None,
     {step_context_note}{expected_output_note}
     """
     
+    merged_system_prompt = f"{CRITIC_SYSTEM_PROMPT}\n\n{docs_system_prompt}"
     response = llm.invoke([
-        SystemMessage(content=CRITIC_SYSTEM_PROMPT),
-        SystemMessage(content=docs_system_prompt),
+        SystemMessage(content=merged_system_prompt),
         HumanMessage(content=user_prompt)
     ])
     return response.content
@@ -242,9 +242,9 @@ def check_db(content: str, query: str, expected_output: str = None,
     {step_context_note}{expected_output_note}
     """
     
+    merged_system_prompt = f"{CRITIC_SYSTEM_PROMPT}\n\n{db_system_prompt}"
     response = llm.invoke([
-        SystemMessage(content=CRITIC_SYSTEM_PROMPT),
-        SystemMessage(content=db_system_prompt),
+        SystemMessage(content=merged_system_prompt),
         HumanMessage(content=user_prompt)
     ])
     return response.content

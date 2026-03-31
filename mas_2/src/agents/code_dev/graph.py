@@ -54,6 +54,47 @@ def _exec_output_tail(text: str, n_lines: int) -> str:
     return "\n".join(lines[-n_lines:])
 
 
+def _extract_informative_error(text: str, max_chars: int = 2000) -> str:
+    """从长日志中提取最有信息量的末尾报错片段。"""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+
+    tb_matches = list(
+        re.finditer(
+            r"Traceback \(most recent call last\):[\s\S]*?(?=\n\n|\Z)",
+            raw,
+            re.DOTALL,
+        )
+    )
+    if tb_matches:
+        return tb_matches[-1].group(0).strip()[-max_chars:]
+
+    lines = raw.splitlines()
+    err_keys = (
+        "ModuleNotFoundError",
+        "ImportError",
+        "TypeError",
+        "ValueError",
+        "AttributeError",
+        "NameError",
+        "KeyError",
+        "IndexError",
+        "RuntimeError",
+        "Exception",
+        "Error",
+        "failed",
+        "unable to",
+    )
+    for i in range(len(lines) - 1, -1, -1):
+        if any(k.lower() in lines[i].lower() for k in err_keys):
+            start = max(0, i - 6)
+            snippet = "\n".join(lines[start : i + 1]).strip()
+            return snippet[-max_chars:]
+
+    return _exec_output_tail(raw, 40)[-max_chars:]
+
+
 def _tail_line_count() -> int:
     try:
         return max(10, int(os.environ.get("MAS_EXEC_OUTPUT_TAIL_LINES", "80")))
@@ -257,10 +298,10 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
     
     final_feedback = ""
     if critic_feedback:
-        print(f"  --> 收到 Critic 的驳回意见: {critic_feedback[:50]}...")
+        print(f"  --> 收到 Critic 的驳回意见: {critic_feedback[:500]}...")
         final_feedback = critic_feedback
     elif internal_feedback:
-        print(f"  --> 收到内部执行的错误反馈: {internal_feedback[:50]}...")
+        print(f"  --> 收到内部执行的错误反馈: {internal_feedback[:500]}...")
         final_feedback = internal_feedback
 
     # 首先从 user_query 中提取路径（如果 state 中没有）
@@ -783,10 +824,8 @@ except Exception as e:
         try:
             result = executor.execute(timeout=600)  # 10分钟超时
 
-            # 打印执行日志（控制台预览；完整 stdout 默认不入 state，见 MAS_KEEP_FULL_EXEC_OUTPUT_IN_STATE / MAS_SAVE_FULL_EXEC_LOG）
+            # 控制台仅输出关键摘要，避免安装依赖等噪声日志淹没真实错误。
             output_str = result.get('output', '')
-            _log_preview = output_str if len(output_str) <= 2000 else output_str[:2000] + "\n... (共 {} 字符，完整内容见界面)".format(len(output_str))
-            print(f"【Docker代码执行日志】\n{_log_preview}")
 
             # 检查执行是否成功（从executor返回的success字段）
             executor_success = result.get('success', True)
@@ -796,13 +835,39 @@ except Exception as e:
                 'Traceback', 'Error:', 'Exception:', 'TypeError', 'ValueError', 
                 'AttributeError', 'NameError', 'KeyError', 'IndexError'
             ])
+
+            result_part = ""
+            result_looks_failed = False
+            if "===RESULT===" in output_str:
+                result_part = output_str.split("===RESULT===", 1)[1]
+                if "===" in result_part:
+                    result_part = result_part.split("===", 1)[0]
+                _res_low = result_part.strip().lower()
+                result_looks_failed = any(
+                    hint in _res_low
+                    for hint in (
+                        "analysis failed",
+                        "failed",
+                        "error",
+                        "exception",
+                        "traceback",
+                        "unable to",
+                        "执行失败",
+                    )
+                )
+
+            if executor_success and "===RESULT===" in output_str and not has_error_in_output and not result_looks_failed:
+                _succ = (result_part or "Execution successful").strip()
+                print(f"【Docker执行摘要】SUCCESS: {_succ}")
+            else:
+                _err_summary = str(result.get('error', '') or "").strip() or _extract_informative_error(output_str)
+                if not _err_summary:
+                    _err_summary = "代码执行失败，但未提取到明确错误"
+                print(f"【Docker执行摘要】FAILED: {_err_summary}")
             
             # 提取结果（参考 umap_langgraph.py 的改进）
-            if executor_success and "===RESULT===" in output_str and not has_error_in_output:
+            if executor_success and "===RESULT===" in output_str and not has_error_in_output and not result_looks_failed:
                 # 提取结果部分
-                result_part = output_str.split("===RESULT===")[1]
-                if "===" in result_part:
-                    result_part = result_part.split("===")[0]
                 state["analysis_result"] = result_part.strip()
                 state["success"] = True  # 标记为成功
                 print("  --> 代码执行成功！已提取分析结果")
@@ -851,11 +916,14 @@ except Exception as e:
                     
                     # 如果还是没找到，使用完整输出作为错误信息（便于排查）
                     if not error_msg:
-                        error_msg = output_str.strip()
+                        error_msg = _extract_informative_error(output_str)
                 
                 # 如果仍然没有错误信息，使用默认值
                 if not error_msg:
-                    error_msg = '代码执行失败，但未找到具体错误信息'
+                    if result_looks_failed and result_part.strip():
+                        error_msg = result_part.strip()
+                    else:
+                        error_msg = '代码执行失败，但未找到具体错误信息'
                 
                 # 构建错误信息
                 if "===RESULT===" not in output_str:
@@ -881,7 +949,8 @@ except Exception as e:
             error_msg = f"Docker代码运行失败：{str(e)}"
             _r = locals().get("result")
             _exec_log = (_r.get("output") or "") if isinstance(_r, dict) else ""
-            state["analysis_result"] = f"{error_msg}\\n错误日志：{_exec_log or '无'}"
+            concise_log = _extract_informative_error(_exec_log) if _exec_log else "无"
+            state["analysis_result"] = f"{error_msg}\\n错误日志：{concise_log}"
             state["success"] = False
             print(f"  --> {error_msg}")
 
@@ -985,8 +1054,24 @@ def prepare_retry(state: CodeAgentState) -> CodeAgentState:
     将错误信息作为反馈，用于下一次代码生成
     """
     if not state.get("success", False):
-        state["feedback"] = state.get("analysis_result", "代码执行失败")
-        print(f"  --> 设置反馈信息: {state['feedback']}...")
+        pending = state.get("pending_contribution") or {}
+        feedback = ""
+
+        if isinstance(pending, dict):
+            feedback = _extract_informative_error(str(pending.get("error", "") or ""))
+            if not feedback:
+                feedback = _extract_informative_error(str(pending.get("output_tail", "") or ""))
+            if not feedback:
+                feedback = _extract_informative_error(str(pending.get("output_display", "") or ""))
+
+        if not feedback:
+            feedback = _extract_informative_error(str(state.get("analysis_result", "") or ""))
+        if not feedback:
+            feedback = "代码执行失败"
+
+        state["feedback"] = feedback
+        _preview = feedback if len(feedback) <= 500 else feedback[:500] + "..."
+        print(f"  --> 设置反馈信息: {_preview}")
     return state
 
 

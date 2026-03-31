@@ -8,6 +8,7 @@ import tempfile
 import docker
 import shutil
 import logging
+import re
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
@@ -150,6 +151,46 @@ class CodeExecutor:
         if os.path.exists(self.requirements_path):
             shutil.copy2(self.requirements_path, os.path.join(temp_dir, 'requirements.txt'))
 
+    @staticmethod
+    def _extract_error_summary(logs: str, max_chars: int = 1200) -> str:
+        """从容器日志提取末尾最关键错误，避免安装过程噪声。"""
+        text = (logs or "").strip()
+        if not text:
+            return ""
+
+        tb_matches = list(
+            re.finditer(
+                r"Traceback \(most recent call last\):[\s\S]*?(?=\n\n|\Z)",
+                text,
+                re.DOTALL,
+            )
+        )
+        if tb_matches:
+            return tb_matches[-1].group(0).strip()[-max_chars:]
+
+        lines = text.splitlines()
+        err_keys = (
+            "error:",
+            "exception",
+            "failed",
+            "module not found",
+            "modulenotfounderror",
+            "importerror",
+            "typeerror",
+            "valueerror",
+            "attributeerror",
+            "nameerror",
+            "runtimeerror",
+            "unable to",
+        )
+        for i in range(len(lines) - 1, -1, -1):
+            line_low = lines[i].lower()
+            if any(k in line_low for k in err_keys):
+                start = max(0, i - 6)
+                return "\n".join(lines[start:i + 1]).strip()[-max_chars:]
+
+        return "\n".join(lines[-20:]).strip()[-max_chars:]
+
     def execute(self,
                 environment_vars: dict | None = None,
                 mem_limit: str | None = '4g',
@@ -218,7 +259,7 @@ python /app/code.py"""
                 container = self.client.containers.run(**run_kwargs)
 
                 try:
-                    container.wait(timeout=timeout)
+                    wait_result = container.wait(timeout=timeout)
                 except Exception as e:
                     self.logger.warning(f"容器等待超时或出错: {e}")
                     try:
@@ -232,7 +273,12 @@ python /app/code.py"""
                         'files': []
                     }
 
-                logs = container.logs().decode('utf-8').strip()
+                logs = container.logs().decode('utf-8', errors='replace').strip()
+                status_code = 0
+                if isinstance(wait_result, dict):
+                    status_code = int(wait_result.get('StatusCode', 0) or 0)
+                elif isinstance(wait_result, int):
+                    status_code = wait_result
 
                 output_files = []
                 if self.output_dir:
@@ -248,11 +294,25 @@ python /app/code.py"""
                                 'size_mb': file_path.stat().st_size / (1024 * 1024)
                             })
 
+                if status_code != 0:
+                    err = self._extract_error_summary(logs)
+                    if not err:
+                        err = f"容器退出码非0: {status_code}"
+                    return {
+                        'success': False,
+                        'error': err,
+                        'output': logs,
+                        'files': output_files,
+                        'container_id': container.id[:12],
+                        'exit_code': status_code,
+                    }
+
                 return {
                     'success': True,
                     'output': logs,
                     'files': output_files,
-                    'container_id': container.id[:12]
+                    'container_id': container.id[:12],
+                    'exit_code': status_code,
                 }
             except Exception as e:
                 self.logger.error(f"执行失败: {e}")
