@@ -10,6 +10,7 @@ from .state import SupervisorAgentState
 from src.core.llm import get_llm
 from src.core.state import PlanStep
 from src.utils.workflow_skills import format_skills_catalog_for_prompt
+from .exploration_plan import generate_exploration_plan
 
 # 初始化 LLM
 llm = get_llm(temperature=0.5)
@@ -64,26 +65,28 @@ def generate_plan(state: SupervisorAgentState, retry_count: int = 0, max_retries
 3. 指定必须生成的输出文件路径（如果有）
 4. 包含明确的验收标准，用于判断任务是否成功
 
+【执行前提与背景】
+（如果存在前期的初步数据检查运行结果，请参考上下文信息。接下来只需根据具体要求对核心任务进行结构拆解映射。）
+
 【可用 Workflow 技能目录】
-以下 id 可与步骤绑定（字段 skill_id）；标有【试点】的为早期端到端验收用例，其余技能同样会挂载技能目录供代码引用。
+这里列出了本地目录下的所有可供参考的分析流程（对应 skill_id）。
 {skills_catalog}
 
-【skill_id 规则】
-- 若某步骤明显遵循某一技能的标准流程，请填写对应的 skill_id（与上表 id=`...` 完全一致）。
-- 不确定、或任务与上表无关时，skill_id 可省略（或 null）。
+【skill_id 规则与分析流程规划】
+- 在生成分析流程时，请先阅览上述的技能目录。若发现某个技能的名称或描述非标契合用户的分析任务（例如用户提出要进行基于 Scanpy 的单细胞分析，理应匹配 `scrnaseq-scanpy-core-analysis`），此时你应该为其设置此配套的 `skill_id`。
+- **一旦选定可适配的技能并绑定了 skill_id**，那么对应的“正式分析流程部分”的计划粒度请务必设计的粗粒度一点，通常只需要整合为少数 1 步或 2 步核心动作即可即可（例如：“遵循 Scanpy core analysis 的推荐流程执行质控、降维、聚类并绘制图像”）。过于琐碎的拆分不利于对应组件遵从其原本最佳实践的完整工作流。
+- 如果不确定，或无任何技能相匹配，不需要勉强，可不填写 skill_id（填 null）。
 
 【数据路径与 input_files】
 - 用户若在任务中说明了数据位置（例如「数据路径：…」「输入为 xxx.h5ad」），必须在依赖该数据的步骤的 input_files 中填入具体路径（与原文一致）；不要将路径只写在 description 而遗漏 input_files。
 - 多文件输入时，按依赖顺序列出全部需要的文件路径。
 
 【验收标准 acceptance_criteria】
-- 若步骤填写了 skill_id，验收标准应对齐该技能 SKILL 文档中的交付物与检查点（可用简要条目概括）。
-- 验收标准须可判定：明确输出文件、图表或数值结论应满足什么条件才算成功。
+- 若步骤填写了 skill_id，验收标准应对齐该技能文档中期望产生的高层面结果。
+- 验收标准须可判定：明确打印了什么文本维度指标，或生成了什么图像才能算成功。
 
 【计划粒度要求】
-- 优先生成“最小可执行步骤集”，不要过度拆分。
-- 若用户目标是单一可交付物（例如“绘制一张UMAP图”），通常应规划为 1 个代码执行步骤即可完成。
-- 只有当任务确实存在明显依赖关系时，才拆成多个步骤。
+- 带有 skill_id 的主体分析流程应只包含最小数量的核心调度模块（如一个端到端总控运行步骤）。
 
 【RAG步骤规划原则】
 - 可以自主决定是否加入 RAG 检索步骤。
@@ -95,7 +98,12 @@ def generate_plan(state: SupervisorAgentState, retry_count: int = 0, max_retries
 
 请以 JSON 格式返回计划列表。确保返回的格式完全符合 PlanResponse 模型的要求。"""
     
-    user_prompt = f"""
+    exploration_context = ""
+    if state.get("data_exploration_results"):
+        res_str = "\n\n".join(state["data_exploration_results"])
+        exploration_context = f"\n【前期数据探查结果】\n在正式规划分析流程前，我们已经对输入数据进行了摸底，探查结果如下：\n{res_str}\n请根据上述数据特征规划分析流程。\n"
+
+    user_prompt = f"""{exploration_context}
 用户任务：{user_query}
 结果保存路径：{result_path}
 {retry_hint}
@@ -117,6 +125,16 @@ def generate_plan(state: SupervisorAgentState, retry_count: int = 0, max_retries
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt)
         ]
+        
+        print("\n" + "="*60)
+        print("🔍 [Supervisor Debug] 发送给 LLM 的生成最终计划提示词：")
+        print("[System Prompt]:")
+        print(system_prompt)
+        print("-" * 60)
+        print("[User Prompt]:")
+        print(user_prompt)
+        print("="*60 + "\n")
+        
         response = chain.invoke(messages)
         
         plan = response.plan
@@ -136,8 +154,16 @@ def generate_plan(state: SupervisorAgentState, retry_count: int = 0, max_retries
                 raise ValueError(f"步骤 {i+1} 缺少必填字段")
         
         print(f"  --> 计划生成成功，共 {len(plan)} 个步骤")
+        print("\n" + "="*30 + " 📃 [正式分析计划生成结果] " + "="*30)
         for step in plan:
-            print(f"     步骤 {step.step_id}: {step.name}")
+            print(f"  [步骤 {step.step_id}] {step.name}")
+            print(f"  - 描述: {step.description}")
+            print(f"  - 验收: {step.acceptance_criteria}")
+            print(f"  - 输入: {step.input_files}")
+            print(f"  - 输出: {step.output_files}")
+            print(f"  - Skill: {step.skill_id}")
+            print(f"  " + "-"*40)
+        print("="*80 + "\n")
         
         # 更新状态
         state["plan"] = plan
@@ -245,7 +271,28 @@ def make_decision(state: SupervisorAgentState) -> SupervisorAgentState:
     
     # 如果计划为空，先生成计划
     if not plan:
-        state = generate_plan(state)
+        data_exploration_done = state.get("data_exploration_done", False)
+        try:
+            from src.agents.code_dev.graph import parse_paths_from_query
+            parsed_paths = parse_paths_from_query(user_query)
+            data_path = parsed_paths.get("data_path")
+            has_data = bool(data_path)
+            
+            if not has_data:
+                # 兼容旧版的逻辑如果有的回退
+                input_files = parsed_paths.get("input_files", [])
+                has_data = len(input_files) > 0
+                data_path = input_files[0] if has_data else None
+                
+        except Exception:
+            has_data = False
+            data_path = None
+            
+        if has_data and not data_exploration_done:
+            state = generate_exploration_plan(state, data_path)
+        else:
+            state = generate_plan(state)
+            
         plan = state.get("plan", [])
         current_step_index = state.get("current_step_index", 0)
     
@@ -289,6 +336,15 @@ def make_decision(state: SupervisorAgentState) -> SupervisorAgentState:
     elif plan and current_step_index >= len(plan):
         # 关键收敛条件：计划已完成 + 无待审核内容 + 最近一步已审核通过 -> 直接结束
         if is_approved and not pending_contribution:
+            if not state.get("data_exploration_done", True):
+                print("  --> 探查计划已全部完成且审核通过，进入正式分析计划阶段")
+                state["data_exploration_done"] = True
+                state["plan"] = []
+                state["current_step_index"] = 0
+                state["is_approved"] = False
+                state["last_worker"] = "supervisor"
+                return make_decision(state)  # 重新走决策逻辑，这次会生成正式计划
+                
             print("  --> 所有计划步骤已完成且审核通过，直接 FINISH")
             state["next_worker"] = "FINISH"
             return state

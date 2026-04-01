@@ -361,6 +361,14 @@ def review_contribution(state: CriticAgentState) -> CriticAgentState:
         if last_worker == "code_dev":
             # 保留 dict，便于下游展示完整 output / result（勿 str() 丢失结构）
             state["code_solution"] = pending if isinstance(pending, dict) else str(pending)
+            
+            # 探索阶段结束前，收集探索结果
+            if not state.get("data_exploration_done", True):
+                res_val = pending.get("result", "") if isinstance(pending, dict) else str(pending)
+                if res_val:
+                    exp_results = state.get("data_exploration_results", [])
+                    state["data_exploration_results"] = exp_results + [res_val]
+
         elif last_worker == "rag_researcher":
             if isinstance(pending, list):
                 state["rag_context"] = "\n\n".join(pending)

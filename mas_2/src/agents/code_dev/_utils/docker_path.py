@@ -30,6 +30,6 @@ def convert_to_docker_path(local_path: str, mode: str = "data") -> str:
     else:
         # 如果是文件，将文件名追加到 base_docker_path
         filename = os.path.basename(local_path)
-        docker_path = os.path.join(base_docker_path, filename)
+        docker_path = f"{base_docker_path}/{filename}"
         return docker_path
 

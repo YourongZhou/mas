@@ -175,6 +175,9 @@ class CodeExecutor:
             "attributeerror",
             "nameerror",
             "runtimeerror",
+            "syntaxerror",
+            "indentationerror",
+            "assertionerror",
             "unable to",
         )
         for i in range(len(lines) - 1, -1, -1):
@@ -329,7 +332,9 @@ python /app/code.py"""
                         })
 
             if status_code != 0:
-                err = self._extract_error_summary(logs)
+                # 提取去除了 pip 等前置噪音的日志进行错误分析
+                exec_logs = logs.split("===MAS_EXEC_START===")[-1] if "===MAS_EXEC_START===" in logs else logs
+                err = self._extract_error_summary(exec_logs)
                 if not err:
                     err = f"容器退出码非0: {status_code}"
                 return {

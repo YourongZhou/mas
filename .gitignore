@@ -27,3 +27,4 @@ mas_2/workflows/*
 mas_2/logs/*
 **/__pycache__/
 mas_2/workflows/*
+.vscode

@@ -388,7 +388,7 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
     else:
         docker_data_path = '/app/data'
 
-    docker_output_path = convert_to_docker_path(result_path, 'output') if result_path else '/app/output'
+    docker_output_path = '/app/output'
 
     skill_id = state.get("current_step_skill_id")
     inj_limit = 12000 if use_scanpy_code_style(skill_id) else 4500
@@ -462,24 +462,42 @@ python 代码在 ```python 与 ``` 之间；requirements 在 ```txt 与 ``` 之�
         docker_output_paths = [convert_to_docker_path(f, 'output') for f in output_files]
         file_paths_note += f"\n【Docker容器内输出路径】\n" + "\n".join([f"- {p}" for p in docker_output_paths])
     
-    user_prompt = f"""
-    任务：{task_description}
-    数据路径（Docker容器内）：{docker_data_path}
-    结果路径（Docker容器内）：{docker_output_path}
-    {file_paths_note}
+    exploration_context = ""
+    # 如果已存在探查结果，则强制传入供代码开发参考（不再局限于探查计划已全部完成后才传）
+    if state.get("data_exploration_results"):
+        res_str = "\n\n".join(state["data_exploration_results"])
+        exploration_context = f"\n【前期数据探查参考】\n已获取的数据统计或结构特征如下：\n{res_str}\n请在编写代码时充分考虑上述数据特征（如针对真实列名、数据格式、特定字段等进行操作）。\n"
+
+    user_prompt = f"""{exploration_context}
     {expected_output_note}
     {context_instruction}
     """
+
+    # 替换 prompt 中的本地路径为 Docker 路径，防止大模型嵌套创建目录
+    if result_path and result_path != './result':
+        base_result = os.path.basename(result_path)
+        if base_result:
+            # 用户 Prompt
+            user_prompt = user_prompt.replace(f"./result/{base_result}", "/app/output")
+            user_prompt = user_prompt.replace(f"result/{base_result}", "/app/output")
+            user_prompt = user_prompt.replace(f"/app/output/{base_result}", "/app/output")
+            # 系统 Prompt
+            system_prompt = system_prompt.replace(f"./result/{base_result}", "/app/output")
+            system_prompt = system_prompt.replace(f"result/{base_result}", "/app/output")
+            system_prompt = system_prompt.replace(f"/app/output/{base_result}", "/app/output")
 
     messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_prompt)
     ]
 
-    # 每次都打印发送给大模型的完整 Prompt (User Prompt, 包含可能带有的修正指令)，便于排错
+    # 每次都打印发送给大模型的完整 Prompt，便于排错
     print("\n" + "*"*60)
     print(f"🔍 [Code Dev Debug] 发送给 LLM 的提示词 (迭代 {state.get('internal_iteration_count', 0) + 1})")
     print("*"*60)
+    print("【System Prompt (Hard Constraints & Formatting)】:")
+    print(system_prompt.strip())
+    print("\n【User Prompt (Task & Context)】:")
     print(user_prompt.strip())
     print("*"*60 + "\n")
 
@@ -622,7 +640,6 @@ if '/app/workflow' not in sys.path:
     sys.path.insert(0, '/app/workflow')
 import scanpy as sc
 import matplotlib.pyplot as plt
-
 # --- DEBUG START: 检查挂载情况 ---
 print("DEBUG: Checking /app/data contents...")
 try:
@@ -638,6 +655,7 @@ try:
 except Exception as e:
     print(f"DEBUG: Error checking directories: {{e}}")
 # --- DEBUG END ---
+print("===MAS_EXEC_START===")
 
 # 关键配置
 plt.switch_backend('Agg')  # 关闭matplotlib弹窗
@@ -665,6 +683,7 @@ try:
 except Exception as e:
     print(f"DEBUG: Error checking directories: {{e}}")
 # --- DEBUG END ---
+print("===MAS_EXEC_START===")
 """
 # 核心分析代码（来自大模型生成）
     llm_code = state.get("scanpy_code", "")
@@ -672,44 +691,17 @@ except Exception as e:
     footer = f"""
 import os
 
-# --- 智能结果输出 ---
+# --- 补充输出文件信息 ---
 try:
-    # 1. 优先检查代码中是否定义了自定义摘要
     if 'analysis_summary' in locals():
         print(f"===RESULT==={{analysis_summary}}===")
-    
-    # 2. 如果没有摘要，但有 adata 对象，输出基础维度信息
-    elif 'adata' in locals():
-        # 基础信息
-        res_str = f"Execution successful. Data shape: {{adata.n_obs}} cells x {{adata.n_vars}} genes."
-        
-        # 尝试通过 adata.uns/obs 推断做了什么，作为补充信息
-        infos = []
-        if 'pca' in adata.uns: infos.append("PCA done")
-        if 'neighbors' in adata.uns: infos.append("Neighbors computed")
-        if 'leiden' in adata.obs: 
-            n_clust = len(adata.obs['leiden'].unique())
-            infos.append(f"Leiden clusters: {{n_clust}}")
-        if 'louvain' in adata.obs:
-            n_clust = len(adata.obs['louvain'].unique())
-            infos.append(f"Louvain clusters: {{n_clust}}")
-            
-        if infos:
-            res_str += f" (Progress: {{', '.join(infos)}})"
-            
-        print(f"===RESULT==={{res_str}}===")
-        
-    # 3. 如果只是普通脚本（没有adata），检查是否有文件生成
     else:
-        # 检查 output 目录下的新文件
-        out_files = os.listdir('/app/output')
+        out_files = os.listdir('/app/output') if os.path.exists('/app/output') else []
         if out_files:
-            print(f"===RESULT===Step completed. Generated files: {{', '.join(out_files)}}===")
+            print(f"===RESULT===Step executed. Generated files: {{', '.join(out_files)}}===")
         else:
-            print(f"===RESULT===Step completed successfully (No specific return value).===")
-
+            print(f"===RESULT===Step executed (No specific result string).===")
 except Exception as e:
-    # 最后的安全网
     print(f"===RESULT===Execution finished, but result extraction failed: {{str(e)}}===")
 """
     
@@ -846,6 +838,7 @@ except Exception as e:
 
         # 控制台仅输出关键摘要，避免安装依赖等噪声日志淹没真实错误。
         output_str = result.get('output', '')
+        output_str = output_str.split("===MAS_EXEC_START===")[-1] if "===MAS_EXEC_START===" in output_str else output_str
 
         # 检查执行是否成功（从executor返回的success字段）
         executor_success = result.get('success', True)
@@ -853,15 +846,37 @@ except Exception as e:
         # 检查output中是否包含错误信息（即使executor返回success=True，代码执行也可能失败）
         has_error_in_output = any(keyword in output_str for keyword in [
             'Traceback', 'Error:', 'Exception:', 'TypeError', 'ValueError', 
-            'AttributeError', 'NameError', 'KeyError', 'IndexError'
+            'AttributeError', 'NameError', 'KeyError', 'IndexError',
+            'SyntaxError', 'IndentationError', 'AssertionError'
         ])
 
         result_part = ""
         result_looks_failed = False
         if "===RESULT===" in output_str:
-            result_part = output_str.split("===RESULT===", 1)[1]
-            if "===" in result_part:
-                result_part = result_part.split("===", 1)[0]
+            parts = output_str.rsplit("===RESULT===", 1)
+            result_part = parts[-1]
+            if result_part.endswith("==="):
+                result_part = result_part[:-3]
+            elif "===" in result_part:
+                result_part = result_part.rsplit("===", 1)[0]
+                
+            # 去除 pip 等安装包的前置外部日志，只保留真实执行部分
+            stdout_part = parts[0].strip()
+                
+            if stdout_part:
+                clean_lines = []
+                for line in stdout_part.split('\n'):
+                    if line.startswith("DEBUG: ") or line.startswith("# --- DEBUG ") or line.strip() == "":
+                        continue
+                    clean_lines.append(line)
+                clean_stdout = "\n".join(clean_lines).strip()
+                
+                if clean_stdout:
+                    if result_part.strip() in ["Step completed successfully (No specific return value).", "Step executed (No specific result string).", "Step executed.", ""]:
+                        result_part = clean_stdout
+                    else:
+                        result_part = f"{clean_stdout}\n{result_part}"
+
             _res_low = result_part.strip().lower()
             result_looks_failed = any(
                 hint in _res_low
@@ -989,53 +1004,63 @@ def display_result(state: CodeAgentState) -> CodeAgentState:
     """
     功能：展示分析结果文本+UMAP聚类图（增加容错，避免解码崩溃）
     """
+    is_exploration = not state.get("data_exploration_done", True)
 
     if state.get("success", False):
-        print("\n=== [Code Dev] 展现分析结果 ===")
-        # 显示文本结果（优先保证文本能看到）
-        print("单细胞分析结果：")
-        print("-"*30)
-        print(state["analysis_result"])
-
-        # 显示所有PNG图片（增加容错）
-        print("正在处理PNG图片并创建对应的HTML文件：")
-        print("-"*30)
-
-        import os
-        # Get all PNG files in the result directory
-        result_dir = state['result_path']
-        png_files = [f for f in os.listdir(result_dir) if f.lower().endswith('.png')]
-
-        # Check if we have write permissions to the result directory
-        if not os.access(result_dir, os.W_OK):
-            # If no write access to result directory, create a single temporary directory for all outputs
-            with tempfile.TemporaryDirectory() as temp_dir:
-                for png_file in png_files:
-                    png_path = os.path.join(result_dir, png_file)
-
-                    # Generate corresponding HTML filename (e.g., leiden.png -> leiden_decoded.html)
-                    base_name = os.path.splitext(png_file)[0]
-                    html_filename = f"{base_name}_decoded.html"
-                    output_html_path = os.path.join(temp_dir, html_filename)
-
-                    # Call the function to create HTML with base64 image
-                    create_html_with_base64_image(png_path, output_html_path)
-
-                    # Inform user of location
-                    print(f"HTML file saved at: {output_html_path}")
-                    print(f"Please copy the file manually to result directory if needed.")
+        if is_exploration:
+            print("\n=== [Code Dev] 探查执行结果 ===")
+            print("-" * 30)
+            print(str(state.get("analysis_result", "")).strip())
+            print("-" * 30)
         else:
-            # We have write access, proceed normally for each PNG file
-            for png_file in png_files:
-                png_path = os.path.join(result_dir, png_file)
+            print("\n=== [Code Dev] 展现分析结果 ===")
+            # 显示文本结果（优先保证文本能看到）
+            print("单细胞分析结果：")
+            print("-"*30)
+            print(str(state.get("analysis_result", "")).strip())
+            
+            # 显示所有PNG图片（增加容错）
+            print("正在处理PNG图片并创建对应的HTML文件：")
+            print("-"*30)
 
-                # Generate corresponding HTML filename (e.g., leiden.png -> leiden_decoded.html)
-                base_name = os.path.splitext(png_file)[0]
-                html_filename = f"{base_name}_decoded.html"
-                output_html_path = os.path.join(result_dir, html_filename)
+            import os
+            
+            # Ensure result_path exists before accessing
+            if "result_path" in state and os.path.exists(state["result_path"]):
+                # Get all PNG files in the result directory
+                result_dir = state['result_path']
+                png_files = [f for f in os.listdir(result_dir) if f.lower().endswith('.png')]
 
-                create_html_with_base64_image(png_path, output_html_path)
-                print(f"Created HTML file: {html_filename} for {png_file}")
+                # Check if we have write permissions to the result directory
+                if not os.access(result_dir, os.W_OK):
+                    # If no write access to result directory, create a single temporary directory for all outputs
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        for png_file in png_files:
+                            png_path = os.path.join(result_dir, png_file)
+
+                            # Generate corresponding HTML filename (e.g., leiden.png -> leiden_decoded.html)
+                            base_name = os.path.splitext(png_file)[0]
+                            html_filename = f"{base_name}_decoded.html"
+                            output_html_path = os.path.join(temp_dir, html_filename)
+
+                            # Call the function to create HTML with base64 image
+                            create_html_with_base64_image(png_path, output_html_path)
+
+                            # Inform user of location
+                            print(f"HTML file saved at: {output_html_path}")
+                            print(f"Please copy the file manually to result directory if needed.")
+                else:
+                    # We have write access, proceed normally for each PNG file
+                    for png_file in png_files:
+                        png_path = os.path.join(result_dir, png_file)
+
+                        # Generate corresponding HTML filename (e.g., leiden.png -> leiden_decoded.html)
+                        base_name = os.path.splitext(png_file)[0]
+                        html_filename = f"{base_name}_decoded.html"
+                        output_html_path = os.path.join(result_dir, html_filename)
+
+                        create_html_with_base64_image(png_path, output_html_path)
+                        print(f"Created HTML file: {html_filename} for {png_file}")
     else:
         # 超过迭代次数仍失败，给出准确精简的向用户解释的错误原因
         print("\n=== [Code Dev] 任务执行失败 ===")
@@ -1048,18 +1073,7 @@ def display_result(state: CodeAgentState) -> CodeAgentState:
         # 将结果覆盖为对用户的精简解释
         state["analysis_result"] = explanation
 
-    # 清理复用的 Docker 容器
-    if state.get("docker_container_id"):
-        try:
-            import docker
-            client = docker.from_env()
-            container = client.containers.get(state["docker_container_id"])
-            container.remove(force=True)
-            print(f"  --> [Code Dev] 已清理复用的 Docker 容器: {state['docker_container_id'][:12]}")
-        except Exception as e:
-            print(f"  --> [Code Dev] 重置/清理复用 Docker 容器失败: {e}")
-        # 清除记录，避免下次任务复用
-        state["docker_container_id"] = None
+    # 保留 Docker 容器，生命周期由 main.py 中 finalize_step 管理
 
     state["last_worker"] = "code_dev"
     return state
