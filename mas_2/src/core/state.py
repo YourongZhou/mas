@@ -13,7 +13,7 @@ except ImportError:
         """简单的消息合并函数"""
         return left + right
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 class PlanStep(BaseModel):
     """定义单个执行步骤"""
@@ -28,6 +28,14 @@ class PlanStep(BaseModel):
         description="可选：绑定的 workflow 技能 id（mas_2/workflows/<id>/SKILL.md），与领域 SOP 对齐",
     )
 
+    @field_validator("acceptance_criteria", mode="before")
+    @classmethod
+    def normalize_acceptance_criteria(cls, value):
+        # 兼容部分 API 返回 list[str] 的情况，统一归一化为单个字符串。
+        if isinstance(value, list):
+            return "\n".join(str(item).strip() for item in value if str(item).strip())
+        return value
+
 class GlobalState(TypedDict):
     """
     全局状态定义
@@ -40,10 +48,14 @@ class GlobalState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     # 用户的原始查询
     user_query: str
+    # 任务唯一 ID（用于隔离不同任务的结果）
+    task_id: str
 
     # === 任务执行字段 ===
     plan: List[PlanStep]          # 完整的计划列表
     current_step_index: int       # 当前正在执行的步骤索引 (0-based)
+    data_exploration_done: bool   # 数据探索阶段是否完成
+    data_exploration_results: List[str] # 积累的数据探索结果输出
     # 当前步骤的输入、预期输出和文件路径信息
     current_step_input: Optional[str]  # 当前步骤的输入描述（从 plan[current_step_index].description 提取）
     current_step_expected_output: Optional[str]  # 当前步骤的预期输出（从 plan[current_step_index].acceptance_criteria 提取）
@@ -60,6 +72,7 @@ class GlobalState(TypedDict):
     # === 产出字段 ===
     # 最终报告（整合所有结果）
     final_report: str
+    completed_steps_outputs: List[str]
     # 最终回答
     final_answer: str
     # 代码解决方案
@@ -67,6 +80,10 @@ class GlobalState(TypedDict):
     # RAG 检索到的上下文
     rag_context: str
     
+    # === 运行环境字段 ===
+    # 跨节点复用的 Docker 容量 ID
+    docker_container_id: Optional[str]    # 从 SKILL.md 提取的全局依赖环境配置（先行安装）
+    global_requirements: Optional[str]
     # === 交互字段 ===
     # Worker 提交的待审核草稿（临时缓冲区）
     pending_contribution: Any

@@ -31,4 +31,7 @@ class CodeAgentState(GlobalState):
     success: bool
     # 内部迭代计数（用于记录重试次数）
     internal_iteration_count: int
+    step_tool_context: Optional[str]
+    # 复用的 Docker 容器 ID
+    docker_container_id: Optional[str]
 
