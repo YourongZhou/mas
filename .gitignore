@@ -28,3 +28,4 @@ mas_2/logs/*
 **/__pycache__/
 mas_2/workflows/*
 .vscode
+agent_cli_example/*

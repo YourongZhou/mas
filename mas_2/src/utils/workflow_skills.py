@@ -127,6 +127,10 @@ def resolve_workflow_root(skill_id: str) -> Optional[str]:
         return str(candidate.resolve())
     return None
 
+def get_workflows_root() -> str:
+    """返回宿主机 workflows 根目录绝对路径。"""
+    return str(_WORKFLOWS_ROOT.resolve())
+
 
 def format_skills_catalog_for_prompt(max_items: int = 64) -> str:
     """供 Supervisor 注入的简短目录（避免全文）。"""
@@ -142,34 +146,34 @@ def format_skills_catalog_for_prompt(max_items: int = 64) -> str:
 
 
 def format_skill_injection_for_code_dev(skill_id: Optional[str], max_chars: int = 4000) -> str:
-    """为 Code Dev 注入：元数据 + SKILL 正文截断。"""
+    """为 Code Dev 注入：提供元数据和物理路径，指示 Agent 自主调用工具探索目录和读取文件。"""
     if not skill_id:
         return ""
     rec = get_skill(skill_id)
     if not rec:
         return f"\n【workflow skill】skill_id={skill_id}（未在注册表中找到，请仅依赖任务描述与 RAG）\n"
-    skill_md = rec.root_path / "SKILL.md"
-    body = ""
-    try:
-        text = skill_md.read_text(encoding="utf-8")
-        _, body = _split_frontmatter(text)
-    except OSError:
-        pass
-    body = (body or "").strip()
-    if len(body) > max_chars:
-        body = body[:max_chars] + "\n\n...（SKILL 正文已截断）"
+    
+    root_path_str = str(rec.root_path.resolve()).replace('\\', '/')
+    
     meta_lines = [
         f"skill_id: {rec.skill_id}",
         f"name: {rec.name}",
         f"category: {rec.category}",
         f"short-description: {rec.short_description}",
+        f"host_path: {root_path_str} (宿主机绝对路径，用于工具调用读取本地文件)"
     ]
-    _logger.debug("skill_injection skill_id=%s meta=%s body_len=%s", skill_id, meta_lines, len(body))
+    
+    _logger.debug("skill_injection for code_dev tool exploration skill_id=%s meta=%s", skill_id, meta_lines)
+    
     return (
         "\n【当前步骤绑定的 Workflow Skill】\n"
         + "\n".join(meta_lines)
-        + "\n\n【SKILL.md 正文（节选）】\n"
-        + body
+        + f"\n\n【重要：利用工具调查技能背景】\n"
+        + "本任务需要生成针对该技能的代码。你**必须主动通过读取本地文件**来了解该技能的脚本如何工作：\n"
+        + f"1. 使用 `list_directory` 工具查看 `{root_path_str}` 及其子目录（如 scripts）。\n"
+        + f"2. 使用 `read_local_file` 工具读取 `{root_path_str}/SKILL.md` 熟悉约定要求（可通过 offset 截断读取长文件）。\n"
+        + "3. 使用 `read_local_file` 工具阅读关键的 Python 脚本的内容（主要是 scripts/目录下的文件），明确参数及其返回结构。\n"
+        + "你可以在生成最终代码之前的多次 tool calls 中完成背景文档与脚本的理解，查阅完毕后再思考并输出你最终需要生成的 ````python` 代码。\n"
     )
 
 
@@ -191,10 +195,3 @@ def should_mount_workflow_in_docker(skill_id: Optional[str]) -> bool:
     if not skill_id:
         return False
     return resolve_workflow_root(skill_id) is not None
-
-
-def use_scanpy_code_style(skill_id: Optional[str]) -> bool:
-    """是否使用现有 Scanpy 专用 system_prompt 与执行头尾。仅绑定 Scanpy 核心技能时为 True。"""
-    if skill_id is None or skill_id == "":
-        return False
-    return skill_id == SCANPY_CORE_SKILL_ID

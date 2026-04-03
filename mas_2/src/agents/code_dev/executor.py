@@ -30,7 +30,7 @@ class CodeExecutor:
         self.code_path = f"{docker_path}/code.py" if docker_path else None
         self.requirements_path = f"{docker_path}/requirements.txt" if docker_path else None
         self.output_dir = output_dir if output_dir else "/tmp/output"  # 默认输出目录
-        self.docker_image = "python:3.13-slim"
+        self.docker_image = "python:3.11"
         self.container_id = container_id
         
         # --- 关键修改 1：使用列表存储挂载信息，避免字典 Key 冲突 ---
@@ -86,9 +86,9 @@ class CodeExecutor:
         self.workflow_host_path = workflow_host_path
         if workflow_host_path and os.path.isdir(workflow_host_path):
             wf = os.path.abspath(workflow_host_path)
-            self.volume_mounts.append(f"{wf}:/app/workflow:ro")
+            self.volume_mounts.append(f"{wf}:/app/workflows:ro")
             if not self.container_id:
-                self.logger.info(f"Workflow 目录挂载: {wf} -> /app/workflow")
+                self.logger.info(f"Workflow 目录挂载: {wf} -> /app/workflows")
     
     def _determine_data_dirs_from_input_files(self, input_files: list):
         """
@@ -283,7 +283,7 @@ class CodeExecutor:
 
             # 4. 执行代码 (使用 timeout 命令限制执行时间)
             _container_script = """set -e
-export PYTHONPATH="/app/workflow${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="/app/workflows${PYTHONPATH:+:$PYTHONPATH}"
 RUNTIME_ROOT=/tmp/mas_runtime
 DEPS="$RUNTIME_ROOT/.mas_pydeps"
 export TMPDIR="$RUNTIME_ROOT/.mas_tmp"

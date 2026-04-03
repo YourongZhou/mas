@@ -361,7 +361,19 @@ def review_contribution(state: CriticAgentState) -> CriticAgentState:
         if last_worker == "code_dev":
             # 保留 dict，便于下游展示完整 output / result（勿 str() 丢失结构）
             state["code_solution"] = pending if isinstance(pending, dict) else str(pending)
-            
+
+            # 收集每个核心执行步骤的上下文供后续步骤复用中间结果信息
+            if isinstance(pending, dict):
+                output_context = pending.get("output_tail") or pending.get("output_display") or pending.get("output")
+                if output_context:
+                    step_num = step_context.get("step_num", "?") if step_context else "?"
+                    step_name = step_context.get("step_name", "未知步骤") if step_context else "未知步骤"
+                    log_msg = f"【步骤 {step_num}: {step_name} 执行完毕】日志摘要:\n{output_context}"
+                    completed_outputs = state.get("completed_steps_outputs", [])
+                    if completed_outputs is None:
+                        completed_outputs = []
+                    state["completed_steps_outputs"] = completed_outputs + [log_msg]
+
             # 探索阶段结束前，收集探索结果
             if not state.get("data_exploration_done", True):
                 res_val = pending.get("result", "") if isinstance(pending, dict) else str(pending)

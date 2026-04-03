@@ -72,6 +72,7 @@ class GlobalState(TypedDict):
     # === 产出字段 ===
     # 最终报告（整合所有结果）
     final_report: str
+    completed_steps_outputs: List[str]
     # 最终回答
     final_answer: str
     # 代码解决方案
@@ -81,8 +82,8 @@ class GlobalState(TypedDict):
     
     # === 运行环境字段 ===
     # 跨节点复用的 Docker 容量 ID
-    docker_container_id: Optional[str]
-
+    docker_container_id: Optional[str]    # 从 SKILL.md 提取的全局依赖环境配置（先行安装）
+    global_requirements: Optional[str]
     # === 交互字段 ===
     # Worker 提交的待审核草稿（临时缓冲区）
     pending_contribution: Any

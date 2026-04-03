@@ -3,11 +3,18 @@ from src.core.llm import get_llm
 from src.core.state import PlanStep
 from langchain_core.messages import SystemMessage, HumanMessage
 import time
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import List
 
 class PlanResponse(BaseModel):
     plan: List[PlanStep] = Field(..., description="完整的执行计划列表")
+
+    @model_validator(mode="before")
+    @classmethod
+    def allow_list(cls, data):
+        if isinstance(data, list):
+            return {"plan": data}
+        return data
 
 def generate_exploration_plan(state: SupervisorAgentState, data_path: str, retry_count: int = 0, max_retries: int = 3) -> SupervisorAgentState:
     print("--- [Supervisor] 正在生成初步数据探查计划 ---")

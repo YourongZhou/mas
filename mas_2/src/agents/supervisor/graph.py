@@ -4,13 +4,14 @@ Supervisor Agent 子图
 """
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, START, END
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Literal, List, Optional
 from .state import SupervisorAgentState
 from src.core.llm import get_llm
 from src.core.state import PlanStep
 from src.utils.workflow_skills import format_skills_catalog_for_prompt
 from .exploration_plan import generate_exploration_plan
+from src.agents.code_dev.executor import CodeExecutor
 
 # 初始化 LLM
 llm = get_llm(temperature=0.5)
@@ -26,9 +27,68 @@ class RouteDecision(BaseModel):
     reasoning: str = Field(..., description="决策理由")
 
 
+class SkillSelectionResponse(BaseModel):
+    """技能选择响应模型"""
+    selected_skill_id: Optional[str] = Field(
+        None,
+        description="根据用户需求与探查结果，从系统可用的 Workflow 技能目录中选出最匹配该任务的核心流程 skill_id。如果没有合适的请填 null。"
+    )
+
+def select_skill_for_plan(state: SupervisorAgentState) -> SupervisorAgentState:
+    """在生成正式计划前，先选择最匹配的 workflow skill"""
+    user_query = state.get("user_query", "")
+    skills_catalog = format_skills_catalog_for_prompt()
+    
+    exploration_context = ""
+    if state.get("data_exploration_results"):
+        res_str = "\n\n".join(state["data_exploration_results"])
+        exploration_context = f"\n【前期数据探查结果】\n在正式规划分析流程前，我们已经对输入数据进行了摸底，探查结果如下：\n{res_str}\n"
+
+    system_prompt = f"""你是一个高级数据分析规划师。在生成核心计算分析执行计划前，你需要先评估以下用户需求与数据特征，并从支持的技能库中选取最匹配的一个技能（Workflow Skill）。
+{exploration_context}
+
+【可用 Workflow 技能目录】
+{skills_catalog}
+
+请返回你选中的 skill_id。若没有任何技能相匹配或任务本身非常简单不足以引用特定技能流程，请填 null。请确保最终输出为合法的 JSON 对象格式。"""
+
+    user_prompt = f"原始用户查询: {user_query}\n请从上述技能目录中选出最匹配该任务的核心流程 skill_id，并务必按 JSON 格式返回。"
+
+    try:
+        chain = llm_plan.with_structured_output(SkillSelectionResponse)
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)
+        ]
+        
+        print("\n--- [Supervisor] 正在为正式计划选择对应的核心技能 ---")
+        response = chain.invoke(messages)
+        
+        if response.selected_skill_id:
+            state["selected_skill_id"] = response.selected_skill_id
+            print(f"  --> 成功匹配到核心技能: {response.selected_skill_id}")
+        else:
+            state["selected_skill_id"] = None
+            print("  --> 未发现特别匹配的技能，将基于通用逻辑规划。")
+            
+    except Exception as e:
+        print(f"  --> [Error] 技能选择失败: {e}")
+        state["selected_skill_id"] = None
+        
+    return state
+
+
 class PlanResponse(BaseModel):
     """计划生成响应模型"""
     plan: List[PlanStep] = Field(..., description="完整的执行计划列表")
+    global_requirements: Optional[str] = Field(None, description="结合技能文档统一生成的 requirements.txt 依赖包内容，无特殊环境则留空。不包含代码内容，仅依赖列表")
+
+    @model_validator(mode="before")
+    @classmethod
+    def allow_list(cls, data):
+        if isinstance(data, list):
+            return {"plan": data, "global_requirements": None}
+        return data
 
 
 def generate_plan(state: SupervisorAgentState, retry_count: int = 0, max_retries: int = 3) -> SupervisorAgentState:
@@ -55,27 +115,41 @@ def generate_plan(state: SupervisorAgentState, retry_count: int = 0, max_retries
         retry_hint += "4. 所有必填字段（step_id, name, description, acceptance_criteria）都有值\n"
         retry_hint += "5. skill_id 可为空：仅当步骤明确对应下方目录中的某一技能时填写\n"
 
-    skills_catalog = format_skills_catalog_for_prompt()
+    selected_skill_id = state.get("selected_skill_id")
+    skill_context = ""
+    skills_catalog = ""
+    skill_id_rules = ""
 
-    system_prompt = f"""你是一个专业的项目规划师，负责将复杂的任务分解为可执行的步骤。
+    if selected_skill_id:
+        import os
+        from src.utils.workflow_skills import resolve_workflow_root
+        root_dir = resolve_workflow_root(selected_skill_id)
+        if root_dir:
+            skill_md_path = os.path.join(root_dir, "SKILL.md")
+            if os.path.exists(skill_md_path):
+                with open(skill_md_path, "r", encoding="utf-8") as f:
+                    skill_doc = f.read()
+                skill_context = f"\n\n【所选核心 Workflow Skill（{selected_skill_id}）底层文档参考】\n为了确保你下发的各个拆分步骤科学、标准且符合当前系统技能的最佳实践，请务必严格按照此文档内描述的各环节依次拆分设置步骤名称、验收标准及输入文件。\n（{skill_doc[:10000]}）"
+        
+        skill_id_rules = f"""【skill_id 规则与分析流程规划】
+- 你必须专门为选定的技能 {selected_skill_id} 设置相关的执行计划。
+- 请务必根据该技能的标准分析流程，**将其拆分为能够稳定运行及有明确产出的几个核心分析步骤（最多不要超过五个任务）**。请确保每个前置步骤的输出合理地作为后置步骤的输入。绝对**不要**将整个长流程压缩成唯一的一个庞大步骤。通过细化步骤，可以让 Code Dev 逐步生成并验证代码，从而更稳健地完成复杂的分析流程，避免执行链路过长。"""
 
-请根据用户的任务需求，生成一个详细的执行计划。每个步骤应该：
-1. 有明确的输入和输出
-2. 指定需要的输入文件路径（如果有）
-3. 指定必须生成的输出文件路径（如果有）
-4. 包含明确的验收标准，用于判断任务是否成功
+    else:
+        skills_catalog = f"\n【可用 Workflow 技能目录】\n这里列出了本地目录下的所有可供参考的分析流程（对应 skill_id）。\n{format_skills_catalog_for_prompt()}\n"
+        skill_id_rules = """【skill_id 规则与分析流程规划】
+- 在生成分析流程时，请先阅览上述的技能目录。若发现某个技能的名称或描述非标契合用户的分析任务，此时你应该为其设置此配套的 `skill_id`。
+- **一旦选定可适配的技能并绑定了 skill_id**，那么对应的“正式分析流程部分”的计划请务必根据该技能的标准分析流程，**将其拆分为几个具体、细化的核心分析步骤（最多不要超过五个任务）**。绝对**不要**将整个长流程压缩成唯一的一个庞大步骤。
+- 如果不确定，或无任何技能相匹配，不需要勉强，可不填写 skill_id（填 null）。"""
+
+    system_prompt = f"""你是一个专业的项目规划师，负责将复杂的任务分解为最精简、最高效的可执行步骤。
+{skill_context}
+请结合用户的原始需求和相关技能内容，生成一个直指核心目标的正式执行计划。
 
 【执行前提与背景】
-（如果存在前期的初步数据检查运行结果，请参考上下文信息。接下来只需根据具体要求对核心任务进行结构拆解映射。）
-
-【可用 Workflow 技能目录】
-这里列出了本地目录下的所有可供参考的分析流程（对应 skill_id）。
+（如果存在初期的数据情况，只作为编写具体代码代码的参考。接下来进行精简的核心任务结构映射即可。）
 {skills_catalog}
-
-【skill_id 规则与分析流程规划】
-- 在生成分析流程时，请先阅览上述的技能目录。若发现某个技能的名称或描述非标契合用户的分析任务（例如用户提出要进行基于 Scanpy 的单细胞分析，理应匹配 `scrnaseq-scanpy-core-analysis`），此时你应该为其设置此配套的 `skill_id`。
-- **一旦选定可适配的技能并绑定了 skill_id**，那么对应的“正式分析流程部分”的计划粒度请务必设计的粗粒度一点，通常只需要整合为少数 1 步或 2 步核心动作即可即可（例如：“遵循 Scanpy core analysis 的推荐流程执行质控、降维、聚类并绘制图像”）。过于琐碎的拆分不利于对应组件遵从其原本最佳实践的完整工作流。
-- 如果不确定，或无任何技能相匹配，不需要勉强，可不填写 skill_id（填 null）。
+{skill_id_rules}
 
 【数据路径与 input_files】
 - 用户若在任务中说明了数据位置（例如「数据路径：…」「输入为 xxx.h5ad」），必须在依赖该数据的步骤的 input_files 中填入具体路径（与原文一致）；不要将路径只写在 description 而遗漏 input_files。
@@ -86,12 +160,23 @@ def generate_plan(state: SupervisorAgentState, retry_count: int = 0, max_retries
 - 验收标准须可判定：明确打印了什么文本维度指标，或生成了什么图像才能算成功。
 
 【计划粒度要求】
-- 带有 skill_id 的主体分析流程应只包含最小数量的核心调度模块（如一个端到端总控运行步骤）。
+- 带有 skill_id 的主体分析流程应包含几个前后连贯能够稳定产出结果的具体任务步骤。确保步骤数量尽可能少，避免执行链路过长。
 
 【RAG步骤规划原则】
 - 可以自主决定是否加入 RAG 检索步骤。
 - 当任务存在方法不确定性、参数不明确、需要领域依据时，建议先加 1 个 RAG 步骤。
 - 当任务非常基础且需求明确（例如常规 Scanpy 基础流程），可不加 RAG 步骤。
+
+【**核心约束**：步骤删减与粒度控制】
+1. **直接进入主题**：绝对禁止单独拆分“加载数据”、“预读”、“初步检查”或“校验维数”等单纯的数据检查准备步骤（前期已探查办妥）。
+2. **剔除冗余最终报告**：绝对不需要最后的“归纳总结”、“撰写报告”、“结果检查与整合”等非代码实操总结步骤。计划的**全部步骤都必须**可执行的具体任务。
+3. **合并过细步骤**：任务步骤粒度必须最佳（勿过碎！），凡是能合并成一次脚本处理完成的计算与分析工作，必须合并（合并能合并的步骤）！尽可能整合核心任务节点数量，不要把能够一次连贯执行的代码强行拆解。
+
+每个步骤应该：
+1. 有明确的输入和输出
+2. 指定需要的输入文件路径（如果有）
+3. 指定必须生成的输出文件路径（如果有）
+4. 包含明确的验收标准，用于判断任务是否成功
 
 对于代码开发任务，输出文件路径格式应为：{result_path}/step_{{step_id}}_{{filename}}
 例如：./result/step_1_umap.png, ./result/step_2_clustering.png
@@ -101,13 +186,14 @@ def generate_plan(state: SupervisorAgentState, retry_count: int = 0, max_retries
     exploration_context = ""
     if state.get("data_exploration_results"):
         res_str = "\n\n".join(state["data_exploration_results"])
-        exploration_context = f"\n【前期数据探查结果】\n在正式规划分析流程前，我们已经对输入数据进行了摸底，探查结果如下：\n{res_str}\n请根据上述数据特征规划分析流程。\n"
+        exploration_context = f"\n【前期数据探查结果】\n在正式规划分析流程前，我们已经对输入数据进行了摸底，探查结果如下：\n{res_str}\n\n【极其重要：去除检查步骤】基于上述结果，请直接进入实际业务要求的数据处理或分析动作。**绝对不要**再专门生成诸如“数据检查”、“加载并查看维度”、“初步检查”等单纯探查或QA测试的步骤。\n"
 
     user_prompt = f"""{exploration_context}
 用户任务：{user_query}
 结果保存路径：{result_path}
 {retry_hint}
-请生成详细的执行计划，包含以下信息：
+请生成详细的执行计划与环境要求，必须包含以下两部分信息：
+【计划列表 plan】（这是一个数组）
 - step_id: 步骤序号（从1开始，必须连续递增）
 - name: 步骤名称（简短的动词短语，必填）
 - description: 详细的任务描述，包含具体的参数要求（必填）
@@ -115,6 +201,9 @@ def generate_plan(state: SupervisorAgentState, retry_count: int = 0, max_retries
 - output_files: 本步骤必须生成的输出文件路径列表（格式：{result_path}/step_{{step_id}}_{{filename}}，如果没有则为空列表 []）
 - acceptance_criteria: 验收标准，明确说明如何判断任务成功；若绑定 skill_id 则与 SKILL 文档要点一致（必填）
 - skill_id: 可选，字符串或 null。若本步骤绑定上表中的某一技能则填写其 id，否则为 null。
+
+【环境依赖 global_requirements】（字符串）
+- 若绑定的 SKILL 包含任何第三方或环境依赖要求，请将所需的所有库拼接成标准 requirements.txt 格式的换行字符串提取出来（例如 "scanpy>=1.9.0\\nmatplotlib"）；无要求则置空。这将被 docker 先行安装，供整体流程使用。
 
 请确保计划覆盖用户任务的所有要求，并且所有字段都正确填写。若用户给出了结果/输出目录，计划中 output_files 的路径前缀应与用户期望一致。
 """
@@ -168,6 +257,47 @@ def generate_plan(state: SupervisorAgentState, retry_count: int = 0, max_retries
         # 更新状态
         state["plan"] = plan
         state["current_step_index"] = 0
+        state["completed_steps_outputs"] = []  # 清空历史日志，确保正式计划开始时不受探查信息干扰
+        if getattr(response, "global_requirements", None):
+            state["global_requirements"] = response.global_requirements
+            print(f"  [发现全局依赖要求] :\n{response.global_requirements}")
+            
+            # 立刻使用 CodeExecutor 组装容器并预安装环境，后续直接免除报错重启
+            try:
+                from src.utils.workflow_skills import get_workflows_root
+                from src.agents.code_dev.graph import extract_paths_from_state
+                
+                # 提取用户数据路径和结果路径以供首次挂载
+                path_info = extract_paths_from_state(state)
+                data_path = path_info.get("data_path")
+                result_path = path_info.get("result_path", "./result")
+                
+                import os
+                print(f"  --> [提前配置环境] 正在创建/复用 Docker 容器并完整安装 global_requirements（非增量）...")
+                executor = CodeExecutor(
+                    docker_path=None,
+                    container_id=state.get("docker_container_id"),
+                    data_dir=data_path if data_path and os.path.exists(data_path) else None,
+                    output_dir=result_path,
+                    workflow_host_path=get_workflows_root()
+                )
+                init_code = "print('Global environment successfully initialized.')\n"
+                exec_result = executor.execute(
+                    code_str=init_code, 
+                    requirements_str=response.global_requirements, 
+                    timeout=900
+                )
+                if exec_result.get("container_id"):
+                    new_id = exec_result["container_id"]
+                    if new_id != state.get("docker_container_id"):
+                        state["docker_container_id"] = new_id
+                        print(f"  --> [容器建立成功] 已成功构建持久化容器，容器ID: {new_id[:12]}")
+                if exec_result.get("success"):
+                    print("  --> [环境配置成功]")
+                else:
+                    print(f"  --> [环境配置失败] {exec_result.get('error', '')}")
+            except Exception as init_err:
+                print(f"  --> [环境配置异常] {init_err}")
         
     except Exception as e:
         error_msg = str(e)
@@ -291,6 +421,7 @@ def make_decision(state: SupervisorAgentState) -> SupervisorAgentState:
         if has_data and not data_exploration_done:
             state = generate_exploration_plan(state, data_path)
         else:
+            state = select_skill_for_plan(state)
             state = generate_plan(state)
             
         plan = state.get("plan", [])
