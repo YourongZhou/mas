@@ -29,3 +29,4 @@ mas_2/logs/*
 mas_2/workflows/*
 .vscode
 agent_cli_example/*
+mas_2/.files/*
