@@ -632,8 +632,8 @@ requirements.txt 内容全部被包括在 ```txt 和 ``` 之间。
             requirements = requirements_match.group(1).strip()
         else:
             print("未获取到 requirements.txt 代码块，使用默认值")
-            # 默认 requirements
-            requirements = "scanpy>=1.9.0\nmatplotlib>=3.4.0\nnumpy>=1.21.0\npandas>=1.3.0\nscipy>=1.7.0\nanndata>=0.8.0\nigraph"
+            # 默认 requirements 置空
+            requirements = ""
 
         # 更新状态
         state["scanpy_code"] = code
