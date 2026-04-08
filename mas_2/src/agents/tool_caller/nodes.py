@@ -1,11 +1,11 @@
-"""
+﻿"""
 Tool Caller Agent 的节点定义
 """
 import json
 from langchain_core.messages import HumanMessage
 from .state import ToolCallerAgentState
 from src.core.llm import get_llm
-from .prompts import get_decision_system_prompt, get_interpret_system_prompt
+from .prompt import get_decision_system_prompt, get_interpret_system_prompt
 from .tools import TOOL_MAP # 确保这导入的是包含 BaseTool 对象的字典
 
 # 初始化 LLM

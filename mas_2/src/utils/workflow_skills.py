@@ -168,12 +168,7 @@ def format_skill_injection_for_code_dev(skill_id: Optional[str], max_chars: int 
     return (
         "\n【当前步骤绑定的 Workflow Skill】\n"
         + "\n".join(meta_lines)
-        + f"\n\n【重要：利用工具调查技能背景】\n"
-        + "本任务需要生成针对该技能的代码。你**必须主动通过读取本地文件**来了解该技能的脚本如何工作：\n"
-        + f"1. 使用 `list_directory` 工具查看 `{root_path_str}` 及其子目录（如 scripts）。\n"
-        + f"2. 使用 `read_local_file` 工具读取 `{root_path_str}/SKILL.md` 熟悉约定要求（可通过 offset 截断读取长文件）。\n"
-        + "3. 使用 `read_local_file` 工具阅读关键的 Python 脚本的内容（主要是 scripts/目录下的文件），明确参数及其返回结构。\n"
-        + "你可以在生成最终代码之前的多次 tool calls 中完成背景文档与脚本的理解，查阅完毕后再思考并输出你最终需要生成的 ````python` 代码。\n"
+        + "\n"
     )
 
 

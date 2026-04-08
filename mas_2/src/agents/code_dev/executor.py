@@ -289,7 +289,7 @@ DEPS="$RUNTIME_ROOT/.mas_pydeps"
 export TMPDIR="$RUNTIME_ROOT/.mas_tmp"
 mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPREFIX"
 if [ -f /app/requirements.txt ] && [ -s /app/requirements.txt ]; then
-  python -m pip install -r /app/requirements.txt --target "$DEPS"
+  python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /app/requirements.txt --target "$DEPS"
 fi
 export PYTHONPATH="$DEPS:$PYTHONPATH"
 python /app/code.py"""

@@ -5,6 +5,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 import time
 from pydantic import BaseModel, Field, model_validator
 from typing import List
+from .prompt import get_exploration_system_prompt, get_exploration_user_prompt
 
 class PlanResponse(BaseModel):
     plan: List[PlanStep] = Field(..., description="完整的执行计划列表")
@@ -19,29 +20,9 @@ class PlanResponse(BaseModel):
 def generate_exploration_plan(state: SupervisorAgentState, data_path: str, retry_count: int = 0, max_retries: int = 3) -> SupervisorAgentState:
     print("--- [Supervisor] 正在生成初步数据探查计划 ---")
     
-    system_prompt = """你是一个高级数据分析规划师。由于用户提供了数据（或数据路径），我们在进行正式的核心分析前，必须首先规划通过代码读取数据并进行摸底检查的初步任务。
-
-请生成一个包含 1到2个 步骤的执行计划，用于全面检查未知数据：
-1. 第一步：读取数据并打印宏观统计概况（例如：对于 h5ad 单细胞文件，请使用 Scanpy 打印 adata, obs.columns, obsm.keys(), 形状等概览；csv 打印头和数据类型等）。
-2. 第二步：深入探查各关键字段的数据分布（例如：检查某些类别特征的 value_counts()，以及核心数据矩阵 X 是否稀疏、极值、是否存在样本前缀 barcode 等）。
-
-注意：
-1. 本计划只供探索数据特征结构，不进行正式分析建模与绘图（因为数据还没看清结构，分析步骤必须在探查完成后再生成）。
-2. 这是要交给 code_dev （即代码执行）的检查任务，不要技能 skill_id。
-
-请严格返回符合以下 JSON 格式的执行计划列表：
-- step_id: 步骤序号（从1开始，必须连续递增）
-- name: 步骤名称（简短的动词短语，必填）
-- description: 详细的探查任务描述，说明要用代码打印哪些概况信息（必填）
-- input_files: 包含用户数据路径的列表（必填，如 ["data.h5ad"]）
-- output_files: 探查任务不需要输出文件，必须为空列表 []
-- acceptance_criteria: 验收标准，必须可判定。例如明确指出“成功打印出数据文件的维度信息和列名”（必填）
-- skill_id: 探查任务必须留空，填 null
-
-重点：必须包含完整的 step_id, name, description, acceptance_criteria。"""
-
+    system_prompt = get_exploration_system_prompt()
     user_query = state.get("user_query", "")
-    user_prompt = f"数据路径为: {data_path}\n原始用户查询: {user_query}\n请仅生成初步数据探查计划。"
+    user_prompt = get_exploration_user_prompt(data_path, user_query)
     
     # 获取LLM
     llm_plan = get_llm(temperature=0.3)
