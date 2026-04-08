@@ -10,40 +10,22 @@ from .state import CriticAgentState
 from src.core.llm import get_llm
 from src.utils.workflow_skills import format_skill_for_critic
 
+from .prompt import (
+    get_umap_image_system_prompt,
+    get_umap_image_user_prompt,
+    get_code_system_prompt,
+    get_code_user_prompt,
+    get_docs_system_prompt,
+    get_docs_user_prompt,
+    get_db_system_prompt,
+    get_db_user_prompt
+)
+
 # 初始化 LLM
 llm = get_llm(temperature=0.1) # 建议降低温度，让审核更死板、更守规矩
 llm_vision = get_llm(model_name="qwen-vl-plus", temperature=0.1)
 
 # --- 全局 System Prompt (增强版) --- 
-CRITIC_SYSTEM_PROMPT = """
-Role: Senior Bioinformatics Reviewer (Nature/Cell Standard) & Technical Auditor
-Profile:
-You are a rigorous AI auditor. Your goal is to verify if the CURRENT STEP has been completed according to its SPECIFIC acceptance criteria.
-
-*** CRITICAL RULES FOR MULTI-STEP TASKS ***
-1. SCOPE IS LIMITED: You are reviewing ONE STEP of a larger plan (e.g., Step 1 of 7).
-   - DO NOT reject the work because it hasn't finished the *entire* project yet.
-   - IF Step 1 is "Load Data", and the code loads data: PASS IT. DO NOT ask for UMAP/Clustering/Annotation if that is in Step 4.
-   - ONLY judge based on the "Current Step Acceptance Criteria".
-
-2. DOCKER ENVIRONMENT AWARENESS:
-   - The code runs in a Docker container.
-   - Path Mismatch is EXPECTED: The user says `/home/user/data/file.h5ad`, but the code uses `/app/data/file.h5ad`.
-   - THIS IS CORRECT BEHAVIOR (Volume Mounting).
-   - NEVER reject code solely because the file path looks different from the user's prompt, AS LONG AS the code executed successfully.
-
-3. EXECUTION LOG IS KING:
-   - If the `Execution Result` shows "SUCCESS" or produced the expected output files, you MUST trust the code works, even if the paths look weird.
-   - Do not hallucinate errors if the log says it worked.
-
-Output Protocol:
-- If the work meets the *current step's* criteria, reply with exactly: "PASS"
-- If the work is flawed, reply in the following format:
-  [FAIL]
-  CRITICAL ISSUE: <Describe the scientific or technical error>
-  SUGGESTION: <Actionable advice to fix it>
-- Reply in Chinese.
-"""
 
 
 def _normalize_base64_image(image_b64: str, default_mime: str = "image/png") -> str:
@@ -70,21 +52,6 @@ def _normalize_base64_image(image_b64: str, default_mime: str = "image/png") -> 
 def check_umap_image(image_base64: str, query: str, expected_output: str = None, 
                      step_context: dict = None) -> str:
     """审核 UMAP 图片质量"""
-    image_system_prompt = """
-    --- Visualization Review Task ---
-    Task: Evaluate the scientific visualization quality and relevance to the User Question.
-    
-    [Universal Criteria] (Must Have)
-    1. Labels: Axis labels must be visible.
-    2. Clarity: No severe blurring.
-    
-    [Step-Specific Context]
-    If this is an intermediate step, do not demand final publication polish.
-    """
-
-    # 完整 System Prompt
-    full_system_prompt = f"{CRITIC_SYSTEM_PROMPT}\n{image_system_prompt}"
-    
     step_context_note = ""
     if step_context:
         step_num = step_context.get("step_num", "")
@@ -95,7 +62,8 @@ def check_umap_image(image_base64: str, query: str, expected_output: str = None,
     if expected_output:
         expected_output_note = f"\n\n【验收标准】\n{expected_output}"
     
-    user_prompt = f"User question: {query}{step_context_note}{expected_output_note}"
+    full_system_prompt = get_umap_image_system_prompt()
+    user_prompt = get_umap_image_user_prompt(query, step_context_note, expected_output_note)
     
     try:
         data_url = _normalize_base64_image(image_base64)
@@ -118,25 +86,6 @@ def check_code(content: str, query: str, execution_result: str = None,
                expected_output: str = None, step_context: dict = None,
                skill_note: str = None) -> str:
     """审核代码"""
-    # --- 针对代码审核的强化 Prompt ---
-    code_system_prompt = """
-    你是一个资深代码审查员。请按以下优先级进行检查：
-
-    1. 【最高优先级】执行结果检查 (Execution Check):
-       - 查看提供的【代码执行结果/日志】。
-       - 如果日志显示 "EXECUTION SUCCESS" 或成功输出了结果标记（如 ===RESULT===），则代码**通过**。
-       - 只要运行成功，**绝对不要**因为文件路径与用户输入不同而驳回（这是Docker映射的正常现象）。
-       - 只有在日志显示 "Traceback", "Error", "Exception" 时才判定为失败。
-
-    2. 步骤范围检查 (Scope Check):
-       - 当前是分步执行模式。
-       - **严禁**要求代码包含当前步骤未提及的功能。
-       - 例子：如果当前步骤是"读取数据"，代码只要读取并保存了数据就是 PASS。**不要**抱怨"未进行聚类"或"未画图"。
-
-    3. 代码逻辑检查:
-       - 只有在没有执行日志的情况下，才深度检查逻辑漏洞。
-    """
-    
     # 构建步骤上下文信息
     step_context_note = ""
     if step_context:
@@ -163,17 +112,9 @@ def check_code(content: str, query: str, execution_result: str = None,
 
     skill_extra = skill_note or ""
 
-    user_prompt = f"""
-    用户问题: {query}
-    待审核代码: 
-    ```python
-    {content}
-    ```
-    {execution_note}
-    {step_context_note}{expected_output_note}{skill_extra}
-    """
+    merged_system_prompt = get_code_system_prompt()
+    user_prompt = get_code_user_prompt(query, content, execution_note, step_context_note, expected_output_note, skill_extra)
     
-    merged_system_prompt = f"{CRITIC_SYSTEM_PROMPT}\n\n{code_system_prompt}"
     response = llm.invoke([
         SystemMessage(content=merged_system_prompt),
         HumanMessage(content=user_prompt)
@@ -186,12 +127,6 @@ def check_docs(content: list, query: str, expected_output: str = None,
     """审核文献"""
     docs_str = "\n".join(content) if isinstance(content, list) else str(content)
     
-    docs_system_prompt = """
-    你是一个科研审稿人。
-    请检查文献是否与问题相关且包含足够信息。
-    对于分步任务，只要满足当前步骤的检索要求即可。
-    """
-    
     step_context_note = ""
     if step_context:
         step_name = step_context.get("step_name", "")
@@ -203,13 +138,9 @@ def check_docs(content: list, query: str, expected_output: str = None,
     if expected_output:
         expected_output_note = f"\n\n【验收标准】\n{expected_output}"
     
-    user_prompt = f"""
-    用户问题: {query}
-    检索到的文献: {docs_str}
-    {step_context_note}{expected_output_note}
-    """
+    merged_system_prompt = get_docs_system_prompt()
+    user_prompt = get_docs_user_prompt(query, docs_str, step_context_note, expected_output_note)
     
-    merged_system_prompt = f"{CRITIC_SYSTEM_PROMPT}\n\n{docs_system_prompt}"
     response = llm.invoke([
         SystemMessage(content=merged_system_prompt),
         HumanMessage(content=user_prompt)
@@ -220,11 +151,6 @@ def check_docs(content: list, query: str, expected_output: str = None,
 def check_db(content: str, query: str, expected_output: str = None, 
             step_context: dict = None) -> str:
     """审核数据库结果"""
-    db_system_prompt = """
-    你是一个数据分析师。
-    请检查数据查询结果是否为空，以及是否符合当前步骤的要求。
-    """
-    
     step_context_note = ""
     if step_context:
         step_name = step_context.get("step_name", "")
@@ -236,13 +162,9 @@ def check_db(content: str, query: str, expected_output: str = None,
     if expected_output:
         expected_output_note = f"\n\n【验收标准】\n{expected_output}"
     
-    user_prompt = f"""
-    用户问题: {query}
-    数据库查询结果: {content}
-    {step_context_note}{expected_output_note}
-    """
+    merged_system_prompt = get_db_system_prompt()
+    user_prompt = get_db_user_prompt(query, content, step_context_note, expected_output_note)
     
-    merged_system_prompt = f"{CRITIC_SYSTEM_PROMPT}\n\n{db_system_prompt}"
     response = llm.invoke([
         SystemMessage(content=merged_system_prompt),
         HumanMessage(content=user_prompt)

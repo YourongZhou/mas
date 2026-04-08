@@ -20,10 +20,12 @@ from src.utils.workflow_skills import (
     format_skill_injection_for_code_dev,
     resolve_workflow_root,
     should_mount_workflow_in_docker,
+    get_workflows_root,
 )
 from ._utils.docker_path import convert_to_docker_path
 from ._utils.llm_code_sanitize import sanitize_llm_python_block
 from ._utils.base64_support import create_html_with_base64_image
+from .prompt import get_code_system_prompt, get_code_user_prompt, get_tool_system_prompt, get_tool_user_prompt, get_final_user_prompt
 # 初始化 LLM
 llm = get_llm(temperature=0.1)
 
@@ -208,23 +210,35 @@ def parse_paths_from_query(user_query: str) -> dict:
             paths["data_path"] = path_str
             break
 
-    # 兜底识别：如“data/ 目录下”这类描述（优先于文件名识别）
+    # 兜底识别：从自然语言中提取常见数据文件路径（含组学常见后缀）优先于单纯目录
     if not paths["data_path"]:
-        dir_match = re.search(r'([A-Za-z0-9_./\\-]+[/\\])\s*目录', user_query, re.IGNORECASE)
-        if dir_match:
-            dir_path = dir_match.group(1).strip('"\' ')
-            paths["data_path"] = dir_path
-
-    # 兜底识别：从自然语言中提取常见数据文件路径（含组学常见后缀）
-    if not paths["data_path"]:
-        file_match = re.search(
-            r"([A-Za-z0-9_./\\-]+\.(?:vcf\.gz|vcf\.bgz|bcf|vcf\.gz\.tbi|vcf|panel|bed|bim|fam|h5ad|h5|csv|tsv|mtx|loom))",
+        file_matches = re.findall(
+            r"([A-Za-z0-9_./:\-\\]+\.(?:vcf\.gz|vcf\.bgz|bcf|vcf\.gz\.tbi|vcf|panel|bed|bim|fam|h5ad|h5|csv|tsv|mtx|loom|txt|json))",
             user_query,
             re.IGNORECASE,
         )
-        if file_match:
-            file_path = file_match.group(1).strip('"\' ')
-            paths["data_path"] = file_path
+        if file_matches:
+            paths["data_path"] = ", ".join([f.strip('"\' ') for f in file_matches])
+
+    # 兜底识别：直接匹配所有长相像绝对路径或文件夹的描述
+    if not paths["data_path"]:
+        # 匹配位于 ... 下，如 “at E:\... ” 或者 “位于 /home/...”
+        loc_match = re.search(r'(?:位于|at|using files at|in|从)\s+([A-Za-z0-9_./:\-\\]+)', user_query, re.IGNORECASE)
+        if loc_match:
+            paths["data_path"] = loc_match.group(1).strip('"\' ')
+
+    # 兜底识别：直接匹配绝对路径（Linux的 / 或 Windows的 C:\ ）
+    if not paths["data_path"]:
+        abs_match = re.search(r'([a-zA-Z]:[\\/][A-Za-z0-9_./:\-\\]+|/[A-Za-z0-9_./\-\\]+)', user_query)
+        if abs_match:
+            paths["data_path"] = abs_match.group(1).strip('"\' ')
+
+    # 兜底识别：如“data/ 目录下”这类描述（如果前面都没匹配到文件）
+    if not paths["data_path"]:
+        dir_match = re.search(r'([A-Za-z0-9_./:\-\\]+[/\\]?)\s*目录', user_query, re.IGNORECASE)
+        if dir_match:
+            dir_path = dir_match.group(1).strip('"\' ')
+            paths["data_path"] = dir_path
 
     # 尝试匹配结果路径
     for pattern in result_patterns:
@@ -268,12 +282,13 @@ def extract_paths_from_state(state: CodeAgentState) -> CodeAgentState:
 
         # 更新 data_path（如果 state 中没有）
         if not has_data_path and parsed_paths["data_path"]:
-            # 验证路径是否存在
-            if os.path.exists(parsed_paths["data_path"]):
+            # 验证多路径或单路径是否存在
+            missing_paths = [p.strip() for p in parsed_paths["data_path"].split(",") if p.strip() and not os.path.exists(p.strip())]
+            if not missing_paths:
                 state["data_path"] = parsed_paths["data_path"]
                 print(f"  --> 从用户查询中解析到数据路径: {parsed_paths['data_path']}")
             else:
-                print(f"  --> 警告：解析到的数据路径不存在: {parsed_paths['data_path']}")
+                print(f"  --> 警告：解析到的数据路径部分或全部不存在: {', '.join(missing_paths)}")
                 # 仍然设置路径，让后续代码处理
                 state["data_path"] = parsed_paths["data_path"]
         elif not has_data_path:
@@ -399,27 +414,7 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
     if state.get("global_requirements"):
         req_instruction = "Supervisor 已经提前为你生成并安装了该任务全局所需的 global requirements。因此，在此步骤生成代码时，请【留空 requirements.txt】！**除非**你明确在修复之前的环境报错（如 `ModuleNotFoundError`）并需要额外补充缺失包，才在 requirements.txt 中列出。"
 
-    system_prompt = f"""
-你是专业的 Python工程师（专注于生物信息数据分析、科学计算及绘图代码生成）。请仅返回 Python 代码和 requirements.txt 包列表（无额外解释），严格按下方代码块格式输出。
-
-【Workflow 技能上下文】
-{skill_block}
-
-【代码生成硬性约束】
-1. 路径规范：代码在 Docker 内运行。由 {docker_data_path} 读取数据，将产出写入 {docker_output_path}。针对纯计算任务无文件 IO 则无需强行读盘。
-2. 勿默认套用单细胞流程：除非任务/SKILL 明确要求（如 h5ad、Leiden、UMAP），否则不要随意使用 scanpy 库或假设存在 AnnData。
-3. 脚本复用与流程：若存在 /app/workflows，请加入 sys.path 并复用其中 `scripts/` 的已有逻辑。API、容错与绘图均以 SKILL 为准，不要随意重写已有脚本核心逻辑。
-4. 输出契约：必须在脚本末尾使用 print(f"===RESULT==={{analysis_summary}}===") 以向系统反馈摘要（analysis_summary 应为一段表示执行概括的字符串）。
-5. 依赖声明：{req_instruction}
-6. 绘图准则：仅当明确需要绘图任务时才引入 matplotlib（必须选用 Agg 后端），以 plt.savefig 保存至 {docker_output_path} 下即可，严禁 show=True。纯数值任务免引入绘图库。
-7. 文件校验：若用户提供了输入文件列表，必须使用其确切路径或挂载名，禁止臆造其它文件名。
-8. 读表容错：遇到读取 .panel / 样本列表等文本时，要求使用 pandas.read_csv(..., sep=r"\\\\s+", comment='#', header=None) 此类容错方法，绝对禁止假定表格中存在名为 ID 的列。
-
-格式要求：
-python 代码全部被包括在 ```python 和 ``` 之间。
-requirements.txt 内容全部被包括在 ```txt 和 ``` 之间。
-【禁止】在 ```python 代码块内部再写任何 ``` 或 ```python 行；代码块内必须且只能为可执行的 Python 源码。
-    """
+    system_prompt = get_code_system_prompt(skill_block, docker_data_path, docker_output_path, req_instruction)
 
     # 构建任务描述，优先使用当前步骤的输入
     plan = state.get("plan", [])
@@ -469,15 +464,7 @@ requirements.txt 内容全部被包括在 ```txt 和 ``` 之间。
         outputs_str = "\n\n".join(recent_outputs)
         historical_outputs_context = f"\n【前期分析步骤的执行上下文摘要】\n以下是前面环节产生的日志与输出产物报告。如果你的代码需要载入前面环节生成的中间文件（如结果表或对象数据），请务必要参考其中的输出路径以保证挂载文件获取正确：\n{outputs_str}\n"
 
-    user_prompt = f"""{historical_outputs_context}{exploration_context}
-【当前生成任务需求】
-{task_description}
-
-{expected_output_note}
-{file_paths_note}
-
-{context_instruction}
-    """
+    user_prompt = get_code_user_prompt(historical_outputs_context, exploration_context, task_description, expected_output_note, file_paths_note, context_instruction)
 
     # 替换 prompt 中的本地路径为 Docker 路径，防止大模型嵌套创建目录
     if result_path and result_path != './result':
@@ -505,28 +492,21 @@ requirements.txt 内容全部被包括在 ```txt 和 ``` 之间。
             print(f"🔍 [Code Dev] 当前处于数据探查阶段，直接生成探查代码（跳过 SKILL 工具调研）...")
         elif is_retry and tool_context_str:
             print(f"🔄 [Code Dev] 当前步骤为重试迭代，使用已有的 Tool Context 进行重试，不再重新调研...")
+        elif not skill_id:
+            print(f"⏩ [Code Dev] Supervisor 未指派具体 SKILL (skill_id 为空)，跳过工具调研阶段直接生成代码...")
         else:
             print("\n" + "="*60)
             print(f"🔍 [Code Dev Tool Loop] 开始为执行任务查阅 SKILL 目录...")
             wf_host_path = resolve_workflow_root(skill_id) if skill_id else ""
             
-            tool_system_prompt = f"""
-你是代码生成前的问题拆解与调研专家。
-即将执行的环节对应技能(SKILL): `{skill_id}`。
-你的工作任务：先使用 `list_directory` 浏览该技能对应的文件目录结构，必须重点关注 `{wf_host_path}` 等相关路径；随后请从目录中找出与接下来任务最相关的极少数核心 `scripts` / `references` 脚本或示例，调用 `read_local_file` 查看 1-5 个最相关文件内容。切忌盲目读取所有脚本，完整的 SKILL.md 信息将在此调研结束后自动添加给实际编写代码的模型！
-
-【要求】
-- 必须且仅允许使用 Tool Calling （如 list_directory / read_local_file）发起工具调用请求。
-- 严禁在此刻生成任何以 ```python 格式代表最终代码的代码块，不要做模拟总结。
-- 当你认为已查阅到所需的所有上下文时，请直接回复字符串文本 "TOOL_CALLS_DONE" 以标志文档查阅彻底结束。
-"""
+            tool_system_prompt = get_tool_system_prompt(skill_id, wf_host_path)
             tool_messages = [
                 SystemMessage(content=tool_system_prompt),
-                HumanMessage(content=f"当前生成任务需求：\n{task_description}\n\n请立刻开始使用工具收集信息，完毕后回复 'TOOL_CALLS_DONE'。")
+                HumanMessage(content=get_tool_user_prompt(task_description))
             ]
             
             tool_iterations = 0
-            max_tool_iterations = 10
+            max_tool_iterations = 8
             collected_info = []
 
             while tool_iterations < max_tool_iterations:
@@ -536,7 +516,7 @@ requirements.txt 内容全部被包括在 ```txt 和 ``` 之间。
                 if not response.tool_calls:
                     break
 
-                print(f"  [Code Dev Tool Loop] 正在执行第 {tool_iterations+1} 轮推理...")
+                print(f"  [Code Dev Tool Loop] 正在执行第 {tool_iterations+1} 轮工具调用...")
                 for tool_call in response.tool_calls:
                     print(f"  [Code Dev Tool Loop] 调用工具: {tool_call['name']}({tool_call['args']})")
                     try:
@@ -563,6 +543,20 @@ requirements.txt 内容全部被包括在 ```txt 和 ``` 之间。
                 
             if collected_info:
                 tool_context_str = "\n【来自工具调研获取的最佳背景内容】\n" + "\n".join(collected_info) + "\n\n请结合上方参考资料和 SKILL 要求，完成任务代码编写。\n"
+                
+                # 兼容不同系统路径分隔符及 Python dict/JSON 序列化后的转义反斜杠
+                host_wf_root_os = get_workflows_root()
+                host_wf_root_posix = host_wf_root_os.replace('\\', '/')
+                host_wf_root_escaped = host_wf_root_os.replace('\\', '\\\\')
+                
+                # 依次替换转义格式、原生 OS 格式、POSIX 格式
+                tool_context_str = tool_context_str.replace(host_wf_root_escaped, "/app/workflows")
+                tool_context_str = tool_context_str.replace(host_wf_root_os, "/app/workflows")
+                tool_context_str = tool_context_str.replace(host_wf_root_posix, "/app/workflows")
+
+                tool_context_str = tool_context_str.replace('\\', '/')
+                # 修复可能出现的双斜杠，但不影响 URL 中的 ://
+                tool_context_str = re.sub(r'(?<!:)//+', '/', tool_context_str)
                 state["step_tool_context"] = tool_context_str
 
             print(f"🔍 [Code Dev Tool Loop] 调研结束，进入正式代码生成...")
@@ -570,7 +564,7 @@ requirements.txt 内容全部被包括在 ```txt 和 ``` 之间。
         # =============== 信息收集阶段结束 ===============
 
         # 将工具内容合并进 user_prompt 作为上下文，并添加 SKILL_BLOCK 要求
-        final_user_prompt = f"{tool_context_str}\n【Workflow技能参考】：\n{skill_block}\n\n【正式任务：所需功能要求】\n{user_prompt}"
+        final_user_prompt = get_final_user_prompt(tool_context_str, skill_block, user_prompt)
 
         messages = [
             SystemMessage(content=system_prompt),
@@ -724,8 +718,6 @@ import os
 sys.path.append(os.getcwd())
 if '{_skill_path_docker}' not in sys.path:
     sys.path.insert(0, '{_skill_path_docker}')
-import scanpy as sc
-import matplotlib.pyplot as plt
 # --- DEBUG START: 检查挂载情况 ---
 print("DEBUG: Checking /app/data contents...")
 try:
@@ -742,10 +734,6 @@ except Exception as e:
     print(f"DEBUG: Error checking directories: {{e}}")
 # --- DEBUG END ---
 print("===MAS_EXEC_START===")
-
-# 关键配置
-plt.switch_backend('Agg')  # 关闭matplotlib弹窗
-sc.settings.verbosity = 3  # 显示Scanpy详细日志
 """
 # 核心分析代码（来自大模型生成）
     llm_code = state.get("scanpy_code", "")

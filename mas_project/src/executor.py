@@ -58,7 +58,7 @@ class CodeExecutor:
         if os.path.exists(self.requirements_path):
             dockerfile_lines.extend([
                 f"COPY requirements.txt .",
-                "RUN pip install --no-cache-dir -r requirements.txt",
+                "RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --no-cache-dir -r requirements.txt",
             ])
 
         # Copy code file
