@@ -2,9 +2,23 @@
 LLM 工厂模块
 提供统一的 LLM 实例创建接口
 """
+from typing import Any, Optional
+
+import httpx
 from langchain_openai import ChatOpenAI
-from typing import Optional
+
 from .config import config
+
+
+def _llm_extra_kwargs() -> dict[str, Any]:
+    """可选 httpx 客户端：在 MAS_HTTPS_TRUST_ENV=false 时忽略环境代理。"""
+    t = config.LLM_REQUEST_TIMEOUT
+    timeout = httpx.Timeout(t, connect=min(60.0, t))
+    out: dict[str, Any] = {"request_timeout": t}
+    if not config.HTTPS_TRUST_ENV:
+        out["http_client"] = httpx.Client(trust_env=False, timeout=timeout)
+        out["http_async_client"] = httpx.AsyncClient(trust_env=False, timeout=timeout)
+    return out
 
 
 def get_llm(
@@ -32,5 +46,6 @@ def get_llm(
         model=model_name or config.MODEL_NAME,
         temperature=temperature if temperature is not None else config.DEFAULT_TEMPERATURE,
         streaming=streaming,
+        **_llm_extra_kwargs(),
     )
 

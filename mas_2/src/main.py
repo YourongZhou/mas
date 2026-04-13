@@ -160,12 +160,117 @@ def finalize_step(state: GlobalState) -> GlobalState:
         if not isinstance(code_solution, dict):
             return str(code_solution)
 
+        def _format_timing(timing) -> str:
+            if not isinstance(timing, dict) or not timing:
+                return ""
+
+            def _fmt(key: str) -> str:
+                value = timing.get(key, 0.0)
+                try:
+                    return f"{float(value):.2f}s"
+                except (TypeError, ValueError):
+                    return "n/a"
+
+            install_value = _fmt("pip_install_elapsed_seconds")
+            if timing.get("pip_install_skipped", False):
+                install_value += " (skipped)"
+
+            parts = [
+                f"container_setup={_fmt('container_setup_elapsed_seconds')}",
+                f"push_to_container={_fmt('push_to_container_elapsed_seconds')}",
+                f"pip_install={install_value}",
+                f"python_exec={_fmt('python_exec_elapsed_seconds')}",
+                f"collect_outputs={_fmt('collect_outputs_elapsed_seconds')}",
+                f"total={_fmt('total_elapsed_seconds')}",
+            ]
+            if timing.get("install_exit_code") is not None:
+                parts.append(f"install_exit_code={timing.get('install_exit_code')}")
+            if timing.get("python_exit_code") is not None:
+                parts.append(f"python_exit_code={timing.get('python_exit_code')}")
+            return ", ".join(parts)
+
+        def _format_phase_timing(phase_timing) -> str:
+            if not isinstance(phase_timing, dict) or not phase_timing:
+                return ""
+
+            def _fmt(key: str, mapping: dict) -> str:
+                value = mapping.get(key, 0.0)
+                try:
+                    return f"{float(value):.2f}s"
+                except (TypeError, ValueError):
+                    return "n/a"
+
+            parts = [
+                f"attempt={phase_timing.get('attempt', '?')}",
+                f"is_retry={bool(phase_timing.get('is_retry', False))}",
+            ]
+
+            gen = phase_timing.get("generate_code")
+            if isinstance(gen, dict):
+                parts.append(
+                    "generate_code="
+                    + ", ".join(
+                        [
+                            f"prompt_prep={_fmt('prompt_prep_elapsed_seconds', gen)}",
+                            f"tool_loop={_fmt('tool_loop_elapsed_seconds', gen)}",
+                            f"tool_llm={_fmt('tool_llm_elapsed_seconds', gen)}",
+                            f"tool_io={_fmt('tool_io_elapsed_seconds', gen)}",
+                            f"llm_generate={_fmt('llm_generate_elapsed_seconds', gen)}",
+                            f"parse={_fmt('parse_elapsed_seconds', gen)}",
+                            f"total={_fmt('total_elapsed_seconds', gen)}",
+                            f"tool_iterations={gen.get('tool_iterations', 0)}",
+                            f"tool_calls={gen.get('tool_calls', 0)}",
+                        ]
+                    )
+                )
+
+            reflection = phase_timing.get("self_reflection")
+            if isinstance(reflection, dict):
+                parts.append(
+                    "self_reflection="
+                    + ", ".join(
+                        [
+                            f"total={_fmt('total_elapsed_seconds', reflection)}",
+                            f"warnings={reflection.get('warnings_count', 0)}",
+                        ]
+                    )
+                )
+
+            execute = phase_timing.get("execute_code")
+            if isinstance(execute, dict):
+                parts.append(
+                    "execute_code="
+                    + ", ".join(
+                        [
+                            f"prep={_fmt('prep_elapsed_seconds', execute)}",
+                            f"executor_call={_fmt('executor_call_elapsed_seconds', execute)}",
+                            f"result_parse={_fmt('result_parse_elapsed_seconds', execute)}",
+                            f"total={_fmt('total_elapsed_seconds', execute)}",
+                        ]
+                    )
+                )
+
+            retry = phase_timing.get("prepare_retry")
+            if isinstance(retry, dict):
+                parts.append(
+                    "prepare_retry="
+                    + ", ".join(
+                        [
+                            f"feedback_extract={_fmt('feedback_extract_elapsed_seconds', retry)}",
+                            f"total={_fmt('total_elapsed_seconds', retry)}",
+                        ]
+                    )
+                )
+            return " | ".join(parts)
+
         code_text = str(code_solution.get("code", "")).strip()
         exec_result = str(code_solution.get("result", "")).strip()
         raw_output = str(code_solution.get("output", "")).strip()
         display_output = str(code_solution.get("output_display", "")).strip()
         tail_output = str(code_solution.get("output_tail", "")).strip()
         log_disk = str(code_solution.get("output_log_path", "")).strip()
+        timing_text = _format_timing(code_solution.get("timing"))
+        phase_timing_text = _format_phase_timing(code_solution.get("phase_timing"))
         if not display_output and raw_output:
             display_output = summarize_docker_stdout(raw_output)
         if not display_output and tail_output:
@@ -195,6 +300,12 @@ def finalize_step(state: GlobalState) -> GlobalState:
         if exec_result:
             lines.append("执行结果（===RESULT=== 提取）:")
             lines.append(exec_result)
+        if timing_text:
+            lines.append("Docker 阶段耗时:")
+            lines.append(timing_text)
+        if phase_timing_text:
+            lines.append("Code Dev 阶段耗时:")
+            lines.append(phase_timing_text)
         if log_text:
             lines.append(f"{log_label}:")
             lines.append(log_text)
@@ -368,4 +479,3 @@ workflow.add_edge("finalize", END)
 
 # 3. 编译主图
 graph = workflow.compile()
-

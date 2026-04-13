@@ -230,6 +230,21 @@ def generate_plan(state: SupervisorAgentState, retry_count: int = 0, max_retries
                     if new_id != state.get("docker_container_id"):
                         state["docker_container_id"] = new_id
                         print(f"  --> [容器建立成功] 已成功构建持久化容器，容器ID: {new_id[:12]}")
+                timing = exec_result.get("timing", {})
+                if timing:
+                    install_elapsed = timing.get("pip_install_elapsed_seconds", 0.0)
+                    total_elapsed = timing.get("total_elapsed_seconds", 0.0)
+                    try:
+                        print(
+                            "  --> [环境配置耗时] "
+                            f"container_setup={float(timing.get('container_setup_elapsed_seconds', 0.0)):.2f}s, "
+                            f"push_to_container={float(timing.get('push_to_container_elapsed_seconds', 0.0)):.2f}s, "
+                            f"pip_install={float(install_elapsed):.2f}s, "
+                            f"python_exec={float(timing.get('python_exec_elapsed_seconds', 0.0)):.2f}s, "
+                            f"total={float(total_elapsed):.2f}s"
+                        )
+                    except (TypeError, ValueError):
+                        pass
                 if exec_result.get("success"):
                     print("  --> [环境配置成功]")
                 else:
@@ -536,4 +551,3 @@ workflow.add_edge("make_decision", END)
 
 # 编译子图
 supervisor_agent_graph = workflow.compile()
-

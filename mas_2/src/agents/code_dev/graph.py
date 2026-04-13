@@ -5,6 +5,7 @@ Code Developer Agent 子图
 import os
 import re
 import tempfile
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -130,6 +131,8 @@ def _build_execute_pending_contribution(
     result_value: str | None = None,
     error_msg: str | None = None,
     output_files: list | None = None,
+    timing: dict | None = None,
+    phase_timing: dict | None = None,
 ) -> dict:
     """
     执行后写入 pending_contribution：默认不含完整 output，含 output_display / output_tail；
@@ -152,6 +155,10 @@ def _build_execute_pending_contribution(
         pending["output_log_path"] = log_path
     if _env_truthy("MAS_KEEP_FULL_EXEC_OUTPUT_IN_STATE"):
         pending["output"] = out
+    if timing:
+        pending["timing"] = timing
+    if phase_timing:
+        pending["phase_timing"] = phase_timing
     if success:
         pending["result"] = (result_value or "").strip()
         if output_files is not None:
@@ -165,6 +172,142 @@ def _build_execute_pending_contribution(
             )
         pending["error"] = err
     return pending
+
+
+def _format_executor_timing(timing: dict | None) -> str:
+    if not timing:
+        return "无"
+
+    def _fmt(key: str) -> str:
+        value = timing.get(key, 0.0)
+        try:
+            return f"{float(value):.2f}s"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    install_value = _fmt("pip_install_elapsed_seconds")
+    if timing.get("pip_install_skipped", False):
+        install_value += " (skipped)"
+
+    parts = [
+        f"container_setup={_fmt('container_setup_elapsed_seconds')}",
+        f"push_to_container={_fmt('push_to_container_elapsed_seconds')}",
+        f"pip_install={install_value}",
+        f"python_exec={_fmt('python_exec_elapsed_seconds')}",
+        f"collect_outputs={_fmt('collect_outputs_elapsed_seconds')}",
+        f"total={_fmt('total_elapsed_seconds')}",
+    ]
+
+    install_exit = timing.get("install_exit_code")
+    python_exit = timing.get("python_exit_code")
+    if install_exit is not None:
+        parts.append(f"install_exit_code={install_exit}")
+    if python_exit is not None:
+        parts.append(f"python_exit_code={python_exit}")
+    return ", ".join(parts)
+
+
+def _fmt_elapsed(value) -> str:
+    try:
+        return f"{float(value):.2f}s"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _ensure_attempt_timing(state: CodeAgentState, attempt_no: int, is_retry: bool) -> dict:
+    history = state.get("code_dev_attempt_timings")
+    if not isinstance(history, list):
+        history = []
+        state["code_dev_attempt_timings"] = history
+
+    current = {
+        "attempt": attempt_no,
+        "is_retry": is_retry,
+    }
+    history.append(current)
+    state["current_attempt_timing"] = current
+    return current
+
+
+def _format_tool_stats(tool_stats: dict[str, dict[str, float | int]]) -> str:
+    if not tool_stats:
+        return "无"
+    parts = []
+    for name in sorted(tool_stats.keys()):
+        info = tool_stats[name]
+        parts.append(
+            f"{name}:count={int(info.get('count', 0))},elapsed={_fmt_elapsed(info.get('elapsed_seconds', 0.0))}"
+        )
+    return "; ".join(parts)
+
+
+def _format_phase_timing(phase_timing: dict | None) -> str:
+    if not isinstance(phase_timing, dict) or not phase_timing:
+        return "无"
+
+    parts = [
+        f"attempt={phase_timing.get('attempt', '?')}",
+        f"is_retry={bool(phase_timing.get('is_retry', False))}",
+    ]
+
+    gen = phase_timing.get("generate_code")
+    if isinstance(gen, dict):
+        parts.append(
+            "generate_code="
+            + ",".join(
+                [
+                    f"prompt_prep={_fmt_elapsed(gen.get('prompt_prep_elapsed_seconds'))}",
+                    f"tool_loop={_fmt_elapsed(gen.get('tool_loop_elapsed_seconds'))}",
+                    f"tool_llm={_fmt_elapsed(gen.get('tool_llm_elapsed_seconds'))}",
+                    f"tool_io={_fmt_elapsed(gen.get('tool_io_elapsed_seconds'))}",
+                    f"llm_generate={_fmt_elapsed(gen.get('llm_generate_elapsed_seconds'))}",
+                    f"parse={_fmt_elapsed(gen.get('parse_elapsed_seconds'))}",
+                    f"total={_fmt_elapsed(gen.get('total_elapsed_seconds'))}",
+                    f"tool_iterations={gen.get('tool_iterations', 0)}",
+                    f"tool_calls={gen.get('tool_calls', 0)}",
+                    f"reused_tool_context={bool(gen.get('reused_tool_context', False))}",
+                ]
+            )
+        )
+
+    reflection = phase_timing.get("self_reflection")
+    if isinstance(reflection, dict):
+        parts.append(
+            "self_reflection="
+            + ",".join(
+                [
+                    f"total={_fmt_elapsed(reflection.get('total_elapsed_seconds'))}",
+                    f"warnings={reflection.get('warnings_count', 0)}",
+                ]
+            )
+        )
+
+    execute = phase_timing.get("execute_code")
+    if isinstance(execute, dict):
+        parts.append(
+            "execute_code="
+            + ",".join(
+                [
+                    f"prep={_fmt_elapsed(execute.get('prep_elapsed_seconds'))}",
+                    f"result_parse={_fmt_elapsed(execute.get('result_parse_elapsed_seconds'))}",
+                    f"total={_fmt_elapsed(execute.get('total_elapsed_seconds'))}",
+                ]
+            )
+        )
+
+    retry = phase_timing.get("prepare_retry")
+    if isinstance(retry, dict):
+        parts.append(
+            "prepare_retry="
+            + ",".join(
+                [
+                    f"feedback_extract={_fmt_elapsed(retry.get('feedback_extract_elapsed_seconds'))}",
+                    f"total={_fmt_elapsed(retry.get('total_elapsed_seconds'))}",
+                ]
+            )
+        )
+
+    return " | ".join(parts)
 
 
 def parse_paths_from_query(user_query: str) -> dict:
@@ -317,7 +460,9 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
     生成代码节点
     调用 LLM 生成代码，写入 pending_contribution
     """
-    print(f"--- [Code Dev] 正在生成代码 (迭代 {state.get('internal_iteration_count', 0) + 1}) ---")
+    attempt_no = state.get('internal_iteration_count', 0) + 1
+    generate_start = time.perf_counter()
+    print(f"--- [Code Dev] 正在生成代码 (迭代 {attempt_no}) ---")
 
     critic_feedback = state.get("critique_feedback", "")
     internal_feedback = state.get("feedback", "")
@@ -329,8 +474,12 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
     elif internal_feedback:
         print(f"  --> 收到内部执行的错误反馈: {internal_feedback[:500]}...")
         final_feedback = internal_feedback
+    is_retry_attempt = bool(critic_feedback or internal_feedback or state.get("internal_iteration_count", 0) > 0)
+    attempt_timing = _ensure_attempt_timing(state, attempt_no=attempt_no, is_retry=is_retry_attempt)
+    attempt_timing["retry_reason"] = "critic_feedback" if critic_feedback else ("internal_feedback" if internal_feedback else "")
 
     # 首先从 user_query 中提取路径（如果 state 中没有）
+    prompt_prep_start = time.perf_counter()
     state = extract_paths_from_state(state)
 
     # 构建 Prompt：如果有反馈，说明是修正模式
@@ -478,6 +627,7 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
             system_prompt = system_prompt.replace(f"./result/{base_result}", "/app/output")
             system_prompt = system_prompt.replace(f"result/{base_result}", "/app/output")
             system_prompt = system_prompt.replace(f"/app/output/{base_result}", "/app/output")
+    prompt_prep_elapsed = time.perf_counter() - prompt_prep_start
 
     try:
         tools = [list_directory, read_local_file]
@@ -487,14 +637,23 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
         is_exploration = not state.get("data_exploration_done", True)
         is_retry = state.get("internal_iteration_count", 0) > 0
         tool_context_str = state.get("step_tool_context", "")
+        tool_loop_elapsed = 0.0
+        tool_llm_elapsed = 0.0
+        tool_io_elapsed = 0.0
+        tool_iterations = 0
+        tool_calls_count = 0
+        tool_stats: dict[str, dict[str, float | int]] = {}
+        reused_tool_context = False
 
         if is_exploration:
             print(f"🔍 [Code Dev] 当前处于数据探查阶段，直接生成探查代码（跳过 SKILL 工具调研）...")
         elif is_retry and tool_context_str:
             print(f"🔄 [Code Dev] 当前步骤为重试迭代，使用已有的 Tool Context 进行重试，不再重新调研...")
+            reused_tool_context = True
         elif not skill_id:
             print(f"⏩ [Code Dev] Supervisor 未指派具体 SKILL (skill_id 为空)，跳过工具调研阶段直接生成代码...")
         else:
+            tool_loop_start = time.perf_counter()
             print("\n" + "="*60)
             print(f"🔍 [Code Dev Tool Loop] 开始为执行任务查阅 SKILL 目录...")
             wf_host_path = resolve_workflow_root(skill_id) if skill_id else ""
@@ -510,7 +669,9 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
             collected_info = []
 
             while tool_iterations < max_tool_iterations:
+                tool_llm_start = time.perf_counter()
                 response = llm_with_tools.invoke(tool_messages)
+                tool_llm_elapsed += time.perf_counter() - tool_llm_start
                 tool_messages.append(response)
                 
                 if not response.tool_calls:
@@ -518,7 +679,9 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
 
                 print(f"  [Code Dev Tool Loop] 正在执行第 {tool_iterations+1} 轮工具调用...")
                 for tool_call in response.tool_calls:
+                    tool_calls_count += 1
                     print(f"  [Code Dev Tool Loop] 调用工具: {tool_call['name']}({tool_call['args']})")
+                    tool_call_start = time.perf_counter()
                     try:
                         if tool_call["name"] == "list_directory":
                             tool_result = list_directory.invoke(tool_call['args'])
@@ -529,6 +692,11 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
                     except Exception as e:
                         tool_result = f"Error: 工具执行异常: {str(e)}"
                         print(f"  [Code Dev Tool Loop] 异常: {str(e)}")
+                    tool_call_elapsed = time.perf_counter() - tool_call_start
+                    tool_io_elapsed += tool_call_elapsed
+                    stat = tool_stats.setdefault(tool_call["name"], {"count": 0, "elapsed_seconds": 0.0})
+                    stat["count"] = int(stat.get("count", 0)) + 1
+                    stat["elapsed_seconds"] = float(stat.get("elapsed_seconds", 0.0)) + tool_call_elapsed
                     
                     preview = str(tool_result)[:500].replace('\n', ' ')
                     print(f"  [Code Dev Tool Loop] 结果预览: {preview}...")
@@ -560,6 +728,16 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
                 state["step_tool_context"] = tool_context_str
 
             print(f"🔍 [Code Dev Tool Loop] 调研结束，进入正式代码生成...")
+            tool_loop_elapsed = time.perf_counter() - tool_loop_start
+            print(
+                "【Code Dev Tool Loop 耗时】"
+                f"total={_fmt_elapsed(tool_loop_elapsed)}, "
+                f"llm={_fmt_elapsed(tool_llm_elapsed)}, "
+                f"tool_io={_fmt_elapsed(tool_io_elapsed)}, "
+                f"iterations={tool_iterations}, "
+                f"tool_calls={tool_calls_count}, "
+                f"stats={_format_tool_stats(tool_stats)}"
+            )
             print("="*60 + "\n")
         # =============== 信息收集阶段结束 ===============
 
@@ -582,10 +760,13 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
         print("*"*60 + "\n")
 
         # 生成正式代码
+        llm_generate_start = time.perf_counter()
         response = llm.invoke(messages)
+        llm_generate_elapsed = time.perf_counter() - llm_generate_start
         text = response.content
 
         # 提取代码块和 requirements
+        parse_start = time.perf_counter()
         # requirements 支持多种标签，避免模型输出轻微变化导致解析失败
         # 允许 ```python / ```py、大小写及首尾空白；非贪婪匹配至第一个闭合 ```
         python_pattern = r"```(?:python|py)\s*\n(.*?)```"
@@ -628,6 +809,7 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
             print("未获取到 requirements.txt 代码块，使用默认值")
             # 默认 requirements 置空
             requirements = ""
+        parse_elapsed = time.perf_counter() - parse_start
 
         # 更新状态
         state["scanpy_code"] = code
@@ -641,6 +823,26 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
             "task": state.get("task", "")
         }
 
+        attempt_timing["generate_code"] = {
+            "prompt_prep_elapsed_seconds": round(prompt_prep_elapsed, 3),
+            "tool_loop_elapsed_seconds": round(tool_loop_elapsed, 3),
+            "tool_llm_elapsed_seconds": round(tool_llm_elapsed, 3),
+            "tool_io_elapsed_seconds": round(tool_io_elapsed, 3),
+            "llm_generate_elapsed_seconds": round(llm_generate_elapsed, 3),
+            "parse_elapsed_seconds": round(parse_elapsed, 3),
+            "total_elapsed_seconds": round(time.perf_counter() - generate_start, 3),
+            "tool_iterations": tool_iterations,
+            "tool_calls": tool_calls_count,
+            "tool_stats": {
+                name: {
+                    "count": int(info.get("count", 0)),
+                    "elapsed_seconds": round(float(info.get("elapsed_seconds", 0.0)), 3),
+                }
+                for name, info in tool_stats.items()
+            },
+            "reused_tool_context": reused_tool_context,
+        }
+        print(f"【Code Dev生成耗时】{_format_phase_timing(attempt_timing)}")
         print(f"  --> 代码生成成功，代码长度: {len(code)} 字符")
 
     except Exception as e:
@@ -649,6 +851,12 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
         state["scanpy_code"] = f"代码生成失败: {e}"
         state["requirements_txt"] = f"requirements.txt 生成失败：{str(e)}"
         state["pending_contribution"] = {"error": error_msg}
+        attempt_timing["generate_code"] = {
+            "prompt_prep_elapsed_seconds": round(prompt_prep_elapsed, 3),
+            "total_elapsed_seconds": round(time.perf_counter() - generate_start, 3),
+            "failed": True,
+        }
+        print(f"【Code Dev生成耗时】{_format_phase_timing(attempt_timing)}")
         print(f"模型调用失败：{e}")
 
     return state
@@ -663,6 +871,7 @@ def self_reflection(state: CodeAgentState) -> CodeAgentState:
     if not code or code.startswith("# Error"):
         return state
 
+    reflection_start = time.perf_counter()
     print("--- [Code Dev] 进行自我检查 ---")
 
     # 简单的安全检查
@@ -675,6 +884,14 @@ def self_reflection(state: CodeAgentState) -> CodeAgentState:
     if warnings:
         print(f"  --> 警告: {', '.join(warnings)}")
 
+    attempt_timing = state.get("current_attempt_timing")
+    if isinstance(attempt_timing, dict):
+        attempt_timing["self_reflection"] = {
+            "warnings_count": len(warnings),
+            "total_elapsed_seconds": round(time.perf_counter() - reflection_start, 3),
+        }
+        print(f"【Code Dev自检耗时】attempt={attempt_timing.get('attempt', '?')}, total={_fmt_elapsed(attempt_timing['self_reflection']['total_elapsed_seconds'])}, warnings={len(warnings)}")
+
     return state
 
 
@@ -683,10 +900,13 @@ def execute_code(state: CodeAgentState) -> CodeAgentState:
     执行代码节点
     在 Docker 容器中执行生成的代码
     """
+    execute_start = time.perf_counter()
+    prep_start = execute_start
     print("--- [Code Dev] 正在执行代码 ---")
 
     code = state.get("scanpy_code", "")
     requirements = state.get("requirements_txt", "")
+    attempt_timing = state.get("current_attempt_timing")
 
     if not code or code.startswith("# Error"):
         state["success"] = False
@@ -887,9 +1107,13 @@ except Exception as e:
     print("【code.py】")
     print(full_code.strip())
     print("="*50 + "\n")
+    prep_elapsed = time.perf_counter() - prep_start
 
     try:
+        executor_start = time.perf_counter()
         result = executor.execute(code_str=full_code, requirements_str=requirements, timeout=600)
+        executor_call_elapsed = time.perf_counter() - executor_start
+        exec_timing = result.get("timing") if isinstance(result, dict) else None
 
         if result.get('container_id'):
             new_cid = result['container_id']
@@ -897,7 +1121,11 @@ except Exception as e:
                 print(f"  --> [容器建立成功] 已成功构建持久化容器，容器ID: {new_cid[:12]}")
             state['docker_container_id'] = new_cid
 
+        if exec_timing:
+            print(f"【Docker阶段耗时】{_format_executor_timing(exec_timing)}")
+
         # 控制台仅输出关键摘要，避免安装依赖等噪声日志淹没真实错误。
+        result_parse_start = time.perf_counter()
         output_str = result.get('output', '')
         output_str = output_str.split("===MAS_EXEC_START===")[-1] if "===MAS_EXEC_START===" in output_str else output_str
 
@@ -958,6 +1186,16 @@ except Exception as e:
             if not _err_summary:
                 _err_summary = "代码执行失败，但未提取到明确错误"
             print(f"【Docker执行摘要】FAILED: {_err_summary}")
+        result_parse_elapsed = time.perf_counter() - result_parse_start
+
+        if isinstance(attempt_timing, dict):
+            attempt_timing["execute_code"] = {
+                "prep_elapsed_seconds": round(prep_elapsed, 3),
+                "executor_call_elapsed_seconds": round(executor_call_elapsed, 3),
+                "result_parse_elapsed_seconds": round(result_parse_elapsed, 3),
+                "total_elapsed_seconds": round(time.perf_counter() - execute_start, 3),
+            }
+            print(f"【Code Dev执行耗时】{_format_phase_timing(attempt_timing)}")
         
         # 提取结果（参考 umap_langgraph.py 的改进）
         if executor_success and "===RESULT===" in output_str and not has_error_in_output and not result_looks_failed:
@@ -974,6 +1212,8 @@ except Exception as e:
                 success=True,
                 result_value=state["analysis_result"],
                 output_files=result.get("files", []),
+                timing=exec_timing,
+                phase_timing=attempt_timing if isinstance(attempt_timing, dict) else None,
             )
         else:
             # 执行失败或没有找到结果标记
@@ -1036,6 +1276,8 @@ except Exception as e:
                 output_str=output_str or "",
                 success=False,
                 error_msg=error_msg,
+                timing=exec_timing,
+                phase_timing=attempt_timing if isinstance(attempt_timing, dict) else None,
             )
 
     except Exception as e:
@@ -1055,6 +1297,8 @@ except Exception as e:
             output_str=_exec_log or "",
             success=False,
             error_msg=error_msg,
+            timing=_r.get("timing") if isinstance(_r, dict) else None,
+            phase_timing=attempt_timing if isinstance(attempt_timing, dict) else None,
         )
 
     return state
@@ -1143,17 +1387,20 @@ def should_retry(state: CodeAgentState) -> str:
     判断是否应该重试代码生成
     如果执行失败且没有达到最大重试次数，则重试
     """
-    max_retries = 10
+    max_retries = 3
     iteration_count = state.get("internal_iteration_count", 0)
     success = state.get("success", False)
 
     if success:
+        print(f"【Code Dev重试决策】attempt={iteration_count}, success=True, next=end")
         return "end"
     elif iteration_count < max_retries:
         print(f"  --> 执行失败，准备重试 (第 {iteration_count + 1}/{max_retries} 次)")
+        print(f"【Code Dev重试决策】attempt={iteration_count}, success=False, next=retry, remaining={max_retries - iteration_count}")
         return "retry"
     else:
         print(f"  --> 已达到最大重试次数 ({max_retries})，停止重试")
+        print(f"【Code Dev重试决策】attempt={iteration_count}, success=False, next=end")
         return "end"
 
 
@@ -1163,6 +1410,7 @@ def prepare_retry(state: CodeAgentState) -> CodeAgentState:
     将错误信息作为反馈，用于下一次代码生成
     """
     if not state.get("success", False):
+        retry_start = time.perf_counter()
         pending = state.get("pending_contribution") or {}
         feedback = ""
 
@@ -1181,6 +1429,14 @@ def prepare_retry(state: CodeAgentState) -> CodeAgentState:
         state["feedback"] = feedback
         _preview = feedback if len(feedback) <= 500 else feedback[:500] + "..."
         print(f"  --> 设置反馈信息: {_preview}")
+        attempt_timing = state.get("current_attempt_timing")
+        if isinstance(attempt_timing, dict):
+            attempt_timing["prepare_retry"] = {
+                "feedback_extract_elapsed_seconds": round(time.perf_counter() - retry_start, 3),
+                "feedback_length": len(feedback),
+                "total_elapsed_seconds": round(time.perf_counter() - retry_start, 3),
+            }
+            print(f"【Code Dev重试准备耗时】{_format_phase_timing(attempt_timing)}")
     return state
 
 
@@ -1214,4 +1470,3 @@ workflow.add_edge("display_result", END)
 
 # 编译子图
 code_agent_graph = workflow.compile()
-

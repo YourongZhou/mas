@@ -9,6 +9,7 @@ import docker
 import shutil
 import logging
 import re
+import time
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
@@ -206,8 +207,84 @@ class CodeExecutor:
             }
 
         container = None
+        total_start = time.perf_counter()
+        timing: dict[str, float | int | bool] = {
+            'container_setup_elapsed_seconds': 0.0,
+            'push_to_container_elapsed_seconds': 0.0,
+            'pip_install_elapsed_seconds': 0.0,
+            'python_exec_elapsed_seconds': 0.0,
+            'collect_outputs_elapsed_seconds': 0.0,
+            'total_elapsed_seconds': 0.0,
+            'pip_install_skipped': True,
+            'install_exit_code': None,
+            'python_exit_code': None,
+        }
+
+        def _remaining_timeout_seconds() -> int | None:
+            if timeout is None:
+                return None
+            elapsed = time.perf_counter() - total_start
+            remaining = timeout - elapsed
+            if remaining <= 0:
+                return 0
+            return max(1, int(remaining))
+
+        def _runtime_env_prelude() -> str:
+            return """set -e
+export PYTHONPATH="/app/workflows${PYTHONPATH:+:$PYTHONPATH}"
+RUNTIME_ROOT=/tmp/mas_runtime
+DEPS="$RUNTIME_ROOT/.mas_pydeps"
+export TMPDIR="$RUNTIME_ROOT/.mas_tmp"
+mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPREFIX"
+"""
+
+        def _exec_phase(script: str, phase_name: str) -> dict:
+            phase_start = time.perf_counter()
+            phase_timeout = _remaining_timeout_seconds()
+            if timeout is not None and phase_timeout == 0:
+                return {
+                    'exit_code': 124,
+                    'output': f'[{phase_name}] timeout budget exhausted before phase started',
+                    'elapsed_seconds': time.perf_counter() - phase_start,
+                }
+
+            command = "bash -lc " + shlex.quote(script)
+            if phase_timeout is not None:
+                command = f"timeout {phase_timeout} " + command
+
+            exec_result = container.exec_run(
+                cmd=command,
+                user=user,
+                demux=False
+            )
+            phase_output = exec_result.output.decode('utf-8', errors='replace').strip() if exec_result.output else ""
+            return {
+                'exit_code': exec_result.exit_code,
+                'output': phase_output,
+                'elapsed_seconds': time.perf_counter() - phase_start,
+            }
+
+        def _collect_output_files() -> list[dict]:
+            collect_start = time.perf_counter()
+            output_files: list[dict] = []
+            if self.output_dir:
+                output_path = Path(self.output_dir)
+                for file_path in output_path.rglob('*'):
+                    if file_path.is_file():
+                        if any(part.startswith('.mas_') for part in file_path.parts):
+                            continue
+                        output_files.append({
+                            'path': str(file_path),
+                            'name': file_path.name,
+                            'size': file_path.stat().st_size,
+                            'size_mb': file_path.stat().st_size / (1024 * 1024)
+                        })
+            timing['collect_outputs_elapsed_seconds'] = round(time.perf_counter() - collect_start, 3)
+            return output_files
+
         try:
             # 1. 尝试获取已有容器
+            container_setup_start = time.perf_counter()
             if self.container_id:
                 try:
                     container = self.client.containers.get(self.container_id)
@@ -249,6 +326,7 @@ class CodeExecutor:
                 self.logger.info(f"运行驻留容器，镜像: {self.docker_image}")
                 container = self.client.containers.run(**run_kwargs)
                 self.container_id = container.id
+            timing['container_setup_elapsed_seconds'] = round(time.perf_counter() - container_setup_start, 3)
 
             # 3. 将代码和 requirements 放入容器内
             import tarfile
@@ -278,58 +356,87 @@ class CodeExecutor:
                     tar.addfile(tinfo, io.BytesIO(r_bytes))
 
             pw_tarstream.seek(0)
+            push_start = time.perf_counter()
             self.logger.info(f"正在将最新代码与依赖推送到容器 {self.container_id[:12]} 内的 /app 目录...")
             container.put_archive('/app', pw_tarstream.read())
+            timing['push_to_container_elapsed_seconds'] = round(time.perf_counter() - push_start, 3)
 
-            # 4. 执行代码 (使用 timeout 命令限制执行时间)
-            _container_script = """set -e
-export PYTHONPATH="/app/workflows${PYTHONPATH:+:$PYTHONPATH}"
-RUNTIME_ROOT=/tmp/mas_runtime
-DEPS="$RUNTIME_ROOT/.mas_pydeps"
-export TMPDIR="$RUNTIME_ROOT/.mas_tmp"
-mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPREFIX"
-if [ -f /app/requirements.txt ] && [ -s /app/requirements.txt ]; then
-  python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /app/requirements.txt --target "$DEPS"
-fi
-export PYTHONPATH="$DEPS:$PYTHONPATH"
-python /app/code.py"""
-
-            command = f"timeout {timeout} bash -lc " + shlex.quote(_container_script)
-            
             user = f"{os.getuid()}:{os.getgid()}" if hasattr(os, 'getuid') else ''
-            
-            self.logger.info(f"正在容器 {self.container_id[:12]} 内执行代码 (超时设置: {timeout}s)...")
-            exec_result = container.exec_run(
-                cmd=command,
-                user=user,
-                demux=False
-            )
-            
-            status_code = exec_result.exit_code
-            logs = exec_result.output.decode('utf-8', errors='replace').strip() if exec_result.output else ""
+
+            combined_logs: list[str] = []
+
+            # 4. 先安装依赖（如果 requirements.txt 非空），再执行代码，分别计时
+            req_content = requirements_str or ""
+            if not req_content and self.requirements_path and os.path.exists(self.requirements_path):
+                with open(self.requirements_path, 'r', encoding='utf-8') as f:
+                    req_content = f.read()
+
+            if req_content.strip():
+                timing['pip_install_skipped'] = False
+                install_script = _runtime_env_prelude() + (
+                    'python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple '
+                    '-r /app/requirements.txt --target "$DEPS"'
+                )
+                self.logger.info(f"正在容器 {self.container_id[:12]} 内安装 Python 依赖...")
+                install_result = _exec_phase(install_script, "pip_install")
+                timing['pip_install_elapsed_seconds'] = round(install_result['elapsed_seconds'], 3)
+                timing['install_exit_code'] = install_result['exit_code']
+                if install_result['output']:
+                    combined_logs.append(install_result['output'])
+
+                if install_result['exit_code'] == 124:
+                    output_files = _collect_output_files()
+                    timing['total_elapsed_seconds'] = round(time.perf_counter() - total_start, 3)
+                    return {
+                        'success': False,
+                        'error': f'依赖安装超时 (总超时限制 {timeout}s)',
+                        'output': "\n".join(combined_logs),
+                        'files': output_files,
+                        'container_id': self.container_id,
+                        'exit_code': install_result['exit_code'],
+                        'timing': timing,
+                    }
+
+                if install_result['exit_code'] != 0:
+                    output_files = _collect_output_files()
+                    install_err = self._extract_error_summary(install_result['output'])
+                    if not install_err:
+                        install_err = f"依赖安装失败，退出码: {install_result['exit_code']}"
+                    timing['total_elapsed_seconds'] = round(time.perf_counter() - total_start, 3)
+                    return {
+                        'success': False,
+                        'error': install_err,
+                        'output': "\n".join(combined_logs),
+                        'files': output_files,
+                        'container_id': self.container_id,
+                        'exit_code': install_result['exit_code'],
+                        'timing': timing,
+                    }
+
+            exec_script = _runtime_env_prelude() + 'export PYTHONPATH="$DEPS:$PYTHONPATH"\npython /app/code.py'
+            self.logger.info(f"正在容器 {self.container_id[:12]} 内执行 Python 代码 (超时设置: {timeout}s)...")
+            python_result = _exec_phase(exec_script, "python_exec")
+            timing['python_exec_elapsed_seconds'] = round(python_result['elapsed_seconds'], 3)
+            timing['python_exit_code'] = python_result['exit_code']
+            if python_result['output']:
+                combined_logs.append(python_result['output'])
+
+            status_code = python_result['exit_code']
+            logs = "\n".join(part for part in combined_logs if part).strip()
 
             if status_code == 124: # timeout 命令的超时退出码
+                output_files = _collect_output_files()
+                timing['total_elapsed_seconds'] = round(time.perf_counter() - total_start, 3)
                 return {
                     'success': False,
                     'error': f'执行超时 ({timeout}s)',
                     'output': logs,
-                    'files': [],
+                    'files': output_files,
                     'container_id': self.container_id,
+                    'timing': timing,
                 }
 
-            output_files = []
-            if self.output_dir:
-                output_path = Path(self.output_dir)
-                for file_path in output_path.rglob('*'):
-                    if file_path.is_file():
-                        if any(part.startswith('.mas_') for part in file_path.parts):
-                            continue
-                        output_files.append({
-                            'path': str(file_path),
-                            'name': file_path.name,
-                            'size': file_path.stat().st_size,
-                            'size_mb': file_path.stat().st_size / (1024 * 1024)
-                        })
+            output_files = _collect_output_files()
 
             if status_code != 0:
                 # 提取去除了 pip 等前置噪音的日志进行错误分析
@@ -337,6 +444,7 @@ python /app/code.py"""
                 err = self._extract_error_summary(exec_logs)
                 if not err:
                     err = f"容器退出码非0: {status_code}"
+                timing['total_elapsed_seconds'] = round(time.perf_counter() - total_start, 3)
                 return {
                     'success': False,
                     'error': err,
@@ -344,21 +452,26 @@ python /app/code.py"""
                     'files': output_files,
                     'container_id': self.container_id,
                     'exit_code': status_code,
+                    'timing': timing,
                 }
 
+            timing['total_elapsed_seconds'] = round(time.perf_counter() - total_start, 3)
             return {
                 'success': True,
                 'output': logs,
                 'files': output_files,
                 'container_id': self.container_id,
                 'exit_code': status_code,
+                'timing': timing,
             }
         except Exception as e:
             self.logger.error(f"执行失败: {e}")
+            timing['total_elapsed_seconds'] = round(time.perf_counter() - total_start, 3)
             return {
                 'success': False,
                 'error': str(e),
                 'output': '',
                 'files': [],
-                'container_id': self.container_id
+                'container_id': self.container_id,
+                'timing': timing,
             }

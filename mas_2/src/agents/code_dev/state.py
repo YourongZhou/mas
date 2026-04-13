@@ -2,7 +2,7 @@
 Code Developer Agent 状态定义
 定义代码生成和执行相关的状态字段
 """
-from typing import TypedDict, Optional
+from typing import TypedDict, Optional, Any
 from src.core.state import GlobalState
 
 
@@ -34,4 +34,7 @@ class CodeAgentState(GlobalState):
     step_tool_context: Optional[str]
     # 复用的 Docker 容器 ID
     docker_container_id: Optional[str]
-
+    # 当前 attempt 的细分耗时
+    current_attempt_timing: Optional[dict[str, Any]]
+    # 历史 attempt 耗时列表
+    code_dev_attempt_timings: list[dict[str, Any]]

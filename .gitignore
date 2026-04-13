@@ -30,3 +30,4 @@ mas_2/workflows/*
 .vscode
 agent_cli_example/*
 mas_2/.files/*
+!mas_2/test_system1_with_time.ipynb
