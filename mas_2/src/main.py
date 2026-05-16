@@ -402,16 +402,16 @@ def finalize_step(state: GlobalState) -> GlobalState:
         print(f"[Finalize] LLM 汇总失败，使用兜底答案: {e}")
         final_answer = fallback_answer
 
-    # 任务结束，清理全局 Docker 容器
+    # 任务结束后统一清理当前实验专属 task container
     if state.get("docker_container_id"):
         try:
             import docker
             client = docker.from_env()
             container = client.containers.get(state["docker_container_id"])
             container.remove(force=True)
-            print(f"\n=== [Finalize] 已清理全局 Docker 容器: {state['docker_container_id'][:12]} ===")
+            print(f"\n=== [Finalize] 已清理实验 Docker task container: {state['docker_container_id'][:12]} ===")
         except Exception as e:
-            print(f"\n=== [Finalize] 清理全局 Docker 容器失败: {e} ===")
+            print(f"\n=== [Finalize] 清理实验 Docker task container 失败: {e} ===")
         state["docker_container_id"] = None
 
     return {

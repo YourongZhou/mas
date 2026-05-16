@@ -38,3 +38,6 @@ class CodeAgentState(GlobalState):
     current_attempt_timing: Optional[dict[str, Any]]
     # 历史 attempt 耗时列表
     code_dev_attempt_timings: list[dict[str, Any]]
+    sandbox_backend: Optional[str]
+    sandbox_endpoint: Optional[str]
+    sandbox_allowed_roots: Optional[list[str]]

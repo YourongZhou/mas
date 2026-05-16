@@ -8,11 +8,25 @@ import tempfile
 import docker
 import shutil
 import logging
+import json
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
+from src.utils.execution_environment import get_image_catalog_entry, image_catalog_root
+
 logging.basicConfig(level=logging.INFO)
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+_ENV_CACHE_ROOT = "/opt/mas_env_cache"
+_ENV_CACHE_DEPS_DIR = f"{_ENV_CACHE_ROOT}/pydeps"
+_ENV_CACHE_MANIFEST = f"{_ENV_CACHE_ROOT}/manifest.json"
+_ENV_CACHE_LOCK = f"{_ENV_CACHE_ROOT}/install.lock"
 
 
 class CodeExecutor:
@@ -20,7 +34,12 @@ class CodeExecutor:
     
     def __init__(self, docker_path: str = None, data_dir: str = None, data_dirs: list = None,
                  output_dir: str = None, input_files: list = None,
-                 workflow_host_path: str = None, container_id: str = None):
+                 workflow_host_path: str = None, container_id: str = None,
+                 docker_image: str | None = None, runtime: str = "python",
+                 env_profile: str | None = None, env_signature: str | None = None,
+                 env_mode: str = "isolated", asset_cache_host_path: str | None = None,
+                 env_cache_key: str | None = None, env_cache_volume: str | None = None,
+                 required_input_container_paths: list[str] | None = None):
         """
         初始化代码执行器
 
@@ -31,8 +50,20 @@ class CodeExecutor:
         self.code_path = f"{docker_path}/code.py" if docker_path else None
         self.requirements_path = f"{docker_path}/requirements.txt" if docker_path else None
         self.output_dir = output_dir if output_dir else "/tmp/output"  # 默认输出目录
-        self.docker_image = "python:3.11"
+        self.docker_image = docker_image or "python:3.11"
         self.container_id = container_id
+        self.runtime = (runtime or "python").strip() or "python"
+        self.env_profile = (env_profile or "").strip() or None
+        self.env_signature = (env_signature or "").strip() or None
+        self.env_mode = (env_mode or "isolated").strip() or "isolated"
+        self.asset_cache_host_path = asset_cache_host_path
+        self.env_cache_key = (env_cache_key or "").strip() or None
+        self.env_cache_volume = (env_cache_volume or "").strip() or None
+        self.required_input_container_paths = [
+            str(path).strip()
+            for path in (required_input_container_paths or [])
+            if str(path).strip()
+        ]
         
         # --- 关键修改 1：使用列表存储挂载信息，避免字典 Key 冲突 ---
         self.volume_mounts = []
@@ -90,6 +121,17 @@ class CodeExecutor:
             self.volume_mounts.append(f"{wf}:/app/workflows:ro")
             if not self.container_id:
                 self.logger.info(f"Workflow 目录挂载: {wf} -> /app/workflows")
+
+        if asset_cache_host_path and os.path.isdir(asset_cache_host_path):
+            cache_path = os.path.abspath(asset_cache_host_path)
+            self.volume_mounts.append(f"{cache_path}:/app/assets:rw")
+            if not self.container_id:
+                self.logger.info(f"Asset cache 挂载: {cache_path} -> /app/assets")
+
+        if self.env_cache_volume:
+            self.volume_mounts.append(f"{self.env_cache_volume}:{_ENV_CACHE_ROOT}:rw")
+            if not self.container_id:
+                self.logger.info(f"Env cache 挂载: {self.env_cache_volume} -> {_ENV_CACHE_ROOT}")
     
     def _determine_data_dirs_from_input_files(self, input_files: list):
         """
@@ -140,6 +182,276 @@ class CodeExecutor:
         except Exception as e:
             self.logger.error(f"FAILED.Docker客户端初始化失败: {e}")
             return False
+
+    def _shared_container_labels(self) -> dict[str, str]:
+        labels = {
+            "mas.managed": "1",
+            "mas.runtime": self.runtime,
+            "mas.env_mode": self.env_mode,
+            "mas.last_used_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if self.env_profile:
+            labels["mas.env_profile"] = self.env_profile
+        if self.env_signature:
+            labels["mas.env_signature"] = self.env_signature
+        return labels
+
+    def _ensure_image_available(self) -> None:
+        try:
+            self.client.images.get(self.docker_image)
+            return
+        except docker.errors.ImageNotFound:
+            pass
+
+        entry = get_image_catalog_entry(self.env_profile)
+        if not _env_truthy("MAS_DOCKER_DEV_BOOTSTRAP"):
+            raise RuntimeError(
+                f"所需 Docker 镜像不存在: {self.docker_image}。"
+                "如为本地开发，请设置 MAS_DOCKER_DEV_BOOTSTRAP=1 后重试。"
+            )
+        if entry is None:
+            raise RuntimeError(f"镜像缺失且无法 bootstrap：未找到 env_profile={self.env_profile} 的 image catalog")
+
+        docker_root = image_catalog_root()
+        dockerfile_path = (docker_root / entry.dockerfile).resolve()
+        context_path = (docker_root / entry.build_context).resolve()
+        if not dockerfile_path.is_file():
+            raise RuntimeError(f"Dockerfile 不存在，无法 bootstrap: {dockerfile_path}")
+        dockerfile_arg = os.path.relpath(dockerfile_path, start=context_path)
+        self.logger.info(
+            "ENV IMAGE BOOTSTRAP profile=%s image=%s dockerfile=%s",
+            self.env_profile or "unknown",
+            self.docker_image,
+            dockerfile_path,
+        )
+        self.client.images.build(
+            path=str(context_path),
+            dockerfile=dockerfile_arg,
+            tag=self.docker_image,
+            rm=True,
+        )
+
+    def _ensure_volume_exists(self, volume_name: str) -> None:
+        try:
+            self.client.volumes.get(volume_name)
+        except docker.errors.NotFound:
+            self.client.volumes.create(name=volume_name)
+
+    def _create_container_env_vars(self, environment_vars: dict | None = None) -> dict[str, str]:
+        env_vars = {
+            'PYTHONUNBUFFERED': '1',
+            'DEBIAN_FRONTEND': 'noninteractive',
+            'MPLCONFIGDIR': '/tmp/mas_runtime/.mas_mpl',
+            'NUMBA_CACHE_DIR': '/tmp/mas_runtime/.mas_numba',
+            'HOME': '/tmp',
+            'PYTHONPYCACHEPREFIX': '/tmp/mas_runtime/.mas_pycache',
+            'PIP_DISABLE_PIP_VERSION_CHECK': '1',
+        }
+        if environment_vars:
+            env_vars.update(environment_vars)
+        return env_vars
+
+    def _runtime_env_prelude(self, deps_dir: str) -> str:
+        return f"""set -e
+export PYTHONPATH="/app/workflows${{PYTHONPATH:+:$PYTHONPATH}}"
+RUNTIME_ROOT=/tmp/mas_runtime
+DEPS="{deps_dir}"
+export TMPDIR="$RUNTIME_ROOT/.mas_tmp"
+mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPREFIX"
+"""
+
+    def ensure_env_cache_ready(
+        self,
+        requirements_str: str | None = None,
+        environment_vars: dict | None = None,
+        mem_limit: str | None = '4g',
+        timeout: int | None = 900,
+    ) -> dict:
+        if not self.docker_available:
+            return {"success": False, "error": "Docker不可用", "output": ""}
+        if self.runtime != "python":
+            return {
+                "success": False,
+                "error": f"当前执行器仅支持 Python runtime，收到 runtime={self.runtime}",
+                "output": "",
+            }
+        if not self.env_cache_volume:
+            return {
+                "success": True,
+                "output": "env cache disabled",
+                "timing": {
+                    "cache_prepare_elapsed_seconds": 0.0,
+                    "cache_hit": True,
+                    "cache_install_performed": False,
+                },
+            }
+
+        req_lines = []
+        for raw_line in str(requirements_str or "").splitlines():
+            line = raw_line.strip()
+            if line and not line.startswith("#"):
+                req_lines.append(line)
+
+        self._ensure_image_available()
+        self._ensure_volume_exists(self.env_cache_volume)
+
+        total_start = time.perf_counter()
+        bootstrap = None
+        try:
+            env_vars = self._create_container_env_vars(environment_vars)
+            run_kwargs = {
+                'image': self.docker_image,
+                'command': ['sleep', 'infinity'],
+                'volumes': [f"{self.env_cache_volume}:{_ENV_CACHE_ROOT}:rw"],
+                'environment': env_vars,
+                'mem_limit': mem_limit,
+                'network_mode': 'bridge',
+                'detach': True,
+                'auto_remove': False,
+                'labels': {
+                    'mas.managed': '1',
+                    'mas.runtime': self.runtime,
+                    'mas.kind': 'env-bootstrap',
+                    'mas.env_profile': self.env_profile or '',
+                    'mas.env_signature': self.env_signature or '',
+                    'mas.env_cache_key': self.env_cache_key or '',
+                },
+            }
+
+            bootstrap = self.client.containers.run(**run_kwargs)
+            payload = {
+                "env_signature": self.env_signature or "",
+                "env_profile": self.env_profile or "",
+                "env_cache_key": self.env_cache_key or "",
+                "requirements": req_lines,
+                "manifest_path": _ENV_CACHE_MANIFEST,
+                "lock_path": _ENV_CACHE_LOCK,
+                "deps_dir": _ENV_CACHE_DEPS_DIR,
+            }
+            bootstrap_script = self._runtime_env_prelude(_ENV_CACHE_DEPS_DIR) + (
+                "python - <<'PY'\n"
+                "import fcntl, json, os, subprocess, sys\n"
+                f"payload = json.loads({json.dumps(json.dumps(payload, ensure_ascii=True))})\n"
+                "cache_root = os.path.dirname(payload['manifest_path'])\n"
+                "os.makedirs(cache_root, exist_ok=True)\n"
+                "os.makedirs(payload['deps_dir'], exist_ok=True)\n"
+                "os.chmod(cache_root, 0o777)\n"
+                "os.chmod(payload['deps_dir'], 0o777)\n"
+                "open(payload['lock_path'], 'a', encoding='utf-8').close()\n"
+                "os.chmod(payload['lock_path'], 0o666)\n"
+                "with open(payload['lock_path'], 'r+', encoding='utf-8') as fh:\n"
+                "    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)\n"
+                "    manifest = {}\n"
+                "    if os.path.exists(payload['manifest_path']):\n"
+                "        try:\n"
+                "            with open(payload['manifest_path'], 'r', encoding='utf-8') as mf:\n"
+                "                manifest = json.load(mf)\n"
+                "        except Exception:\n"
+                "            manifest = {}\n"
+                "    expected = {\n"
+                "        'env_signature': payload['env_signature'],\n"
+                "        'env_profile': payload['env_profile'],\n"
+                "        'env_cache_key': payload['env_cache_key'],\n"
+                "        'installed_requirements': payload['requirements'],\n"
+                "    }\n"
+                "    hit = (\n"
+                "        manifest.get('env_signature') == expected['env_signature']\n"
+                "        and manifest.get('env_cache_key') == expected['env_cache_key']\n"
+                "        and manifest.get('installed_requirements') == expected['installed_requirements']\n"
+                "    )\n"
+                "    if not hit and payload['requirements']:\n"
+                "        cmd = [\n"
+                "            sys.executable, '-m', 'pip', 'install',\n"
+                "            '-i', 'https://pypi.tuna.tsinghua.edu.cn/simple',\n"
+                "            '--target', payload['deps_dir'],\n"
+                "            *payload['requirements'],\n"
+                "        ]\n"
+                "        subprocess.check_call(cmd)\n"
+                "    manifest = {\n"
+                "        **expected,\n"
+                "        'last_used_at': __import__('datetime').datetime.utcnow().isoformat() + 'Z',\n"
+                "    }\n"
+                "    with open(payload['manifest_path'], 'w', encoding='utf-8') as mf:\n"
+                "        json.dump(manifest, mf, ensure_ascii=False, indent=2)\n"
+                "    os.chmod(payload['manifest_path'], 0o666)\n"
+                "    print('ENV CACHE HIT' if hit else 'ENV CACHE READY')\n"
+                "PY"
+            )
+            command = "bash -lc " + shlex.quote(bootstrap_script)
+            if timeout is not None:
+                command = f"timeout {int(timeout)} " + command
+            exec_result = bootstrap.exec_run(cmd=command, user='', demux=False)
+            output = exec_result.output.decode('utf-8', errors='replace').strip() if exec_result.output else ""
+            elapsed = round(time.perf_counter() - total_start, 3)
+            return {
+                "success": exec_result.exit_code == 0,
+                "error": "" if exec_result.exit_code == 0 else self._extract_error_summary(output) or "环境缓存准备失败",
+                "output": output,
+                "exit_code": exec_result.exit_code,
+                "timing": {
+                    "cache_prepare_elapsed_seconds": elapsed,
+                    "cache_hit": "ENV CACHE HIT" in output,
+                    "cache_install_performed": "ENV CACHE READY" in output,
+                },
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": str(exc),
+                "output": "",
+                "timing": {
+                    "cache_prepare_elapsed_seconds": round(time.perf_counter() - total_start, 3),
+                    "cache_hit": False,
+                    "cache_install_performed": False,
+                },
+            }
+        finally:
+            if bootstrap is not None:
+                try:
+                    bootstrap.remove(force=True)
+                except Exception:
+                    pass
+
+    def _run_required_inputs_preflight(self, container, user: str, timeout: int | None) -> dict | None:
+        if not self.required_input_container_paths:
+            return None
+        checks = "\n".join(
+            [
+                f'if [ ! -r {shlex.quote(path)} ]; then echo "MISSING_INPUT::{path}"; exit 31; fi'
+                for path in self.required_input_container_paths
+            ]
+        )
+        script = self._runtime_env_prelude(
+            _ENV_CACHE_DEPS_DIR if self.env_cache_volume else "/tmp/mas_runtime/.mas_pydeps"
+        ) + (
+            'echo "===PRE_EXEC_PREFLIGHT==="\n'
+            'if [ -d /app/data ]; then ls -1 /app/data || true; fi\n'
+            f"{checks}\n"
+            'echo "PREFLIGHT_OK"\n'
+        )
+        command = "bash -lc " + shlex.quote(script)
+        if timeout is not None:
+            command = f"timeout {int(timeout)} " + command
+        result = container.exec_run(cmd=command, user=user, demux=False)
+        output = result.output.decode('utf-8', errors='replace').strip() if result.output else ""
+        if result.exit_code == 0:
+            return None
+        missing_lines = [
+            line.split("MISSING_INPUT::", 1)[1].strip()
+            for line in output.splitlines()
+            if "MISSING_INPUT::" in line
+        ]
+        err = "挂载预检查失败"
+        if missing_lines:
+            err = "挂载预检查失败，容器内缺少输入文件: " + ", ".join(missing_lines)
+        elif output:
+            err = self._extract_error_summary(output) or err
+        return {
+            "success": False,
+            "error": err,
+            "output": output,
+            "exit_code": result.exit_code,
+        }
 
     def _prepare_temp_directory(self, temp_dir: str) -> None:
         shutil.copy2(self.code_path, os.path.join(temp_dir, 'code.py'))
@@ -205,6 +517,14 @@ class CodeExecutor:
                 'output': '',
                 'files': []
             }
+        if self.runtime != "python":
+            return {
+                'success': False,
+                'error': f'当前执行器仅支持 Python runtime，收到 runtime={self.runtime}',
+                'output': '',
+                'files': [],
+                'container_id': self.container_id,
+            }
 
         container = None
         total_start = time.perf_counter()
@@ -228,15 +548,6 @@ class CodeExecutor:
             if remaining <= 0:
                 return 0
             return max(1, int(remaining))
-
-        def _runtime_env_prelude() -> str:
-            return """set -e
-export PYTHONPATH="/app/workflows${PYTHONPATH:+:$PYTHONPATH}"
-RUNTIME_ROOT=/tmp/mas_runtime
-DEPS="$RUNTIME_ROOT/.mas_pydeps"
-export TMPDIR="$RUNTIME_ROOT/.mas_tmp"
-mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPREFIX"
-"""
 
         def _exec_phase(script: str, phase_name: str) -> dict:
             phase_start = time.perf_counter()
@@ -288,6 +599,20 @@ mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPRE
             if self.container_id:
                 try:
                     container = self.client.containers.get(self.container_id)
+                    labels = (container.attrs.get("Config", {}) or {}).get("Labels", {}) or {}
+                    if self.env_signature and labels.get("mas.env_signature") not in (None, "", self.env_signature):
+                        self.logger.info(
+                            "ENV SWITCH from=%s to=%s",
+                            labels.get("mas.env_profile", "unknown"),
+                            self.env_profile or "legacy",
+                        )
+                        container = None
+                    elif self.env_signature:
+                        self.logger.info(
+                            "ENV REUSE profile=%s container=%s",
+                            self.env_profile or labels.get("mas.env_profile", "unknown"),
+                            self.container_id[:12],
+                        )
                     if container.status != 'running':
                         container.start()
                 except docker.errors.NotFound:
@@ -295,17 +620,10 @@ mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPRE
 
             # 2. 如果无复用容器则新建
             if container is None:
-                env_vars = {
-                    'PYTHONUNBUFFERED': '1',
-                    'DEBIAN_FRONTEND': 'noninteractive',
-                    'MPLCONFIGDIR': '/tmp/mas_runtime/.mas_mpl',
-                    'NUMBA_CACHE_DIR': '/tmp/mas_runtime/.mas_numba',
-                    'HOME': '/tmp',
-                    'PYTHONPYCACHEPREFIX': '/tmp/mas_runtime/.mas_pycache',
-                    'PIP_DISABLE_PIP_VERSION_CHECK': '1',
-                }
-                if environment_vars:
-                    env_vars.update(environment_vars)
+                self._ensure_image_available()
+                if self.env_cache_volume:
+                    self._ensure_volume_exists(self.env_cache_volume)
+                env_vars = self._create_container_env_vars(environment_vars)
 
                 run_kwargs = {
                     'image': self.docker_image,
@@ -316,6 +634,7 @@ mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPRE
                     'network_mode': 'bridge',
                     'detach': True,
                     'auto_remove': False,
+                    'labels': self._shared_container_labels(),
                 }
                 if hasattr(os, 'getuid') and hasattr(os, 'getgid'):
                     try:
@@ -323,7 +642,12 @@ mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPRE
                     except Exception as e:
                         self.logger.warning(f"无法获取当前用户 UID/GID: {e}")
 
-                self.logger.info(f"运行驻留容器，镜像: {self.docker_image}")
+                self.logger.info(
+                    "ENV CREATE profile=%s image=%s mode=%s",
+                    self.env_profile or "legacy",
+                    self.docker_image,
+                    self.env_mode,
+                )
                 container = self.client.containers.run(**run_kwargs)
                 self.container_id = container.id
             timing['container_setup_elapsed_seconds'] = round(time.perf_counter() - container_setup_start, 3)
@@ -362,8 +686,28 @@ mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPRE
             timing['push_to_container_elapsed_seconds'] = round(time.perf_counter() - push_start, 3)
 
             user = f"{os.getuid()}:{os.getgid()}" if hasattr(os, 'getuid') else ''
+            deps_dir = _ENV_CACHE_DEPS_DIR if self.env_cache_volume else "/tmp/mas_runtime/.mas_pydeps"
 
             combined_logs: list[str] = []
+
+            preflight = self._run_required_inputs_preflight(
+                container,
+                user=user,
+                timeout=_remaining_timeout_seconds(),
+            )
+            if preflight is not None:
+                combined_logs.append(preflight.get("output", ""))
+                output_files = _collect_output_files()
+                timing['total_elapsed_seconds'] = round(time.perf_counter() - total_start, 3)
+                return {
+                    'success': False,
+                    'error': preflight.get('error', '挂载预检查失败'),
+                    'output': "\n".join(part for part in combined_logs if part).strip(),
+                    'files': output_files,
+                    'container_id': self.container_id,
+                    'exit_code': preflight.get('exit_code'),
+                    'timing': timing,
+                }
 
             # 4. 先安装依赖（如果 requirements.txt 非空），再执行代码，分别计时
             req_content = requirements_str or ""
@@ -373,7 +717,7 @@ mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPRE
 
             if req_content.strip():
                 timing['pip_install_skipped'] = False
-                install_script = _runtime_env_prelude() + (
+                install_script = self._runtime_env_prelude(deps_dir) + (
                     'python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple '
                     '-r /app/requirements.txt --target "$DEPS"'
                 )
@@ -413,7 +757,7 @@ mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPRE
                         'timing': timing,
                     }
 
-            exec_script = _runtime_env_prelude() + 'export PYTHONPATH="$DEPS:$PYTHONPATH"\npython /app/code.py'
+            exec_script = self._runtime_env_prelude(deps_dir) + 'export PYTHONPATH="$DEPS:$PYTHONPATH"\npython /app/code.py'
             self.logger.info(f"正在容器 {self.container_id[:12]} 内执行 Python 代码 (超时设置: {timeout}s)...")
             python_result = _exec_phase(exec_script, "python_exec")
             timing['python_exec_elapsed_seconds'] = round(python_result['elapsed_seconds'], 3)

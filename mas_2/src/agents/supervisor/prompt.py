@@ -67,7 +67,9 @@ def get_plan_generation_user_prompt(exploration_context: str, user_query: str, r
 - skill_id: 可选，字符串或 null。若本步骤绑定上表中的某一技能则填写其 id，否则为 null。
 
 【环境依赖 global_requirements】（字符串）
-- 若绑定的 SKILL 包含任何第三方或环境依赖要求，请将所需的所有库拼接成标准 requirements.txt 格式的换行字符串提出出来（例如 "scanpy>=1.9.0\\nmatplotlib"）；无要求则置空。这将被 docker 先行安装，供整体流程使用。
+- 该字段主要用于 legacy / 未声明结构化环境 profile 的 workflow。
+- 若 workflow 已有固定 family image/profile，请尽量置空；只有确实存在额外的小型 Python 依赖增量时才填写。
+- 如果需要填写，请输出标准 requirements.txt 格式的换行字符串（例如 "scanpy>=1.9.0\\nmatplotlib"）；无要求则置空。
 
 请确保计划覆盖用户任务的所有要求，并且所有字段都正确填写。若用户给出了结果/输出目录，计划中 output_files 的路径前缀应与用户期望一致。
 """

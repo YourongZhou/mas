@@ -2,12 +2,17 @@
 LLM 工厂模块
 提供统一的 LLM 实例创建接口
 """
+import logging
 from typing import Any, Optional
 
 import httpx
 from langchain_openai import ChatOpenAI
 
 from .config import config
+
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
 
 
 def _llm_extra_kwargs() -> dict[str, Any]:
@@ -48,4 +53,3 @@ def get_llm(
         streaming=streaming,
         **_llm_extra_kwargs(),
     )
-

@@ -1,0 +1,161 @@
+[
+  {
+    "env_profile": "py-general-v1",
+    "image_tag": "mas/py-general:v1",
+    "runtime": "python",
+    "base_image": "python:3.11-slim",
+    "dockerfile": "profiles/py-general-v1.Dockerfile",
+    "build_context": ".",
+    "smoke_test": "python -c \"import numpy, pandas, scipy, sklearn, seaborn, matplotlib, requests\"",
+    "package_versions_path": "env_manifests/py-general-v1.pip-freeze.txt",
+    "core_dependencies": [
+      "numpy>=1.26",
+      "pandas>=2.1",
+      "scipy>=1.11",
+      "scikit-learn>=1.4",
+      "matplotlib>=3.8",
+      "seaborn>=0.13",
+      "statsmodels>=0.14",
+      "plotnine>=0.13",
+      "requests>=2.31",
+      "reportlab>=4.0"
+    ],
+    "allowed_runtime_extras": [
+      "openpyxl",
+      "xlrd",
+      "pyarrow",
+      "fastparquet",
+      "tables",
+      "xlsxwriter"
+    ]
+  },
+  {
+    "env_profile": "py-scverse-v1",
+    "image_tag": "mas/py-scverse:v1",
+    "runtime": "python",
+    "base_image": "python:3.11-slim",
+    "dockerfile": "profiles/py-scverse-v1.Dockerfile",
+    "build_context": ".",
+    "smoke_test": "python -c \"import scanpy, anndata, seaborn, scvelo, cellrank, squidpy, sklearn\"",
+    "package_versions_path": "env_manifests/py-scverse-v1.pip-freeze.txt",
+    "core_dependencies": [
+      "scanpy>=1.10",
+      "anndata>=0.10",
+      "numpy>=1.26",
+      "pandas>=2.1",
+      "scikit-learn>=1.4",
+      "scikit-misc>=0.1",
+      "matplotlib>=3.8",
+      "seaborn>=0.13",
+      "plotnine>=0.13",
+      "adjustText>=0.8",
+      "scrublet>=0.2.3",
+      "squidpy>=1.4",
+      "scvi-tools>=1.1",
+      "harmonypy>=0.0.10",
+      "celltypist>=1.6",
+      "pydeseq2>=0.4",
+      "scvelo>=0.3",
+      "cellrank>=2.0",
+      "statsmodels>=0.14",
+      "scipy>=1.11",
+      "reportlab>=4.0"
+    ],
+    "allowed_runtime_extras": [
+      "openpyxl",
+      "xlrd",
+      "pyarrow",
+      "fastparquet",
+      "tables",
+      "xlsxwriter"
+    ]
+  },
+  {
+    "env_profile": "r-bioc-v1",
+    "image_tag": "mas/r-bioc:v1",
+    "runtime": "r",
+    "base_image": "rocker/r-ver:4.4.1",
+    "dockerfile": "profiles/r-bioc-v1.Dockerfile",
+    "build_context": ".",
+    "smoke_test": "Rscript -e \"library(DESeq2); library(ggplot2); library(survival)\"",
+    "package_versions_path": "env_manifests/r-bioc-v1.installed-packages.txt",
+    "core_dependencies": [
+      "DESeq2",
+      "apeglm",
+      "ggplot2",
+      "ggprism",
+      "ggrepel",
+      "survival",
+      "survminer",
+      "scales"
+    ],
+    "allowed_runtime_extras": [
+      "openpyxl",
+      "xlrd",
+      "pyarrow",
+      "fastparquet",
+      "tables",
+      "xlsxwriter"
+    ]
+  },
+  {
+    "env_profile": "r-singlecell-v1",
+    "image_tag": "mas/r-singlecell:v1",
+    "runtime": "r",
+    "base_image": "rocker/r-ver:4.4.1",
+    "dockerfile": "profiles/r-singlecell-v1.Dockerfile",
+    "build_context": ".",
+    "smoke_test": "Rscript -e \"library(Seurat); library(harmony); library(patchwork); library(SoupX); library(DoubletFinder); stopifnot(requireNamespace('SeuratData', quietly = TRUE))\"",
+    "package_versions_path": "env_manifests/r-singlecell-v1.installed-packages.txt",
+    "core_dependencies": [
+      "Seurat",
+      "harmony",
+      "patchwork",
+      "DoubletFinder",
+      "SoupX",
+      "SeuratData",
+      "SingleR",
+      "celldex",
+      "CellChat"
+    ],
+    "allowed_runtime_extras": [
+      "openpyxl",
+      "xlrd",
+      "pyarrow",
+      "fastparquet",
+      "tables",
+      "xlsxwriter"
+    ]
+  },
+  {
+    "env_profile": "mixed-genetics-v1",
+    "image_tag": "mas/mixed-genetics:v1",
+    "runtime": "mixed",
+    "base_image": "rocker/r-ver:4.4.1",
+    "dockerfile": "profiles/mixed-genetics-v1.Dockerfile",
+    "build_context": ".",
+    "smoke_test": "python3 -c 'import pandas, numpy, scipy, requests, seaborn' && Rscript -e 'library(data.table); cat(R.version.string)' && test -f /opt/fusion_twas/FUSION.assoc_test.R",
+    "package_versions_path": "env_manifests/mixed-genetics-v1.packages.txt",
+    "core_dependencies": [
+      "python3",
+      "pandas>=2.1",
+      "numpy>=1.26",
+      "scipy>=1.11",
+      "statsmodels>=0.14",
+      "requests>=2.31",
+      "seaborn>=0.13",
+      "metaxcan",
+      "plotnine>=0.13",
+      "BiocManager",
+      "FUSION"
+    ],
+    "allowed_runtime_extras": [
+      "openpyxl",
+      "xlrd",
+      "pyarrow",
+      "fastparquet",
+      "tables",
+      "xlsxwriter"
+    ]
+  }
+]

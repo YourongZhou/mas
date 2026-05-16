@@ -13,7 +13,7 @@ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
 from .state import CodeAgentState
 from src.core.llm import get_llm
-from src.tools import read_local_file, list_directory
+from src.sandbox.tools import build_code_dev_sandbox_tool_bundle
 from .executor import CodeExecutor
 from src.utils.docker_log_summary import summarize_docker_stdout
 from src.utils.project_paths import get_mas2_project_root
@@ -22,6 +22,15 @@ from src.utils.workflow_skills import (
     resolve_workflow_root,
     should_mount_workflow_in_docker,
     get_workflows_root,
+)
+from src.utils.execution_environment import (
+    asset_cache_status,
+    clear_environment_from_state,
+    ensure_asset_cache,
+    filter_profiled_requirements,
+    format_environment_package_versions_for_prompt,
+    resolve_environment_for_state,
+    sync_environment_to_state,
 )
 from ._utils.docker_path import convert_to_docker_path
 from ._utils.llm_code_sanitize import sanitize_llm_python_block
@@ -46,6 +55,104 @@ def _mas2_data_dir_candidates() -> list[str]:
 
 def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_input_file_host_path(input_ref: str, data_path: str, result_path: str) -> str | None:
+    ref = str(input_ref or "").strip()
+    if not ref:
+        return None
+
+    candidates: list[str] = []
+    if os.path.isabs(ref):
+        candidates.append(ref)
+    else:
+        candidates.extend(
+            [
+                os.path.abspath(ref),
+                os.path.join(result_path, ref) if result_path else "",
+                os.path.join(result_path, os.path.basename(ref)) if result_path else "",
+            ]
+        )
+        if data_path:
+            if os.path.isdir(data_path):
+                candidates.extend(
+                    [
+                        os.path.join(data_path, ref),
+                        os.path.join(data_path, os.path.basename(ref)),
+                    ]
+                )
+            elif os.path.isfile(data_path) and os.path.basename(data_path) == os.path.basename(ref):
+                candidates.append(data_path)
+        for root_candidate in _mas2_data_dir_candidates():
+            if root_candidate:
+                candidates.append(os.path.join(root_candidate, os.path.basename(ref)))
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        abs_path = os.path.abspath(text)
+        if abs_path in seen:
+            continue
+        seen.add(abs_path)
+        if os.path.exists(abs_path):
+            return abs_path
+    return None
+
+
+def _build_input_mount_plan(data_path: str, result_path: str, input_files: list[str]) -> dict:
+    result_root = os.path.abspath(result_path) if result_path else ""
+    data_dirs: list[str] = []
+    dir_to_index: dict[str, int] = {}
+    mappings: list[dict[str, str]] = []
+    required_container_paths: list[str] = []
+    missing_inputs: list[str] = []
+
+    def _register_data_dir(host_dir: str) -> int:
+        abs_dir = os.path.abspath(host_dir)
+        if abs_dir not in dir_to_index:
+            dir_to_index[abs_dir] = len(data_dirs)
+            data_dirs.append(abs_dir)
+        return dir_to_index[abs_dir]
+
+    for raw_ref in input_files or []:
+        ref = str(raw_ref or "").strip()
+        if not ref:
+            continue
+        resolved = _resolve_input_file_host_path(ref, data_path, result_path)
+        container_path = f"/app/data/{os.path.basename(ref)}"
+
+        if resolved:
+            abs_resolved = os.path.abspath(resolved)
+            if result_root and os.path.commonpath([result_root, abs_resolved]) == result_root:
+                rel_path = os.path.relpath(abs_resolved, result_root).replace("\\", "/")
+                container_path = f"/app/output/{rel_path}"
+            elif os.path.isfile(abs_resolved):
+                dir_index = _register_data_dir(os.path.dirname(abs_resolved))
+                container_root = "/app/data" if dir_index == 0 else f"/app/data{dir_index}"
+                container_path = f"{container_root}/{os.path.basename(abs_resolved)}"
+            elif os.path.isdir(abs_resolved):
+                dir_index = _register_data_dir(abs_resolved)
+                container_path = "/app/data" if dir_index == 0 else f"/app/data{dir_index}"
+        else:
+            missing_inputs.append(ref)
+
+        mappings.append(
+            {
+                "input_ref": ref,
+                "host_path": resolved or "",
+                "container_path": container_path,
+            }
+        )
+        required_container_paths.append(container_path)
+
+    return {
+        "data_dirs": data_dirs,
+        "mappings": mappings,
+        "required_container_paths": required_container_paths,
+        "missing_inputs": missing_inputs,
+    }
 
 
 def _exec_output_tail(text: str, n_lines: int) -> str:
@@ -422,11 +529,20 @@ def extract_paths_from_state(state: CodeAgentState) -> CodeAgentState:
     user_query = state.get("user_query", "")
     if user_query:
         parsed_paths = parse_paths_from_query(user_query)
+        candidate_result_path = state.get("result_path") or parsed_paths.get("result_path") or default_result_path
 
         # 更新 data_path（如果 state 中没有）
         if not has_data_path and parsed_paths["data_path"]:
-            # 验证多路径或单路径是否存在
-            missing_paths = [p.strip() for p in parsed_paths["data_path"].split(",") if p.strip() and not os.path.exists(p.strip())]
+            requested_paths = [p.strip() for p in parsed_paths["data_path"].split(",") if p.strip()]
+            missing_paths = []
+            for raw_path in requested_paths:
+                resolved = _resolve_input_file_host_path(
+                    raw_path,
+                    parsed_paths["data_path"],
+                    candidate_result_path,
+                )
+                if resolved is None and not os.path.exists(raw_path):
+                    missing_paths.append(raw_path)
             if not missing_paths:
                 state["data_path"] = parsed_paths["data_path"]
                 print(f"  --> 从用户查询中解析到数据路径: {parsed_paths['data_path']}")
@@ -555,11 +671,23 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
     docker_output_path = '/app/output'
 
     skill_id = state.get("current_step_skill_id")
+    resolved_env = resolve_environment_for_state(state, skill_id)
     # 统一使用较大的注入限制以兼容复杂 SKILL
     inj_limit = 12000
     skill_block = format_skill_injection_for_code_dev(skill_id, max_chars=inj_limit)
+    env_package_versions_block = format_environment_package_versions_for_prompt(resolved_env)
+    if env_package_versions_block:
+        skill_block = (skill_block + "\n" + env_package_versions_block).strip()
 
     req_instruction = "requirements.txt 须且仅需列出代码中实际调用的第三方依赖环境包，若是标准库可留空。"
+    if resolved_env:
+        core_names = ", ".join(resolved_env.core_dependencies) if resolved_env.core_dependencies else "(none)"
+        allowlist_names = ", ".join(resolved_env.allowed_runtime_extras) if resolved_env.allowed_runtime_extras else "(none)"
+        req_instruction = (
+            f"当前步骤已绑定预配置环境 profile={resolved_env.env_profile}。requirements.txt 仅允许声明运行时额外依赖；"
+            f"禁止覆盖或重装核心依赖 {core_names}。允许的额外依赖白名单仅限：{allowlist_names}。"
+            "若无需额外依赖，请保持 requirements.txt 为空。"
+        )
     if state.get("global_requirements"):
         req_instruction = "Supervisor 已经提前为你生成并安装了该任务全局所需的 global requirements。因此，在此步骤生成代码时，请【留空 requirements.txt】！**除非**你明确在修复之前的环境报错（如 `ModuleNotFoundError`）并需要额外补充缺失包，才在 requirements.txt 中列出。"
 
@@ -586,13 +714,22 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
         expected_output_note = f"\n\n【预期输出要求】\n{current_step_expected_output}\n请确保生成的代码能够满足上述要求。"
     
     # 构建文件路径说明
+    input_mount_plan = _build_input_mount_plan(data_path, result_path, input_files)
+    canonical_mapping_lines = [
+        f"- {item['input_ref']} -> {item['container_path']}"
+        + (f" (host: {item['host_path']})" if item.get("host_path") else "")
+        for item in input_mount_plan["mappings"]
+    ]
+
     file_paths_note = ""
     if input_files:
         file_paths_note += f"\n【输入文件】\n" + "\n".join([f"- {f}" for f in input_files])
-        file_paths_note += (
-            "\n（Docker 内数据目录为 /app/data/，请用 os.path.join('/app/data', '<basename>') 或下列 basename 读取；"
-            "勿使用未出现在上述列表中的文件名。）"
-        )
+        if canonical_mapping_lines:
+            file_paths_note += "\n【已验证的容器内输入路径映射】\n" + "\n".join(canonical_mapping_lines)
+        file_paths_note += "\n（必须严格使用上面的容器内路径读取输入，禁止臆造其它文件名或路径。）"
+        if input_mount_plan["missing_inputs"]:
+            file_paths_note += "\n【警告】以下输入文件暂未在宿主机解析到，若继续使用它们，执行前挂载预检会直接失败：\n"
+            file_paths_note += "\n".join([f"- {item}" for item in input_mount_plan["missing_inputs"]])
     if output_files:
         file_paths_note += f"\n【必须生成的输出文件】\n" + "\n".join([f"- {f}" for f in output_files])
         # 确保输出文件保存到指定路径
@@ -630,8 +767,11 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
     prompt_prep_elapsed = time.perf_counter() - prompt_prep_start
 
     try:
-        tools = [list_directory, read_local_file]
-        llm_with_tools = llm.bind_tools(tools)
+        sandbox_bundle = build_code_dev_sandbox_tool_bundle(state)
+        state["sandbox_backend"] = sandbox_bundle.backend
+        state["sandbox_endpoint"] = sandbox_bundle.endpoint
+        state["sandbox_allowed_roots"] = sandbox_bundle.allowed_roots
+        llm_with_tools = llm.bind_tools(sandbox_bundle.tools)
         
         # =============== 新增：工具调用专用的信息收集阶段 ===============
         is_exploration = not state.get("data_exploration_done", True)
@@ -656,6 +796,10 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
             tool_loop_start = time.perf_counter()
             print("\n" + "="*60)
             print(f"🔍 [Code Dev Tool Loop] 开始为执行任务查阅 SKILL 目录...")
+            print(
+                f"🔐 [Code Dev Tool Loop] sandbox backend={sandbox_bundle.backend} "
+                f"allowed_roots={sandbox_bundle.allowed_roots}"
+            )
             wf_host_path = resolve_workflow_root(skill_id) if skill_id else ""
             
             tool_system_prompt = get_tool_system_prompt(skill_id, wf_host_path)
@@ -683,12 +827,11 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
                     print(f"  [Code Dev Tool Loop] 调用工具: {tool_call['name']}({tool_call['args']})")
                     tool_call_start = time.perf_counter()
                     try:
-                        if tool_call["name"] == "list_directory":
-                            tool_result = list_directory.invoke(tool_call['args'])
-                        elif tool_call["name"] == "read_local_file":
-                            tool_result = read_local_file.invoke(tool_call['args'])
-                        else:
+                        tool_instance = sandbox_bundle.tool_map.get(tool_call["name"])
+                        if tool_instance is None:
                             tool_result = f"Error: Unknown tool {tool_call['name']}"
+                        else:
+                            tool_result = tool_instance.invoke(tool_call["args"])
                     except Exception as e:
                         tool_result = f"Error: 工具执行异常: {str(e)}"
                         print(f"  [Code Dev Tool Loop] 异常: {str(e)}")
@@ -979,124 +1122,181 @@ except Exception as e:
 
     full_code = header + "\n# --- LLM Generated Code ---\n" + llm_code + "\n" + footer
 
-    # 智能确定数据路径：检查输入文件的实际位置
     data_path = state.get("data_path", "")
     current_step_file_paths = state.get("current_step_file_paths", {})
     input_files = current_step_file_paths.get("input_files", []) if current_step_file_paths else []
-    
-    # 如果计划中指定了输入文件，检查它们实际存在的位置
-    actual_data_path = data_path
-    if input_files:
-        # 检查第一个输入文件的实际位置
-        first_input = input_files[0]
-        
-        # 如果输入文件路径是绝对路径且存在，使用其所在目录
-        if os.path.isabs(first_input) and os.path.exists(first_input):
-            actual_data_path = os.path.dirname(first_input) if os.path.isfile(first_input) else first_input
-            print(f"  --> 检测到输入文件: {first_input}")
-            print(f"  --> 使用输入文件所在目录作为数据路径: {actual_data_path}")
-        # 如果输入文件路径是相对路径，尝试在 result_path 中查找
-        elif not os.path.isabs(first_input):
-            # 尝试在 result_path 中查找（可能是上一轮的输出）
-            candidate_paths = [
-                os.path.join(result_path, first_input),  # result_path/input_file
-                os.path.join(result_path, os.path.basename(first_input)),  # result_path/filename
-                first_input  # 直接使用相对路径
-            ]
-            
-            for candidate in candidate_paths:
-                if os.path.exists(candidate):
-                    actual_data_path = os.path.dirname(candidate) if os.path.isfile(candidate) else candidate
-                    print(f"  --> 在候选路径中找到输入文件: {candidate}")
-                    print(f"  --> 使用该输入文件所在目录作为数据路径: {actual_data_path}")
-                    break
-            else:
-                # 仅文件名时：在 mas_2/data 与 ./data 下按 basename 查找（不依赖 Notebook CWD）
-                base = os.path.basename(first_input)
-                found_in_project_data = False
-                for root_candidate in _mas2_data_dir_candidates():
-                    if not root_candidate or not os.path.isdir(root_candidate):
-                        continue
-                    cand = os.path.join(root_candidate, base)
-                    if os.path.exists(cand):
-                        actual_data_path = root_candidate
-                        print(f"  --> 在数据目录 {root_candidate} 中找到输入文件: {cand}")
-                        found_in_project_data = True
-                        break
-                if not found_in_project_data and data_path and os.path.exists(data_path):
-                    candidate_in_data = os.path.join(data_path, first_input) if os.path.isdir(data_path) else None
-                    if candidate_in_data and os.path.exists(candidate_in_data):
-                        actual_data_path = data_path
-                        print(f"  --> 在原始 data_path 中找到输入文件: {candidate_in_data}")
-                    else:
-                        # 如果还是找不到，使用 result_path（因为可能是上一轮的输出）
-                        actual_data_path = result_path
-                        print(f"  --> 未找到输入文件，使用 result_path 作为数据路径: {actual_data_path}")
-        # 如果输入文件路径是绝对路径但不存在，检查是否在 result_path 中
-        elif os.path.isabs(first_input) and not os.path.exists(first_input):
-            filename = os.path.basename(first_input)
-            candidate_in_result = os.path.join(result_path, filename)
-            if os.path.exists(candidate_in_result):
-                actual_data_path = result_path
-                print(f"  --> 输入文件不存在，但在 result_path 中找到同名文件: {candidate_in_result}")
-                print(f"  --> 使用 result_path 作为数据路径: {actual_data_path}")
-            else:
-                for root_candidate in _mas2_data_dir_candidates():
-                    if not root_candidate or not os.path.isdir(root_candidate):
-                        continue
-                    cand = os.path.join(root_candidate, filename)
-                    if os.path.exists(cand):
-                        actual_data_path = root_candidate
-                        print(f"  --> 绝对路径无效，在 {root_candidate} 中找到同名文件: {cand}")
-                        break
-    
-    # 如果 actual_data_path 为空或不存在，优先尝试 mas_2/data 与 ./data（不依赖 Notebook CWD）
-    if not actual_data_path or not os.path.exists(actual_data_path):
+    input_mount_plan = _build_input_mount_plan(data_path, result_path, input_files)
+    actual_data_dirs = list(input_mount_plan["data_dirs"])
+    actual_data_path = actual_data_dirs[0] if actual_data_dirs else data_path
+
+    for mapping in input_mount_plan["mappings"]:
+        if mapping.get("host_path"):
+            print(
+                f"  --> 输入映射: {mapping['input_ref']} -> {mapping['container_path']} "
+                f"(host: {mapping['host_path']})"
+            )
+    for missing in input_mount_plan["missing_inputs"]:
+        print(f"  --> 警告：未在宿主机解析到输入文件: {missing}")
+
+    if not actual_data_dirs and (not actual_data_path or not os.path.exists(actual_data_path)):
         for default_data_dir in _mas2_data_dir_candidates():
             if default_data_dir and os.path.isdir(default_data_dir):
                 actual_data_path = default_data_dir
+                actual_data_dirs = [default_data_dir]
                 print(f"  --> 数据路径无效，使用默认 data 目录: {actual_data_path}")
                 break
-
-    # 如果仍无有效数据路径，再回退到 result_path
-    if not actual_data_path or not os.path.exists(actual_data_path):
-        if result_path and os.path.exists(result_path):
-            actual_data_path = result_path
-            print(f"  --> 数据路径无效，使用 result_path 作为数据路径: {actual_data_path}")
-    
-    # 确保数据路径存在
-    if actual_data_path and not os.path.exists(actual_data_path):
-        print(f"  --> 警告：数据路径不存在: {actual_data_path}，将尝试创建")
-        try:
-            os.makedirs(actual_data_path, exist_ok=True)
-        except Exception as e:
-            print(f"  --> 无法创建数据路径: {e}")
 
     # 在 Docker 容器中执行代码
     # 传递 input_files 以便 executor 智能确定需要挂载的目录
     from src.utils.workflow_skills import get_workflows_root
     workflow_host = get_workflows_root()
-    if workflow_host and not state.get("docker_container_id"):
-        print(f"  --> Workflow 目录将挂载到容器 /app/workflows: {workflow_host}")
+    resolved_env = resolve_environment_for_state(state, _skill_for_exec)
+    executor_container_id = state.get("docker_container_id")
+    asset_cache_host_path = None
 
-    executor = CodeExecutor(
-        docker_path=None,
-        container_id=state.get('docker_container_id'),
-        data_dir=actual_data_path if actual_data_path and os.path.exists(actual_data_path) else None,
-        input_files=input_files if input_files else None,
-        output_dir=result_path,
-        workflow_host_path=workflow_host,
-    )
+    if resolved_env:
+        print(
+            f"ENV RESOLVE profile={resolved_env.env_profile} "
+            f"runtime={resolved_env.runtime} reason={resolved_env.skill_id}"
+        )
+        prev_sig = state.get("docker_env_signature")
+        prev_profile = state.get("docker_env_profile")
+        if prev_sig and prev_sig != resolved_env.env_signature:
+            print(
+                f"ENV SWITCH from={prev_profile or 'legacy'} to={resolved_env.env_profile}"
+            )
+            executor_container_id = None
+        for asset_name, exists, asset_path in asset_cache_status(resolved_env):
+            print(
+                f"ASSET CACHE {'HIT' if exists else 'MISS'} "
+                f"asset={asset_name} path={asset_path}"
+            )
+        asset_cache_root = ensure_asset_cache(resolved_env)
+        if asset_cache_root is not None:
+            asset_cache_host_path = str(asset_cache_root)
 
-    # 首次启动容器才合并 global_requirements 进行集中安装
-    if not state.get('docker_container_id') and state.get('global_requirements'):
-        print(f"  --> [初次执行] 组合并预安装 global_requirements")
-        global_reqs = state['global_requirements'].strip()
-        if global_reqs:
-            if requirements.strip():
-                requirements = global_reqs + "\n" + requirements.strip()
-            else:
-                requirements = global_reqs
+        if not resolved_env.is_python:
+            err = (
+                f"当前 workflow `{_skill_for_exec}` 绑定 runtime={resolved_env.runtime} / "
+                f"image={resolved_env.env_image}，但当前 Code Dev 执行器仅支持 Python。"
+            )
+            print(f"  --> [ENV UNSUPPORTED] {err}")
+            state["success"] = False
+            state["analysis_result"] = err
+            state["pending_contribution"] = _build_execute_pending_contribution(
+                code=full_code,
+                requirements=requirements,
+                task=state.get("task", ""),
+                output_str="",
+                success=False,
+                error_msg=err,
+            )
+            return state
+
+        filtered_requirements = filter_profiled_requirements(resolved_env, requirements)
+        if filtered_requirements.blocked_lines:
+            print(
+                "  --> [PROFILE REQUIREMENTS FILTER] 已忽略以下 requirements: "
+                + ", ".join(filtered_requirements.blocked_lines)
+            )
+        if filtered_requirements.blocked_core_lines:
+            print(
+                "  --> [PROFILE REQUIREMENTS FILTER] 已阻止核心依赖覆盖: "
+                + ", ".join(filtered_requirements.blocked_core_lines)
+            )
+        sync_environment_to_state(
+            state,
+            resolved_env,
+            env_cache_key=filtered_requirements.env_cache_key,
+            env_cache_volume=filtered_requirements.env_cache_volume,
+        )
+
+        if workflow_host and not executor_container_id:
+            print(f"  --> Workflow 目录将挂载到容器 /app/workflows: {workflow_host}")
+
+        shared_cache_volume = (
+            filtered_requirements.env_cache_volume
+            if resolved_env.is_shared
+            else None
+        )
+        executor = CodeExecutor(
+            docker_path=None,
+            container_id=executor_container_id,
+            data_dir=actual_data_path if actual_data_path and os.path.exists(actual_data_path) else None,
+            data_dirs=actual_data_dirs if actual_data_dirs else None,
+            input_files=input_files if input_files else None,
+            output_dir=result_path,
+            workflow_host_path=workflow_host,
+            docker_image=resolved_env.env_image,
+            runtime=resolved_env.runtime,
+            env_profile=resolved_env.env_profile,
+            env_signature=resolved_env.env_signature,
+            env_mode=resolved_env.env_mode,
+            asset_cache_host_path=asset_cache_host_path,
+            env_cache_key=filtered_requirements.env_cache_key,
+            env_cache_volume=shared_cache_volume,
+            required_input_container_paths=input_mount_plan["required_container_paths"],
+        )
+
+        if resolved_env.is_shared:
+            cache_result = executor.ensure_env_cache_ready(
+                requirements_str=filtered_requirements.allowed_text,
+                timeout=900,
+            )
+            cache_timing = cache_result.get("timing", {}) if isinstance(cache_result, dict) else {}
+            if cache_timing:
+                print(
+                    "  --> [环境缓存预热] "
+                    f"elapsed={float(cache_timing.get('cache_prepare_elapsed_seconds', 0.0)):.2f}s, "
+                    f"cache_hit={bool(cache_timing.get('cache_hit', False))}, "
+                    f"install={bool(cache_timing.get('cache_install_performed', False))}"
+                )
+            if not cache_result.get("success"):
+                err = cache_result.get("error", "环境缓存准备失败")
+                print(f"  --> [ENV CACHE FAILED] {err}")
+                state["success"] = False
+                state["analysis_result"] = err
+                state["pending_contribution"] = _build_execute_pending_contribution(
+                    code=full_code,
+                    requirements=filtered_requirements.allowed_text,
+                    task=state.get("task", ""),
+                    output_str=cache_result.get("output", "") if isinstance(cache_result, dict) else "",
+                    success=False,
+                    error_msg=err,
+                )
+                return state
+            requirements = ""
+        else:
+            requirements = filtered_requirements.allowed_text
+    else:
+        if state.get("docker_env_signature"):
+            print(
+                f"ENV SWITCH from={state.get('docker_env_profile') or 'profiled'} to=legacy"
+            )
+            clear_environment_from_state(state)
+        if workflow_host and not state.get("docker_container_id"):
+            print(f"  --> Workflow 目录将挂载到容器 /app/workflows: {workflow_host}")
+
+        executor = CodeExecutor(
+            docker_path=None,
+            container_id=None if state.get("docker_env_signature") else state.get('docker_container_id'),
+            data_dir=actual_data_path if actual_data_path and os.path.exists(actual_data_path) else None,
+            data_dirs=actual_data_dirs if actual_data_dirs else None,
+            input_files=input_files if input_files else None,
+            output_dir=result_path,
+            workflow_host_path=workflow_host,
+            required_input_container_paths=input_mount_plan["required_container_paths"],
+        )
+
+        # 仅 legacy/unprofiled workflow 使用 global_requirements fallback
+        if not state.get('docker_container_id') and state.get('global_requirements'):
+            print(f"  --> [LEGACY ENV] 首次执行，组合并预安装 global_requirements")
+            global_reqs = state['global_requirements'].strip()
+            if global_reqs:
+                if requirements.strip():
+                    requirements = global_reqs + "\n" + requirements.strip()
+                else:
+                    requirements = global_reqs
 
     print("\n" + "="*50)
     print(f"🚀 [Code Dev] 准备推送到 Docker 执行的代码与环境 (迭代 {state.get('internal_iteration_count', 0)})")
@@ -1110,9 +1310,12 @@ except Exception as e:
     prep_elapsed = time.perf_counter() - prep_start
 
     try:
+        step_name = state.get("current_step_input") or _skill_for_exec or f"step_{state.get('current_step_index', 0)}"
+        print(f"EXEC START step={step_name}")
         executor_start = time.perf_counter()
         result = executor.execute(code_str=full_code, requirements_str=requirements, timeout=600)
         executor_call_elapsed = time.perf_counter() - executor_start
+        print(f"EXEC END step={step_name} elapsed={executor_call_elapsed:.2f}s")
         exec_timing = result.get("timing") if isinstance(result, dict) else None
 
         if result.get('container_id'):
@@ -1120,9 +1323,16 @@ except Exception as e:
             if new_cid != state.get('docker_container_id'):
                 print(f"  --> [容器建立成功] 已成功构建持久化容器，容器ID: {new_cid[:12]}")
             state['docker_container_id'] = new_cid
+            if resolved_env:
+                sync_environment_to_state(state, resolved_env, container_id=new_cid)
 
         if exec_timing:
             print(f"【Docker阶段耗时】{_format_executor_timing(exec_timing)}")
+            if resolved_env and not exec_timing.get("pip_install_skipped", True):
+                print(
+                    f"ENV EXTRA INSTALL profile={resolved_env.env_profile} "
+                    f"elapsed={float(exec_timing.get('pip_install_elapsed_seconds', 0.0)):.2f}s"
+                )
 
         # 控制台仅输出关键摘要，避免安装依赖等噪声日志淹没真实错误。
         result_parse_start = time.perf_counter()

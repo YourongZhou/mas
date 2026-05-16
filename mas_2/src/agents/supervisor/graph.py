@@ -10,6 +10,13 @@ from .state import SupervisorAgentState
 from src.core.llm import get_llm
 from src.core.state import PlanStep
 from src.utils.workflow_skills import format_skills_catalog_for_prompt
+from src.utils.execution_environment import (
+    asset_cache_status,
+    ensure_asset_cache,
+    filter_profiled_requirements,
+    resolve_execution_environment,
+    sync_environment_to_state,
+)
 from .exploration_plan import generate_exploration_plan
 from src.agents.code_dev.executor import CodeExecutor
 from .prompt import get_skill_selection_system_prompt, get_skill_selection_user_prompt, get_plan_generation_system_prompt, get_plan_generation_user_prompt
@@ -196,61 +203,102 @@ def generate_plan(state: SupervisorAgentState, retry_count: int = 0, max_retries
         state["plan"] = plan
         state["current_step_index"] = 0
         state["completed_steps_outputs"] = []  # 清空历史日志，确保正式计划开始时不受探查信息干扰
-        if getattr(response, "global_requirements", None):
+        bootstrap_skill_id = selected_skill_id or next(
+            (getattr(step, "skill_id", None) for step in plan if getattr(step, "skill_id", None)),
+            None,
+        )
+        resolved_env = resolve_execution_environment(bootstrap_skill_id) if bootstrap_skill_id else None
+        if resolved_env:
+            state["global_requirements"] = None
+            print(
+                f"ENV RESOLVE profile={resolved_env.env_profile} "
+                f"runtime={resolved_env.runtime} reason={resolved_env.skill_id}"
+            )
+            if getattr(response, "global_requirements", None):
+                print("  --> [忽略 legacy global_requirements] 当前 workflow 已声明结构化环境 profile")
+                state["global_requirements"] = None
+
+            for asset_name, exists, asset_path in asset_cache_status(resolved_env):
+                print(
+                    f"ASSET CACHE {'HIT' if exists else 'MISS'} "
+                    f"asset={asset_name} path={asset_path}"
+                )
+            asset_cache_root = ensure_asset_cache(resolved_env)
+
+            if resolved_env.runtime != "python":
+                print(
+                    f"  --> [环境已解析] 当前 workflow 需要 runtime={resolved_env.runtime} / image={resolved_env.env_image}；"
+                    "现阶段仅对 Python profile 执行预热，实际执行时将显式校验。"
+                )
+                sync_environment_to_state(state, resolved_env)
+            else:
+                try:
+                    print(
+                        f"  --> [提前配置环境] 正在预热 profile={resolved_env.env_profile} "
+                        f"image={resolved_env.env_image} ..."
+                    )
+                    filtered_requirements = filter_profiled_requirements(resolved_env, "")
+                    executor = CodeExecutor(
+                        docker_path=None,
+                        docker_image=resolved_env.env_image,
+                        runtime=resolved_env.runtime,
+                        env_profile=resolved_env.env_profile,
+                        env_signature=resolved_env.env_signature,
+                        env_mode=resolved_env.env_mode,
+                        env_cache_key=filtered_requirements.env_cache_key,
+                        env_cache_volume=(
+                            filtered_requirements.env_cache_volume
+                            if resolved_env.is_shared
+                            else None
+                        ),
+                    )
+                    sync_environment_to_state(
+                        state,
+                        resolved_env,
+                        env_cache_key=filtered_requirements.env_cache_key,
+                        env_cache_volume=filtered_requirements.env_cache_volume,
+                    )
+                    if resolved_env.is_shared:
+                        exec_result = executor.ensure_env_cache_ready(
+                            requirements_str=filtered_requirements.allowed_text,
+                            timeout=900,
+                        )
+                    else:
+                        exec_result = {
+                            "success": True,
+                            "output": "env cache skipped for isolated profile",
+                            "timing": {
+                                "cache_prepare_elapsed_seconds": 0.0,
+                                "cache_hit": True,
+                                "cache_install_performed": False,
+                            },
+                        }
+                    timing = exec_result.get("timing", {})
+                    if timing:
+                        try:
+                            print(
+                                "  --> [环境配置耗时] "
+                                f"cache_prepare={float(timing.get('cache_prepare_elapsed_seconds', 0.0)):.2f}s, "
+                                f"cache_hit={bool(timing.get('cache_hit', False))}, "
+                                f"install={bool(timing.get('cache_install_performed', False))}"
+                            )
+                            if timing.get("cache_install_performed", False):
+                                print(
+                                    f"ENV EXTRA INSTALL profile={resolved_env.env_profile} "
+                                    f"elapsed={float(timing.get('cache_prepare_elapsed_seconds', 0.0)):.2f}s"
+                                )
+                        except (TypeError, ValueError):
+                            pass
+                    if exec_result.get("success"):
+                        print("  --> [环境配置成功]")
+                    else:
+                        print(f"  --> [环境配置失败] {exec_result.get('error', '')}")
+                except Exception as init_err:
+                    print(f"  --> [环境配置异常] {init_err}")
+        elif getattr(response, "global_requirements", None):
             state["global_requirements"] = response.global_requirements
             print(f"  [发现全局依赖要求] :\n{response.global_requirements}")
-            
-            # 立刻使用 CodeExecutor 组装容器并预安装环境，后续直接免除报错重启
-            try:
-                from src.utils.workflow_skills import get_workflows_root
-                from src.agents.code_dev.graph import extract_paths_from_state
-                
-                # 提取用户数据路径和结果路径以供首次挂载
-                path_info = extract_paths_from_state(state)
-                data_path = path_info.get("data_path")
-                result_path = path_info.get("result_path", "./result")
-                
-                import os
-                print(f"  --> [提前配置环境] 正在创建/复用 Docker 容器并完整安装 global_requirements（非增量）...")
-                executor = CodeExecutor(
-                    docker_path=None,
-                    container_id=state.get("docker_container_id"),
-                    data_dir=data_path if data_path and os.path.exists(data_path) else None,
-                    output_dir=result_path,
-                    workflow_host_path=get_workflows_root()
-                )
-                init_code = "print('Global environment successfully initialized.')\n"
-                exec_result = executor.execute(
-                    code_str=init_code, 
-                    requirements_str=response.global_requirements, 
-                    timeout=900
-                )
-                if exec_result.get("container_id"):
-                    new_id = exec_result["container_id"]
-                    if new_id != state.get("docker_container_id"):
-                        state["docker_container_id"] = new_id
-                        print(f"  --> [容器建立成功] 已成功构建持久化容器，容器ID: {new_id[:12]}")
-                timing = exec_result.get("timing", {})
-                if timing:
-                    install_elapsed = timing.get("pip_install_elapsed_seconds", 0.0)
-                    total_elapsed = timing.get("total_elapsed_seconds", 0.0)
-                    try:
-                        print(
-                            "  --> [环境配置耗时] "
-                            f"container_setup={float(timing.get('container_setup_elapsed_seconds', 0.0)):.2f}s, "
-                            f"push_to_container={float(timing.get('push_to_container_elapsed_seconds', 0.0)):.2f}s, "
-                            f"pip_install={float(install_elapsed):.2f}s, "
-                            f"python_exec={float(timing.get('python_exec_elapsed_seconds', 0.0)):.2f}s, "
-                            f"total={float(total_elapsed):.2f}s"
-                        )
-                    except (TypeError, ValueError):
-                        pass
-                if exec_result.get("success"):
-                    print("  --> [环境配置成功]")
-                else:
-                    print(f"  --> [环境配置失败] {exec_result.get('error', '')}")
-            except Exception as init_err:
-                print(f"  --> [环境配置异常] {init_err}")
+            print("  --> [LEGACY ENV] 不再由 Supervisor 预先创建 task container；首次执行时再安装这些依赖。")
         
     except Exception as e:
         error_msg = str(e)
@@ -372,6 +420,8 @@ def make_decision(state: SupervisorAgentState) -> SupervisorAgentState:
             data_path = None
             
         if has_data and not data_exploration_done:
+            if not state.get("selected_skill_id"):
+                state = select_skill_for_plan(state)
             state = generate_exploration_plan(state, data_path)
         else:
             state = select_skill_for_plan(state)

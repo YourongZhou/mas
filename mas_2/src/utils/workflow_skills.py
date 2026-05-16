@@ -9,7 +9,7 @@ import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _logger = logging.getLogger(__name__)
 
@@ -36,7 +36,35 @@ class WorkflowSkillRecord:
     category: str
     short_description: str
     root_path: Path
+    runtime: Optional[str]
+    env_profile: Optional[str]
+    env_image: Optional[str]
+    env_mode: str
+    env_extra_requirements: Tuple[str, ...]
+    required_assets: Tuple[str, ...]
     raw_meta: Dict[str, Any]
+
+
+def _normalize_str_list(value: Any) -> Tuple[str, ...]:
+    def _clean(text: str) -> str:
+        cleaned = text.strip()
+        if cleaned.startswith("- "):
+            cleaned = cleaned[2:].strip()
+        return cleaned.strip('"').strip("'")
+
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple, set)):
+        return tuple(_clean(str(item)) for item in value if _clean(str(item)))
+    text = str(value).strip()
+    if not text:
+        return ()
+    if text.startswith("[") and text.endswith("]"):
+        inner = text[1:-1].strip()
+        if not inner:
+            return ()
+        return tuple(_clean(part) for part in inner.split(",") if _clean(part))
+    return tuple(_clean(line) for line in text.splitlines() if _clean(line))
 
 
 def _split_frontmatter(md_text: str) -> tuple[Dict[str, Any], str]:
@@ -91,6 +119,12 @@ def _record_from_skill_path(skill_md: Path) -> Optional[WorkflowSkillRecord]:
         category=category,
         short_description=short_description,
         root_path=root,
+        runtime=str(meta.get("runtime") or "").strip() or None,
+        env_profile=str(meta.get("env_profile") or "").strip() or None,
+        env_image=str(meta.get("env_image") or "").strip() or None,
+        env_mode=str(meta.get("env_mode") or "isolated").strip() or "isolated",
+        env_extra_requirements=_normalize_str_list(meta.get("env_extra_requirements")),
+        required_assets=_normalize_str_list(meta.get("required_assets")),
         raw_meta=meta,
     )
 
@@ -160,6 +194,8 @@ def format_skill_injection_for_code_dev(skill_id: Optional[str], max_chars: int 
         f"name: {rec.name}",
         f"category: {rec.category}",
         f"short-description: {rec.short_description}",
+        f"runtime: {rec.runtime or 'legacy'}",
+        f"env_profile: {rec.env_profile or 'legacy'}",
         f"host_path: {root_path_str} (宿主机绝对路径，用于工具调用读取本地文件)"
     ]
     
@@ -190,3 +226,13 @@ def should_mount_workflow_in_docker(skill_id: Optional[str]) -> bool:
     if not skill_id:
         return False
     return resolve_workflow_root(skill_id) is not None
+
+
+def use_scanpy_code_style(skill_id: Optional[str]) -> bool:
+    """仅 Scanpy 核心技能启用既有的 Scanpy 风格提示约束。"""
+    return bool(skill_id and skill_id == SCANPY_CORE_SKILL_ID)
+
+
+def has_structured_environment(skill_id: Optional[str]) -> bool:
+    rec = get_skill(skill_id or "")
+    return bool(rec and rec.env_profile and rec.env_image and rec.runtime)

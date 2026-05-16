@@ -62,6 +62,8 @@ class GlobalState(TypedDict):
     current_step_file_paths: Optional[dict]  # 当前步骤的文件路径信息 {"input_files": [...], "output_files": [...]}
     # 当前步骤绑定的 workflow skill_id（来自 plan[current_step_index].skill_id）
     current_step_skill_id: Optional[str]
+    # Supervisor 基于整体任务预选的 workflow skill_id，可在 exploration 阶段回退用于环境选择
+    selected_skill_id: Optional[str]
 
     # === 调度控制字段 ===
     # 下一个要执行的 worker（由 Supervisor 决定）
@@ -81,8 +83,21 @@ class GlobalState(TypedDict):
     rag_context: str
     
     # === 运行环境字段 ===
-    # 跨节点复用的 Docker 容量 ID
-    docker_container_id: Optional[str]    # 从 SKILL.md 提取的全局依赖环境配置（先行安装）
+    # 当前实验专属的 Docker task container ID
+    docker_container_id: Optional[str]
+    docker_env_profile: Optional[str]
+    docker_env_signature: Optional[str]
+    docker_env_image: Optional[str]
+    docker_env_runtime: Optional[str]
+    docker_env_mode: Optional[str]
+    docker_env_package_versions_path: Optional[str]
+    docker_env_cache_key: Optional[str]
+    docker_env_cache_volume: Optional[str]
+    docker_required_assets: Optional[List[str]]
+    sandbox_backend: Optional[str]
+    sandbox_endpoint: Optional[str]
+    sandbox_allowed_roots: Optional[List[str]]
+    # legacy/unprofiled workflow 的 fallback 依赖文本
     global_requirements: Optional[str]
     # === 交互字段 ===
     # Worker 提交的待审核草稿（临时缓冲区）
@@ -91,4 +106,3 @@ class GlobalState(TypedDict):
     critique_feedback: Optional[str]
     # 是否通过审核
     is_approved: bool
-
