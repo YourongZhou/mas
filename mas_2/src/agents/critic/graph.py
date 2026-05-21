@@ -279,6 +279,9 @@ def review_contribution(state: CriticAgentState) -> CriticAgentState:
         print(f"  --> 审核通过！")
         state["is_approved"] = True
         state["critique_feedback"] = None
+        state["critic_reject_count"] = 0
+        state["step_blocked"] = False
+        state["step_block_reason"] = None
         
         if last_worker == "code_dev":
             # 保留 dict，便于下游展示完整 output / result（勿 str() 丢失结构）
@@ -316,6 +319,15 @@ def review_contribution(state: CriticAgentState) -> CriticAgentState:
         print(f"  --> 审核驳回！意见: {feedback}")
         state["is_approved"] = False
         state["critique_feedback"] = feedback
+        if last_worker == "code_dev":
+            reject_count = int(state.get("critic_reject_count", 0) or 0) + 1
+            state["critic_reject_count"] = reject_count
+            if reject_count >= 2:
+                state["step_blocked"] = True
+                state["step_block_reason"] = (
+                    f"当前步骤已被 Critic 连续驳回 {reject_count} 轮，"
+                    "继续同路径重试大概率只会重复已有错误。"
+                )
     
     state["review_details"] = feedback
     return state

@@ -399,6 +399,14 @@ def make_decision(state: SupervisorAgentState) -> SupervisorAgentState:
     is_approved = state.get("is_approved", False)
     last_worker = state.get("last_worker", "")
     pending_contribution = state.get("pending_contribution")
+    step_blocked = bool(state.get("step_blocked", False))
+    step_block_reason = str(state.get("step_block_reason", "") or "")
+
+    if step_blocked:
+        print(f"  --> 当前步骤进入阻塞终止状态: {step_block_reason}")
+        state["final_report"] = step_block_reason or "当前步骤多轮修复后仍失败，已停止自动重试。"
+        state["next_worker"] = "FINISH"
+        return state
     
     # 如果计划为空，先生成计划
     if not plan:

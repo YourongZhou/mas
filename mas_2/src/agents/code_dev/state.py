@@ -41,3 +41,10 @@ class CodeAgentState(GlobalState):
     sandbox_backend: Optional[str]
     sandbox_endpoint: Optional[str]
     sandbox_allowed_roots: Optional[list[str]]
+    code_dev_step_key: Optional[str]
+    tool_context_step_key: Optional[str]
+    critic_reject_count: int
+    step_blocked: bool
+    step_block_reason: Optional[str]
+    last_failure_fingerprint: Optional[str]
+    failure_streak: int
