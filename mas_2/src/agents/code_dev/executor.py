@@ -600,20 +600,23 @@ mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPRE
                 try:
                     container = self.client.containers.get(self.container_id)
                     labels = (container.attrs.get("Config", {}) or {}).get("Labels", {}) or {}
-                    if self.env_signature and labels.get("mas.env_signature") not in (None, "", self.env_signature):
-                        self.logger.info(
-                            "ENV SWITCH from=%s to=%s",
-                            labels.get("mas.env_profile", "unknown"),
-                            self.env_profile or "legacy",
-                        )
-                        container = None
-                    elif self.env_signature:
-                        self.logger.info(
-                            "ENV REUSE profile=%s container=%s",
-                            self.env_profile or labels.get("mas.env_profile", "unknown"),
-                            self.container_id[:12],
-                        )
-                    if container.status != 'running':
+                    if self.env_signature:
+                        current_sig = (labels.get("mas.env_signature") or "").strip()
+                        current_profile = (labels.get("mas.env_profile") or "legacy").strip() or "legacy"
+                        if current_sig != self.env_signature:
+                            self.logger.info(
+                                "ENV SWITCH from=%s to=%s",
+                                current_profile,
+                                self.env_profile or "legacy",
+                            )
+                            container = None
+                        else:
+                            self.logger.info(
+                                "ENV REUSE profile=%s container=%s",
+                                self.env_profile or current_profile,
+                                self.container_id[:12],
+                            )
+                    if container is not None and container.status != 'running':
                         container.start()
                 except docker.errors.NotFound:
                     container = None

@@ -205,6 +205,47 @@ def _extract_informative_error(text: str, max_chars: int = 2000) -> str:
     return _exec_output_tail(raw, 40)[-max_chars:]
 
 
+def _normalize_failure_fingerprint(text: str) -> str:
+    raw = _extract_informative_error(text, max_chars=400).lower()
+    if not raw:
+        return ""
+    raw = re.sub(r"0x[0-9a-f]+", "0xADDR", raw)
+    raw = re.sub(r"\d+", "#", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    return raw[:240]
+
+
+def _is_hard_environment_blocker(text: str) -> bool:
+    low = (text or "").lower()
+    hard_hints = (
+        "unable to determine r home",
+        "no such file or directory: 'r'",
+        "r_home",
+        "rpy2 in api mode cannot be built without r",
+        "system-level dependency",
+        "executable file not found in $path",
+        "command not found",
+    )
+    return any(hint in low for hint in hard_hints)
+
+
+def _current_step_key(state: CodeAgentState) -> str:
+    idx = state.get("current_step_index", 0)
+    skill_id = state.get("current_step_skill_id") or ""
+    step_input = state.get("current_step_input") or ""
+    first_line = step_input.strip().splitlines()[0] if step_input.strip() else ""
+    return f"{idx}|{skill_id}|{first_line[:120]}"
+
+
+def _reset_step_local_retry_state(state: CodeAgentState) -> None:
+    state["internal_iteration_count"] = 0
+    state["feedback"] = ""
+    state["step_blocked"] = False
+    state["step_block_reason"] = None
+    state["last_failure_fingerprint"] = ""
+    state["failure_streak"] = 0
+
+
 def _tail_line_count() -> int:
     try:
         return max(10, int(os.environ.get("MAS_EXEC_OUTPUT_TAIL_LINES", "80")))
@@ -576,20 +617,37 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
     生成代码节点
     调用 LLM 生成代码，写入 pending_contribution
     """
+    current_step_key = _current_step_key(state)
+    previous_step_key = state.get("code_dev_step_key") or ""
+    critic_feedback = state.get("critique_feedback", "")
+    if previous_step_key != current_step_key:
+        state["code_dev_step_key"] = current_step_key
+        state["tool_context_step_key"] = ""
+        state["step_tool_context"] = ""
+        state["critic_reject_count"] = 0
+        _reset_step_local_retry_state(state)
+    elif critic_feedback:
+        # Critic 驳回后重新进入 code_dev：给这一轮 3 次全新内部修复机会，
+        # 但保留上轮最终代码、requirements 与 Critic 意见作为修复上下文。
+        state["internal_iteration_count"] = 0
+        state["feedback"] = ""
+
     attempt_no = state.get('internal_iteration_count', 0) + 1
     generate_start = time.perf_counter()
     print(f"--- [Code Dev] 正在生成代码 (迭代 {attempt_no}) ---")
 
-    critic_feedback = state.get("critique_feedback", "")
     internal_feedback = state.get("feedback", "")
     
     final_feedback = ""
-    if critic_feedback:
-        print(f"  --> 收到 Critic 的驳回意见: {critic_feedback[:500]}...")
-        final_feedback = critic_feedback
-    elif internal_feedback:
+    feedback_source = ""
+    if internal_feedback:
         print(f"  --> 收到内部执行的错误反馈: {internal_feedback[:500]}...")
         final_feedback = internal_feedback
+        feedback_source = "上一次执行报错"
+    elif critic_feedback:
+        print(f"  --> 收到 Critic 的驳回意见: {critic_feedback[:500]}...")
+        final_feedback = critic_feedback
+        feedback_source = "Critic 的驳回意见"
     is_retry_attempt = bool(critic_feedback or internal_feedback or state.get("internal_iteration_count", 0) > 0)
     attempt_timing = _ensure_attempt_timing(state, attempt_no=attempt_no, is_retry=is_retry_attempt)
     attempt_timing["retry_reason"] = "critic_feedback" if critic_feedback else ("internal_feedback" if internal_feedback else "")
@@ -603,10 +661,11 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
     previous_code = state.get("scanpy_code", "")
     previous_requirements = state.get("requirements_txt", "")
 
-    if state.get("feedback"):
+    if final_feedback:
         context_instruction = f"""
         【重要！代码执行遇到错误，请务必修改代码或依赖】
-        上一次执行遇到了以下报错：
+        以下是需要优先修复的反馈来源：{feedback_source}
+        详细反馈如下：
         {final_feedback}
 
         上一次使用的代码如下：
@@ -618,7 +677,8 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
         {previous_requirements}
         ```
         请仔细分析上述报错。如果报错指向缺少某个 Python 包（如 ModuleNotFoundError, ImportError 等），你**必须**在生成的 requirements.txt 代码块中补充该包。
-        如果报错逻辑错误，请确保你输出的新的 python 代码块已经修复了该问题。
+        如果报错属于逻辑错误、字段不匹配或语法错误，请优先基于上一次代码做最小必要修复，而不是整段重写。
+        如果报错属于环境硬阻塞（例如缺少 R 可执行文件、缺少系统级依赖），请优先切换到当前环境可行的纯 Python 方案；若确实无可行替代，请在代码中尽早给出清晰失败说明，避免反复重试同一路线。
         请不要输出多余解释，务必包含新的 ```python 和 ```txt 块！
         """
     # 获取当前步骤的输入、预期输出和文件路径
@@ -777,6 +837,7 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
         is_exploration = not state.get("data_exploration_done", True)
         is_retry = state.get("internal_iteration_count", 0) > 0
         tool_context_str = state.get("step_tool_context", "")
+        tool_context_step_key = state.get("tool_context_step_key", "")
         tool_loop_elapsed = 0.0
         tool_llm_elapsed = 0.0
         tool_io_elapsed = 0.0
@@ -787,7 +848,7 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
 
         if is_exploration:
             print(f"🔍 [Code Dev] 当前处于数据探查阶段，直接生成探查代码（跳过 SKILL 工具调研）...")
-        elif is_retry and tool_context_str:
+        elif tool_context_str and tool_context_step_key == current_step_key and (is_retry or critic_feedback):
             print(f"🔄 [Code Dev] 当前步骤为重试迭代，使用已有的 Tool Context 进行重试，不再重新调研...")
             reused_tool_context = True
         elif not skill_id:
@@ -869,6 +930,7 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
                 # 修复可能出现的双斜杠，但不影响 URL 中的 ://
                 tool_context_str = re.sub(r'(?<!:)//+', '/', tool_context_str)
                 state["step_tool_context"] = tool_context_str
+                state["tool_context_step_key"] = current_step_key
 
             print(f"🔍 [Code Dev Tool Loop] 调研结束，进入正式代码生成...")
             tool_loop_elapsed = time.perf_counter() - tool_loop_start
@@ -1597,12 +1659,18 @@ def should_retry(state: CodeAgentState) -> str:
     判断是否应该重试代码生成
     如果执行失败且没有达到最大重试次数，则重试
     """
-    max_retries = 3
+    max_retries = 5
     iteration_count = state.get("internal_iteration_count", 0)
     success = state.get("success", False)
+    failure_streak = int(state.get("failure_streak", 0) or 0)
+    blocker_reason = str(state.get("feedback", "") or state.get("analysis_result", "") or "")
 
     if success:
         print(f"【Code Dev重试决策】attempt={iteration_count}, success=True, next=end")
+        return "end"
+    elif _is_hard_environment_blocker(blocker_reason) and failure_streak >= 2:
+        print("  --> 检测到重复的环境硬阻塞错误，提前停止内部重试")
+        print(f"【Code Dev重试决策】attempt={iteration_count}, success=False, next=end")
         return "end"
     elif iteration_count < max_retries:
         print(f"  --> 执行失败，准备重试 (第 {iteration_count + 1}/{max_retries} 次)")
@@ -1637,6 +1705,13 @@ def prepare_retry(state: CodeAgentState) -> CodeAgentState:
             feedback = "代码执行失败"
 
         state["feedback"] = feedback
+        fingerprint = _normalize_failure_fingerprint(feedback)
+        prev_fingerprint = state.get("last_failure_fingerprint", "") or ""
+        if fingerprint and fingerprint == prev_fingerprint:
+            state["failure_streak"] = int(state.get("failure_streak", 0) or 0) + 1
+        else:
+            state["failure_streak"] = 1 if fingerprint else 0
+        state["last_failure_fingerprint"] = fingerprint
         _preview = feedback if len(feedback) <= 500 else feedback[:500] + "..."
         print(f"  --> 设置反馈信息: {_preview}")
         attempt_timing = state.get("current_attempt_timing")

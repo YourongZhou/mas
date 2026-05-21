@@ -8,7 +8,7 @@ from pathlib import Path
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import SystemMessage, HumanMessage
 from src.core.state import GlobalState
-from src.core.llm import get_llm
+from src.core.llm import get_llm, format_llm_runtime_banner
 
 # 导入所有编译好的子图
 from src.agents.supervisor.graph import supervisor_agent_graph
@@ -20,6 +20,11 @@ from src.utils.docker_log_summary import summarize_docker_stdout
 
 
 # ==================== Wrapper 节点 ====================
+
+def runtime_banner_step(state: GlobalState) -> GlobalState:
+    """在每轮运行最开始打印实际注册的 LLM 运行配置摘要。"""
+    print(format_llm_runtime_banner())
+    return state
 
 def wrap_rag_researcher(state: GlobalState) -> GlobalState:
     """包装 RAG Researcher，更新 last_worker"""
@@ -86,6 +91,9 @@ def critic_router(state: GlobalState) -> str:
         print("  --> 审核通过，返回 Supervisor")
         return "supervisor"
     else:
+        if state.get("step_blocked"):
+            print("  --> 当前步骤达到最大驳回轮次，返回 Supervisor 做终止决策")
+            return "supervisor"
         # 审核驳回 -> 返回上一个 Worker 重做
         print(f"  --> 审核驳回，返回 {last_worker} 重做")
         
@@ -426,6 +434,7 @@ def finalize_step(state: GlobalState) -> GlobalState:
 workflow = StateGraph(GlobalState)
 
 # 1. 添加所有节点
+workflow.add_node("runtime_banner", runtime_banner_step)
 # Supervisor 和 Critic 直接使用子图
 workflow.add_node("supervisor", supervisor_agent_graph)
 workflow.add_node("critic", critic_agent_graph)
@@ -441,8 +450,9 @@ workflow.add_node("finalize", finalize_step)
 
 # 2. 定义流程
 
-# START -> supervisor
-workflow.add_edge(START, "supervisor")
+# START -> runtime_banner -> supervisor
+workflow.add_edge(START, "runtime_banner")
+workflow.add_edge("runtime_banner", "supervisor")
 
 # supervisor -> (路由) -> [rag_researcher, code_dev, tool_caller, critic, finalize]
 workflow.add_conditional_edges(

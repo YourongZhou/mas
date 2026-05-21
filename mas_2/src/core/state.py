@@ -106,3 +106,17 @@ class GlobalState(TypedDict):
     critique_feedback: Optional[str]
     # 是否通过审核
     is_approved: bool
+    # 当前步骤的稳定标识，用于在换步时重置 code_dev 内部状态
+    code_dev_step_key: Optional[str]
+    # Tool 调研上下文对应的步骤标识
+    tool_context_step_key: Optional[str]
+    # 当前步骤已被 Critic 驳回的轮次
+    critic_reject_count: int
+    # 当前步骤是否已进入阻塞终止状态
+    step_blocked: bool
+    # 当前步骤阻塞终止原因
+    step_block_reason: Optional[str]
+    # 最近一次失败的归一化指纹
+    last_failure_fingerprint: Optional[str]
+    # 同一失败连续出现的次数
+    failure_streak: int
