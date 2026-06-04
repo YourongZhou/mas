@@ -47,24 +47,21 @@ class ExecuteRArgs(BaseModel):
     timeout_s: int = 900
 
 
-class RunScanpyPipelineArgs(BaseModel):
-    data_path: str = Field(..., description="Host path or repo-relative path to an h5ad file.")
-    env_profile: str = "py-scverse-v1"
-    skill_id: str = "scrnaseq-scanpy-core-analysis"
-    timeout_s: int = 1800
+class RunSkillWorkflowArgs(BaseModel):
+    skill_id: str = Field(..., description="Workflow skill id from mas_2/workflows.")
+    task: str = Field(..., description="Concrete analysis task and expected outputs.")
+    data_path: str = Field("", description="Optional host path or repo-relative primary input data path.")
+    runtime: str = Field("", description="Optional runtime override: python or r. Empty means use skill metadata.")
+    env_profile: str = Field("", description="Optional Docker profile override. Empty means use skill metadata.")
+    max_attempts: int = Field(5, description="Maximum generate/execute/repair attempts.")
+    timeout_s: int = Field(1800, description="Per-execution timeout in seconds.")
 
 
-class QueryMyGeneArgs(BaseModel):
-    gene_symbol: str = Field(..., description="Gene symbol, e.g. TP53 or MS4A1.")
-
-
-class GeneSetEnrichmentArgs(BaseModel):
-    gene_list: list[str] | str = Field(..., description="Gene symbols as a list or comma/space separated string.")
-    organism: str = "human"
-    databases: list[str] | None = None
-    top_k: int = 10
-
-
-class CellTypeAnnotationArgs(BaseModel):
-    gene_list: list[str] | str = Field(..., description="Marker genes as a list or comma/space separated string.")
+class RunCodeWorkflowArgs(BaseModel):
+    task: str = Field(..., description="Concrete analysis or data-processing task and expected outputs.")
+    data_path: str = Field("", description="Optional host path or repo-relative primary input data path.")
+    runtime: str = Field("python", description="Runtime: python or r.")
+    env_profile: str = Field("", description="Optional Docker profile override. Empty means py-general-v1 for Python or r-bioc-v1 for R.")
+    max_attempts: int = Field(5, description="Maximum generate/execute/repair attempts.")
+    timeout_s: int = Field(900, description="Per-execution timeout in seconds.")
 

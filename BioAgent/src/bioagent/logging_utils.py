@@ -37,7 +37,7 @@ class RunLogger:
 
     def __enter__(self) -> "RunLogger":
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._handle = self.path.open("w", encoding="utf-8")
+        self._handle = self.path.open("w", encoding="utf-8-sig")
         self.log(f"RUN START id={self.run_id}")
         return self
 
@@ -62,6 +62,22 @@ class RunLogger:
         self.log("=" * 88)
         self.log(title)
         self.log("=" * 88)
+
+    def node(self, title: str, detail: str = "") -> None:
+        self.section(f"节点：{title}")
+        if detail:
+            self.log(f"说明：{detail}")
+
+    def progress(self, title: str, detail: str = "") -> None:
+        suffix = f" | {detail}" if detail else ""
+        self.log(f"进度：{title}{suffix}")
+
+    def warning(self, message: str) -> None:
+        self.log(f"警告：{message}")
+
+    def error_reason(self, message: str) -> None:
+        reason = message.strip() if message else "未能自动提取明确错误原因，请查看 stdout/stderr 详情。"
+        self.log(f"错误原因：{reason}")
 
     def timed(self, label: str) -> TimedBlock:
         return TimedBlock(self, label)

@@ -39,7 +39,9 @@ def run_bmmc_singlecell_demo(max_turns: int = 12) -> dict:
         task=(
             "我想用 data 目录下的 bmmc_b_cell.h5ad 单细胞数据进行分析。"
             "请使用新的单主 Agent + 工具调用模式：先确认可用的 Scanpy skill 和 Docker profile，"
-            "然后调用 run_scanpy_singlecell_pipeline 完成标准单细胞核心分析，最后汇总输出文件。"
+            "然后调用 run_skill_workflow 基于 scrnaseq-scanpy-core-analysis Skill 生成代码、执行并修复，"
+            "完成稳健的核心流程：读取数据、QC、标准化、HVG、PCA、邻居图、Leiden、UMAP、"
+            "summary JSON、关键图和 processed h5ad。不要额外展开非必要的 DE、轨迹、互作或复杂 PDF 报告。"
         ),
         data_path=r"mas_2\data\bmmc_b_cell.h5ad",
         max_turns=max_turns,
