@@ -8,22 +8,19 @@ from bioagent.config import AgentConfig
 from bioagent.logging_utils import RunLogger
 
 from .execution import execute_python_impl, execute_r_impl
-from .bio import gene_set_enrichment_impl, query_mygene_impl, run_celltype_annotation_impl
 from .filesystem import glob_search_impl, grep_text_impl, list_files_impl, read_file_impl
 from .schemas import (
     ExecutePythonArgs,
     ExecuteRArgs,
-    CellTypeAnnotationArgs,
-    GeneSetEnrichmentArgs,
     GlobArgs,
     GrepArgs,
     InspectSkillArgs,
     ListFilesArgs,
-    QueryMyGeneArgs,
     ReadFileArgs,
-    RunScanpyPipelineArgs,
+    RunCodeWorkflowArgs,
+    RunSkillWorkflowArgs,
 )
-from .singlecell import run_scanpy_singlecell_pipeline_impl
+from .skill_workflow import run_code_workflow_impl, run_skill_workflow_impl
 from .workflow import inspect_image_catalog_impl, inspect_workflow_skill_impl, list_workflow_skills_impl
 
 
@@ -77,35 +74,47 @@ def build_tools(config: AgentConfig, logger: RunLogger, run_dir: Path) -> list[S
     def execute_r(code: str, env_profile: str = "r-bioc-v1", timeout_s: int = 900) -> dict:
         return execute_r_impl(config, logger, run_dir, code=code, env_profile=env_profile, timeout_s=timeout_s)
 
-    def run_scanpy_singlecell_pipeline(
-        data_path: str,
-        env_profile: str = "py-scverse-v1",
-        skill_id: str = "scrnaseq-scanpy-core-analysis",
+    def run_skill_workflow(
+        skill_id: str,
+        task: str,
+        data_path: str = "",
+        runtime: str = "",
+        env_profile: str = "",
+        max_attempts: int = 5,
         timeout_s: int = 1800,
     ) -> dict:
-        return run_scanpy_singlecell_pipeline_impl(
+        return run_skill_workflow_impl(
             config,
             logger,
             run_dir,
-            data_path=data_path,
-            env_profile=env_profile,
             skill_id=skill_id,
+            task=task,
+            data_path=data_path,
+            runtime=runtime,
+            env_profile=env_profile,
+            max_attempts=max_attempts,
             timeout_s=timeout_s,
         )
 
-    def query_mygene(gene_symbol: str) -> dict:
-        return query_mygene_impl(gene_symbol)
-
-    def gene_set_enrichment(
-        gene_list: list[str] | str,
-        organism: str = "human",
-        databases: list[str] | None = None,
-        top_k: int = 10,
+    def run_code_workflow(
+        task: str,
+        data_path: str = "",
+        runtime: str = "python",
+        env_profile: str = "",
+        max_attempts: int = 5,
+        timeout_s: int = 900,
     ) -> dict:
-        return gene_set_enrichment_impl(gene_list, organism=organism, databases=databases, top_k=top_k)
-
-    def run_celltype_annotation(gene_list: list[str] | str) -> dict:
-        return run_celltype_annotation_impl(gene_list)
+        return run_code_workflow_impl(
+            config,
+            logger,
+            run_dir,
+            task=task,
+            data_path=data_path,
+            runtime=runtime,
+            env_profile=env_profile,
+            max_attempts=max_attempts,
+            timeout_s=timeout_s,
+        )
 
     return [
         StructuredTool.from_function(list_files, name="list_files", description="列出项目允许范围内的文件和目录。", args_schema=ListFilesArgs),
@@ -118,13 +127,22 @@ def build_tools(config: AgentConfig, logger: RunLogger, run_dir: Path) -> list[S
         StructuredTool.from_function(execute_python, name="execute_python", description="在指定 Python Docker profile 中执行生成的 Python 脚本。", args_schema=ExecutePythonArgs),
         StructuredTool.from_function(execute_r, name="execute_r", description="在指定 R Docker profile 中执行生成的 R 脚本。", args_schema=ExecuteRArgs),
         StructuredTool.from_function(
-            run_scanpy_singlecell_pipeline,
-            name="run_scanpy_singlecell_pipeline",
-            description="按照 scrnaseq-scanpy-core-analysis skill 对 .h5ad 单细胞数据执行完整 Scanpy 核心分析炮筒流程。",
-            args_schema=RunScanpyPipelineArgs,
+            run_skill_workflow,
+            name="run_skill_workflow",
+            description=(
+                "通用 Skill-driven 工作流执行器：读取指定 workflow skill，"
+                "由 LLM 根据 Skill 和脚本清单生成代码，使用匹配 Docker profile 执行，失败后基于 stdout/stderr 自动修复重试。"
+            ),
+            args_schema=RunSkillWorkflowArgs,
         ),
-        StructuredTool.from_function(query_mygene, name="query_mygene", description="查询人类基因的 MyGene 信息。", args_schema=QueryMyGeneArgs),
-        StructuredTool.from_function(gene_set_enrichment, name="gene_set_enrichment", description="使用 Enrichr/gseapy 对基因列表做 ORA 富集分析。", args_schema=GeneSetEnrichmentArgs),
-        StructuredTool.from_function(run_celltype_annotation, name="run_celltype_annotation", description="根据 marker genes 做轻量细胞类型注释。", args_schema=CellTypeAnnotationArgs),
+        StructuredTool.from_function(
+            run_code_workflow,
+            name="run_code_workflow",
+            description=(
+                "通用无 Skill 代码工作流：当任务不需要 workflow skill 或没有匹配 skill 时，"
+                "由 LLM 生成 Python/R 代码，使用 Docker 执行，并基于 stdout/stderr 自动修复重试。"
+            ),
+            args_schema=RunCodeWorkflowArgs,
+        ),
     ]
 

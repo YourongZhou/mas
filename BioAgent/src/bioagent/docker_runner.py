@@ -2,6 +2,7 @@
 
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,6 +35,7 @@ class ExecutionResult:
             "exit_code": self.exit_code,
             "stdout": self.stdout[-8000:],
             "stderr": self.stderr[-8000:],
+            "error_reason": "" if self.ok else _summarize_process_error(self.stderr, self.stdout),
             "command": self.command,
         }
 
@@ -78,8 +80,9 @@ class DockerRunner:
         return result.returncode == 0
 
     def _run(self, command: list[str], timeout_s: int) -> subprocess.CompletedProcess[str]:
-        self.logger.log("DOCKER COMMAND " + " ".join(command))
-        return subprocess.run(
+        self.logger.progress("Docker 命令启动", f"timeout={timeout_s}s command={' '.join(command)}")
+        started = time.perf_counter()
+        result = subprocess.run(
             command,
             capture_output=True,
             text=True,
@@ -88,6 +91,14 @@ class DockerRunner:
             timeout=timeout_s,
             check=False,
         )
+        elapsed = time.perf_counter() - started
+        self.logger.progress(
+            "Docker 命令结束",
+            f"exit_code={result.returncode} elapsed={elapsed:.2f}s stdout_chars={len(result.stdout or '')} stderr_chars={len(result.stderr or '')}",
+        )
+        if result.returncode != 0:
+            self.logger.error_reason(_summarize_process_error(result.stderr or "", result.stdout or ""))
+        return result
 
     def execute_python(
         self,
@@ -101,14 +112,22 @@ class DockerRunner:
         script.write_text(code, encoding="utf-8")
         req_file = self.scripts_dir / "requirements.txt"
         req_file.write_text(requirements.strip() + "\n" if requirements.strip() else "", encoding="utf-8")
+        self.logger.progress(
+            "准备 Python 执行脚本",
+            f"script={script} env_profile={env_profile} requirements={'yes' if requirements.strip() else 'no'}",
+        )
 
         if not self._docker_available():
+            self.logger.error_reason("docker CLI not found，无法启动沙箱执行。")
             return ExecutionResult(False, "python", env_profile, "", str(self.run_dir), str(script), 127, "", "docker CLI not found", [])
         try:
             image = self._image(env_profile, "python")
         except ValueError as exc:
+            self.logger.error_reason(str(exc))
             return ExecutionResult(False, "python", env_profile, "", str(self.run_dir), str(script), 2, "", str(exc), [])
+        self.logger.progress("选择 Docker 镜像", f"runtime=python env_profile={env_profile} image={image}")
         if not self._image_exists(image):
+            self.logger.error_reason(f"Docker image not found locally: {image}. 请先构建 mas_2/docker 中对应镜像。")
             return ExecutionResult(
                 False,
                 "python",
@@ -157,6 +176,7 @@ class DockerRunner:
                 command,
             )
         except subprocess.TimeoutExpired as exc:
+            self.logger.error_reason(f"Docker Python 执行超过 timeout={timeout_s}s。")
             return ExecutionResult(False, "python", env_profile, image, str(self.run_dir), str(script), -1, exc.stdout or "", (exc.stderr or "") + "\nTimed out", command)
 
     def execute_r(
@@ -168,14 +188,19 @@ class DockerRunner:
     ) -> ExecutionResult:
         script = self.scripts_dir / "code.R"
         script.write_text(code, encoding="utf-8")
+        self.logger.progress("准备 R 执行脚本", f"script={script} env_profile={env_profile}")
 
         if not self._docker_available():
+            self.logger.error_reason("docker CLI not found，无法启动沙箱执行。")
             return ExecutionResult(False, "r", env_profile, "", str(self.run_dir), str(script), 127, "", "docker CLI not found", [])
         try:
             image = self._image(env_profile, "r")
         except ValueError as exc:
+            self.logger.error_reason(str(exc))
             return ExecutionResult(False, "r", env_profile, "", str(self.run_dir), str(script), 2, "", str(exc), [])
+        self.logger.progress("选择 Docker 镜像", f"runtime=r env_profile={env_profile} image={image}")
         if not self._image_exists(image):
+            self.logger.error_reason(f"Docker image not found locally: {image}. 请先构建 mas_2/docker 中对应镜像。")
             return ExecutionResult(
                 False,
                 "r",
@@ -218,5 +243,44 @@ class DockerRunner:
                 command,
             )
         except subprocess.TimeoutExpired as exc:
+            self.logger.error_reason(f"Docker R 执行超过 timeout={timeout_s}s。")
             return ExecutionResult(False, "r", env_profile, image, str(self.run_dir), str(script), -1, exc.stdout or "", (exc.stderr or "") + "\nTimed out", command)
+
+
+def _summarize_process_error(stderr: str, stdout: str) -> str:
+    text = (stderr or "").strip() or (stdout or "").strip()
+    if not text:
+        return "进程返回非零退出码，但 stdout/stderr 为空。"
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    context = ""
+    for line in reversed(lines):
+        if not context and line.startswith("Error raised while"):
+            context = line
+        if _looks_like_exception_line(line):
+            return f"{line}；{context}" if context and context != line else line
+    for line in reversed(lines):
+        lowered = line.lower()
+        if "error" in lowered or "exception" in lowered or "timed out" in lowered:
+            return line
+    return lines[-1][-500:] if lines else "未能自动提取明确错误原因。"
+
+
+def _looks_like_exception_line(line: str) -> bool:
+    if line.startswith(("Traceback ", "During handling ")):
+        return False
+    return bool(
+        line.startswith(("Error: ", "Exception: "))
+        or "Error:" in line[:120]
+        or line.startswith(
+            (
+                "AssertionError:",
+                "ImportError:",
+                "KeyError:",
+                "ModuleNotFoundError:",
+                "RuntimeError:",
+                "TypeError:",
+                "ValueError:",
+            )
+        )
+    )
 

@@ -12,7 +12,7 @@ supervisor -> code_dev -> critic -> supervisor
 用户任务
 -> 单个主 Agent 维护完整上下文
 -> 主 Agent 判断是否需要工具
--> 工具执行：读文件 / 查 Skill / 查 Docker 环境 / 执行代码 / 跑生信流程
+-> 工具执行：读文件 / 查 Skill / 查 Docker 环境 / 通用代码执行 / Skill 工作流
 -> 工具结果回灌给同一个主 Agent
 -> 主 Agent 继续推理或给出最终结果
 ```
@@ -56,10 +56,11 @@ mas/
 | Docker image catalog 解析 | 已迁移 | `inspect_image_catalog`，执行工具也会检查 profile/image |
 | Python Docker 执行 | 已迁移 | `execute_python` |
 | R Docker 执行 | 已迁移 | `execute_r` |
-| 单细胞 Scanpy 核心分析 | 已增强迁移 | `run_scanpy_singlecell_pipeline` 提供炮筒式完整流程 |
-| MyGene 查询 | 已迁移 | `query_mygene` |
-| 基因集富集 | 已迁移 | `gene_set_enrichment`，基于 `gseapy/Enrichr` |
-| 细胞类型注释工具 | 已迁移为轻量版 | `run_celltype_annotation`，基于 marker overlap |
+| Skill-driven 生信工作流 | 已增强迁移 | `run_skill_workflow` 读取 Skill、生成代码、Docker 执行并按报错修复 |
+| 无 Skill 通用任务 | 已支持 | `run_code_workflow` 直接按任务生成 Python/R 代码、Docker 执行并修复 |
+| MyGene 查询 | 已通用化 | 不再写死专用 Tool；无匹配 Skill 时通过 `run_code_workflow` 生成代码执行 |
+| 基因集富集 | 已通用化 | 优先走 `functional-enrichment-from-degs` Skill；无匹配场景时走 `run_code_workflow` |
+| 细胞类型注释 | 已通用化 | 优先走单细胞相关 Skill；无匹配场景时走 `run_code_workflow` |
 | RAG Researcher | 未作为独立 Agent 迁移 | 当前通过 Skill 文档读取替代；如需文献 RAG，可后续作为 Tool 加入 |
 | Chainlit 前端 | 明确不迁移 | 你的要求是不需要前端，执行方式仍然是 Notebook |
 | Notebook 执行 | 已支持 | `notebooks/run_agent_loop.ipynb` |
@@ -90,8 +91,7 @@ BioAgent/
         filesystem.py       文件读取、搜索、glob
         workflow.py         workflow skill / image catalog 工具
         execution.py        Python/R 代码执行工具
-        singlecell.py       Scanpy 单细胞炮筒流程
-        bio.py              MyGene、富集、细胞类型注释
+        skill_workflow.py   Skill-driven 代码生成、执行与修复闭环
         schemas.py          Tool 参数 schema
 ```
 
@@ -108,7 +108,8 @@ Turn 1:
 
 Turn 2:
   LLM 看到工具结果
-  对 h5ad 单细胞任务调用 run_scanpy_singlecell_pipeline
+  如果有匹配 Skill，调用 run_skill_workflow
+  如果没有匹配 Skill，调用 run_code_workflow 或 execute_python / execute_r
 
 Turn 3:
   LLM 看到执行结果
@@ -150,19 +151,45 @@ Turn 3:
 |---|---|
 | `execute_python` | 在指定 Python Docker profile 中执行 Python 脚本 |
 | `execute_r` | 在指定 R Docker profile 中执行 R 脚本 |
+| `run_skill_workflow` | 读取指定 Skill，生成代码，使用 Docker 执行，失败后按 stdout/stderr 修复重试 |
+| `run_code_workflow` | 无需 Skill 的通用代码工作流，适合统计、转换、绘图、轻量分析和临时数据处理 |
 
-### 生信工具
+### 生信任务路由
 
-| Tool | 作用 |
+| 任务类型 | 推荐路径 |
 |---|---|
-| `run_scanpy_singlecell_pipeline` | 针对 `.h5ad` 执行完整 Scanpy 单细胞核心分析 |
-| `query_mygene` | 查询基因信息 |
-| `gene_set_enrichment` | 基因集富集分析 |
-| `run_celltype_annotation` | 根据 marker genes 做轻量细胞类型注释 |
+| MyGene / 外部基因信息查询 | `run_code_workflow` 生成可审计脚本执行 |
+| DEG 后功能富集 | `run_skill_workflow(skill_id="functional-enrichment-from-degs")` |
+| 单细胞 marker / 细胞类型注释 | `run_skill_workflow` 选择 Scanpy/Seurat 单细胞 Skill |
+| 没有明确 Skill 的临时生信分析 | `run_code_workflow` |
 
 ---
 
-## 6. 单细胞炮筒流程
+## 6. 工作流路由
+
+BioAgent 不会强制所有任务都走 Skill。它的路由策略更接近 `agent_cli_example` 的主循环设计：
+
+```text
+概念解释 / 普通问答
+-> 直接回答
+
+文件检查 / 日志分析 / 搜索
+-> list_files / read_file / grep_text / glob_search
+
+有明确匹配的生信工作流
+-> inspect_workflow_skill
+-> run_skill_workflow
+
+没有匹配 Skill 的通用数据分析
+-> run_code_workflow
+
+非常小的一次性脚本
+-> execute_python / execute_r
+```
+
+这样单细胞、bulk RNA-seq、Seurat、生存分析等任务可以借助对应 Skill；而简单表格汇总、文件转换、画图、日志解析、临时统计等任务不需要强行套 Skill。
+
+## 7. Skill-driven 工作流
 
 对于这类任务：
 
@@ -173,10 +200,10 @@ Turn 3:
 主 Agent 应优先调用：
 
 ```text
-run_scanpy_singlecell_pipeline
+run_skill_workflow
 ```
 
-该工具对应 `scrnaseq-scanpy-core-analysis` Skill，默认使用：
+对单细胞 `.h5ad` 示例，Agent 会选择 `scrnaseq-scanpy-core-analysis` Skill，默认使用：
 
 ```text
 env_profile = py-scverse-v1
@@ -184,47 +211,27 @@ image       = mas/py-scverse:v1
 runtime     = python
 ```
 
-它会在 Docker 中执行一条完整流程：
+它不是预先写死的单细胞模板，而是按以下闭环执行：
 
-1. 读取 `.h5ad`
-2. 输出数据结构摘要
-3. 计算 QC 指标
-4. 生成 QC 分布图
-5. 标准化 / log1p
-6. 高变基因选择
-7. scale + PCA
-8. neighbors
-9. Leiden 多分辨率聚类
-10. UMAP
-11. marker gene 计算
-12. 导出 processed h5ad、metadata、PCA/UMAP 坐标、marker CSV
-13. 生成 PDF 报告和 summary JSON/TXT
+1. 读取 `mas_2/workflows/<skill_id>/SKILL.md`
+2. 读取该 Skill 的 scripts / references 清单和关键预览
+3. 根据用户任务、输入数据、Skill 约束和 Docker profile 生成完整 Python/R 脚本
+4. 在 `/repo` 只读挂载和 `/work` 运行目录中执行
+5. 所有结果写入 `/work/outputs`
+6. 如果执行失败，把上一版代码、exit code、stdout/stderr 回灌给代码生成器修复
+7. 成功后输出 `===RESULT===...` 摘要，并在主 Agent 中形成最终报告
 
 预期输出目录：
 
 ```text
-BioAgent/runs/run_YYYYMMDD_HHMMSS/outputs/scrnaseq_scanpy_core/
+BioAgent/runs/run_YYYYMMDD_HHMMSS/outputs/
 ```
 
-典型输出文件：
-
-```text
-adata_processed.h5ad
-analysis_summary.json
-analysis_summary.txt
-cell_metadata.csv
-cell_qc_metrics.csv
-cluster_markers.csv
-pca_coordinates.csv
-qc_histograms.png
-scrna_analysis_report.pdf
-umap_coordinates.csv
-umap_leiden_0.8.png
-```
+具体输出文件由 Skill 和生成代码决定；单细胞任务通常会包含 processed `.h5ad`、QC 表、UMAP/PCA 坐标、marker 结果、图像和报告。
 
 ---
 
-## 7. Notebook 使用方式
+## 8. Notebook 使用方式
 
 打开：
 
@@ -262,11 +269,11 @@ result
 
 ---
 
-## 8. Docker 环境要求
+## 9. Docker 环境要求
 
 新系统不会静默 fallback 到错误环境。
 
-如果调用 `run_scanpy_singlecell_pipeline`，本地必须存在：
+如果执行单细胞 Scanpy Skill，本地必须存在：
 
 ```text
 mas/py-scverse:v1
@@ -292,7 +299,7 @@ load_image_catalog(config.docker_root)
 
 ---
 
-## 9. 日志
+## 10. 日志
 
 每次运行会生成：
 
@@ -311,10 +318,12 @@ BioAgent/logs/run_YYYYMMDD_HHMMSS.log
 - Docker exit code
 - stdout/stderr 预览
 - final answer
+- Skill workflow 阶段进展：选定 Skill、生成代码、执行、修复重试、完成/耗尽尝试
+- Code workflow 阶段进展：生成代码、执行、修复重试、完成/耗尽尝试
 
 ---
 
-## 10. 验证命令
+## 11. 验证命令
 
 推荐使用 `mas_agent` Conda 环境：
 
@@ -332,7 +341,7 @@ C:\Users\WYX\.conda\envs\mas_agent\python.exe -c "import ast, pathlib; files=lis
 
 ---
 
-## 11. 当前边界
+## 12. 当前边界
 
 目前已经迁移的是主流程能力和常用生信工具能力。以下能力还没有作为独立 Tool 完整恢复：
 
@@ -341,6 +350,6 @@ C:\Users\WYX\.conda\envs\mas_agent\python.exe -c "import ast, pathlib; files=lis
 - Chainlit 前端
 - 对每个 Skill 的专用 deterministic runner
 
-不过所有 `mas_2/workflows/*/SKILL.md` 都可以通过 Skill 工具读取，所有 Docker profile 都可以通过 catalog 工具识别，主 Agent 也可以基于这些 Skill 生成并执行 Python/R 代码。后续如果要继续增强，最建议逐个把高频 Skill 做成类似 `run_scanpy_singlecell_pipeline` 的专用炮筒工具。
+不过所有 `mas_2/workflows/*/SKILL.md` 都可以通过 Skill 工具读取，所有 Docker profile 都可以通过 catalog 工具识别，`run_skill_workflow` 会基于这些 Skill 生成并执行 Python/R 代码。后续如果要继续增强，最建议补充每个 Skill 的输出 schema、QC gate 和结果验证器，而不是回到硬编码单流程。
 
 
