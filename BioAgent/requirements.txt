@@ -1,3 +1,4 @@
 fastapi>=0.115
-langmem>=0.0.30
+httpx[socks]>=0.28
+langchain-anthropic>=1.4,<2
 uvicorn>=0.30

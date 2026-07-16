@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import io
+import json
 import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from langchain_core.messages import AIMessage
+import pytest
 
-from bioagent.config import AgentConfig
+from bioagent.config import AgentConfig, load_model_settings, model_settings_path
+import bioagent.webapp.app as webapp_module
+import bioagent.webapp.state as web_state_module
 from bioagent.webapp.app import TEXT_PREVIEW_LIMIT_BYTES, TEXT_PREVIEW_TRUNCATED_MESSAGE, create_app, _read_text_preview
-from bioagent.webapp.state import TaskRecord, apply_event_to_record, build_file_tree, record_from_payload
+from bioagent.webapp.state import TaskRecord, apply_event_to_record, build_file_tree, record_from_payload, stop_active_docker_containers
 
 
 def _config(tmp_path: Path) -> AgentConfig:
@@ -115,6 +120,33 @@ def _needs_input_stream(task: str, *, data_path: str | None = None, result_dir: 
     }
 
 
+def _pausable_stream(
+    task: str,
+    *,
+    data_path: str | None = None,
+    result_dir: str | None = None,
+    max_turns: int = 20,
+    pause_requested=None,
+):
+    run_dir = Path(result_dir or ".").parent / "run_paused"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    yield {"type": "run_start", "run_id": "run_paused", "run_dir": str(run_dir), "log_path": str(run_dir / "run.log")}
+    assert pause_requested is not None
+    deadline = time.time() + 3
+    while not pause_requested() and time.time() < deadline:
+        time.sleep(0.01)
+    assert pause_requested()
+    yield {"type": "final", "content": "Task paused. Add instructions to continue.", "status": "paused"}
+    yield {
+        "type": "run_end",
+        "run_id": "run_paused",
+        "run_dir": str(run_dir),
+        "log_path": str(run_dir / "run.log"),
+        "status": "paused",
+        "result": {"final_answer": "Task paused. Add instructions to continue.", "status": "paused"},
+    }
+
+
 def _fake_resume(resume_id: str, user_answer: str, *, max_turns: int = 20) -> dict:
     return {
         "final_answer": f"Resumed with {user_answer}",
@@ -123,6 +155,294 @@ def _fake_resume(resume_id: str, user_answer: str, *, max_turns: int = 20) -> di
         "turns": 2,
         "status": "completed",
     }
+
+
+def _fake_chat(context: dict, user_message: str) -> str:
+    assert context["sessionId"]
+    assert context["runStatus"] == "paused"
+    assert "availableSkills" in context
+    return f"Available skills for this session: {user_message}"
+
+
+def test_model_settings_api_persists_redacts_and_applies_configuration(tmp_path: Path) -> None:
+    tested: list[AgentConfig] = []
+
+    def model_test_runner(config: AgentConfig) -> dict:
+        tested.append(config)
+        return {"ok": True, "latencyMs": 12, "preview": "OK"}
+
+    config = _config(tmp_path)
+    app = create_app(config=config, stream_runner=_fake_stream, model_test_runner=model_test_runner)
+    client = TestClient(app)
+
+    initial = client.get("/api/settings/model").json()
+    assert initial["provider"] == "openai_compatible"
+    assert initial["baseUrl"] == "http://example.test/v1"
+    assert initial["apiKeyMasked"] == "te***"
+    assert "apiKey" not in initial
+
+    payload = {
+        "provider": "anthropic",
+        "base_url": "http://10.119.1.246:9010/v1",
+        "api_key": "new-secret-key",
+        "model_name": "new-qwen-model",
+        "temperature": 0.15,
+        "request_timeout": 900,
+        "mimo_thinking_type": "",
+        "chat_template_enable_thinking": False,
+    }
+    saved = client.put("/api/settings/model", json=payload)
+    connection = client.post("/api/settings/model/test", json={**payload, "api_key": ""})
+    health = client.get("/api/health").json()
+
+    assert saved.status_code == 200
+    assert saved.json()["provider"] == "anthropic"
+    assert saved.json()["modelName"] == "new-qwen-model"
+    assert saved.json()["apiKeyMasked"] == "new-se...-key"
+    assert "new-secret-key" not in saved.text
+    assert connection.json()["ok"] is True
+    assert tested[-1].api_key == "new-secret-key"
+    assert tested[-1].provider == "anthropic"
+    assert tested[-1].model_name == "new-qwen-model"
+    assert health["model"] == "new-qwen-model"
+    assert health["baseUrl"] == "http://10.119.1.246:9010/v1"
+    assert load_model_settings(config.project_root)["api_key"] == "new-secret-key"
+    assert load_model_settings(config.project_root)["provider"] == "anthropic"
+    assert model_settings_path(config.project_root).stat().st_mode & 0o777 == 0o600
+
+
+def test_model_connection_rejects_invalid_tool_call_payload(tmp_path: Path, monkeypatch) -> None:
+    class InvalidToolModel:
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def invoke(self, messages):
+            return AIMessage(
+                content="",
+                invalid_tool_calls=[
+                    {
+                        "name": "bioagent_connection_probe",
+                        "args": '{}{"value":"OK"}',
+                        "id": "toolu_invalid",
+                        "error": "JSONDecodeError: Extra data",
+                    }
+                ],
+                response_metadata={"finish_reason": "tool_calls"},
+            )
+
+    monkeypatch.setattr(webapp_module, "build_llm", lambda config: InvalidToolModel())
+
+    with pytest.raises(RuntimeError, match="invalid tool call"):
+        webapp_module._test_model_connection(_config(tmp_path))
+
+
+def test_model_settings_reset_restores_startup_configuration(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    app = create_app(config=config, stream_runner=_fake_stream, model_test_runner=lambda _: {"ok": True})
+    client = TestClient(app)
+    client.put(
+        "/api/settings/model",
+        json={
+            "provider": "openai_compatible",
+            "base_url": "http://new.test/v1",
+            "api_key": "new-key",
+            "model_name": "new-model",
+            "temperature": 0.2,
+            "request_timeout": 30,
+            "mimo_thinking_type": "disabled",
+            "chat_template_enable_thinking": None,
+        },
+    )
+
+    response = client.delete("/api/settings/model")
+
+    assert response.status_code == 200
+    assert response.json()["source"] == "environment"
+    assert response.json()["modelName"] == "test-model"
+    assert client.get("/api/health").json()["model"] == "test-model"
+    assert not model_settings_path(config.project_root).exists()
+
+
+def test_workbench_exposes_a_dedicated_model_settings_page() -> None:
+    root = Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static"
+    markup = (root / "index.html").read_text(encoding="utf-8")
+    script = (root / "assets" / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="settingsNavButton"' in markup
+    assert 'id="modelSettingsPage"' in markup
+    assert 'id="modelSettingsForm"' in markup
+    assert 'id="modelProviderInput"' in markup
+    assert 'id="modelBaseUrlInput"' in markup
+    assert 'id="modelApiKeyInput" type="password"' in markup
+    assert 'id="testModelButton"' in markup
+    assert 'id="resetModelSettingsButton"' in markup
+    assert 'location.pathname === "/settings"' in script
+    assert 'api("/api/settings/model")' in script
+    assert 'api("/api/settings/model/test"' in script
+
+
+def test_session_api_creates_an_open_conversation_with_an_initial_run(tmp_path: Path) -> None:
+    app = create_app(config=_config(tmp_path), stream_runner=_fake_stream)
+    client = TestClient(app)
+
+    created = client.post("/api/sessions", json={"task": "Run GWAS"}).json()
+    snapshot = _wait_for_status(client, created["sessionId"], "completed")
+
+    assert created["sessionId"] == created["taskId"]
+    assert snapshot["sessionStatus"] == "open"
+    assert snapshot["runStatus"] == "completed"
+    assert snapshot["runs"][0]["kind"] == "agent"
+    assert snapshot["messages"][0]["role"] == "user"
+    assert snapshot["messages"][0]["content"] == "Run GWAS"
+
+
+def test_paused_session_message_is_answered_without_resuming_the_run(tmp_path: Path) -> None:
+    resume_calls: list[tuple[str, str]] = []
+
+    def resume_runner(resume_id: str, user_answer: str, *, max_turns: int = 20) -> dict:
+        resume_calls.append((resume_id, user_answer))
+        return _fake_resume(resume_id, user_answer, max_turns=max_turns)
+
+    app = create_app(
+        config=_config(tmp_path),
+        stream_runner=_pausable_stream,
+        resume_runner=resume_runner,
+        chat_runner=_fake_chat,
+    )
+    client = TestClient(app)
+    session_id = client.post("/api/sessions", json={"task": "Run GWAS"}).json()["sessionId"]
+    _wait_for_status(client, session_id, "running")
+    client.post(f"/api/sessions/{session_id}/pause")
+    _wait_for_status(client, session_id, "paused")
+
+    response = client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={"content": "what skills do you have?"},
+    )
+    deadline = time.time() + 3
+    snapshot = client.get(f"/api/sessions/{session_id}").json()
+    while snapshot["interactionStatus"] and time.time() < deadline:
+        time.sleep(0.01)
+        snapshot = client.get(f"/api/sessions/{session_id}").json()
+
+    assert response.status_code == 202
+    assert snapshot["runStatus"] == "paused"
+    assert snapshot["interactionStatus"] == ""
+    assert snapshot["messages"][-2]["content"] == "what skills do you have?"
+    assert "Available skills" in snapshot["messages"][-1]["content"]
+    assert resume_calls == []
+
+
+def test_running_session_message_is_queued_for_the_active_agent(tmp_path: Path) -> None:
+    received: list[str] = []
+
+    def steerable_stream(
+        task: str,
+        *,
+        data_path: str | None = None,
+        result_dir: str | None = None,
+        max_turns: int = 20,
+        pause_requested=None,
+        take_pending_messages=None,
+    ):
+        yield {"type": "run_start", "run_id": "run_steer", "run_dir": str(tmp_path), "log_path": str(tmp_path / "run.log")}
+        deadline = time.time() + 3
+        while time.time() < deadline and not received:
+            received.extend(take_pending_messages())
+            time.sleep(0.01)
+        yield {"type": "final", "content": "Steering applied.", "status": "completed"}
+        yield {"type": "run_end", "run_id": "run_steer", "run_dir": str(tmp_path), "status": "completed"}
+
+    app = create_app(config=_config(tmp_path), stream_runner=steerable_stream)
+    client = TestClient(app)
+    session_id = client.post("/api/sessions", json={"task": "Run GWAS"}).json()["sessionId"]
+    _wait_for_status(client, session_id, "running")
+
+    response = client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={"content": "Use only chromosome 22."},
+    )
+    snapshot = _wait_for_status(client, session_id, "completed")
+
+    assert response.status_code == 202
+    assert received == ["Use only chromosome 22."]
+    queued_message = next(message for message in snapshot["messages"] if message["content"] == "Use only chromosome 22.")
+    assert queued_message["delivery"] == "consumed"
+
+
+def test_completed_session_message_starts_a_follow_up_run_in_the_same_session(tmp_path: Path) -> None:
+    prompts: list[str] = []
+    followup_kwargs: list[dict] = []
+
+    def followup_stream(task: str, *, data_path=None, result_dir=None, max_turns=20, **kwargs):
+        prompts.append(task)
+        followup_kwargs.append(kwargs)
+        run_id = f"run_{len(prompts)}"
+        yield {"type": "run_start", "run_id": run_id, "run_dir": str(tmp_path / run_id), "log_path": str(tmp_path / f"{run_id}.log")}
+        yield {"type": "final", "content": f"Answer {len(prompts)}", "status": "completed"}
+        yield {"type": "run_end", "run_id": run_id, "run_dir": str(tmp_path / run_id), "status": "completed"}
+
+    app = create_app(config=_config(tmp_path), stream_runner=followup_stream)
+    client = TestClient(app)
+    session_id = client.post("/api/sessions", json={"task": "Run GWAS"}).json()["sessionId"]
+    _wait_for_status(client, session_id, "completed")
+
+    response = client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={"content": "Explain the strongest association."},
+    )
+    deadline = time.time() + 3
+    snapshot = client.get(f"/api/sessions/{session_id}").json()
+    while len(snapshot["runs"]) < 2 and time.time() < deadline:
+        time.sleep(0.01)
+        snapshot = client.get(f"/api/sessions/{session_id}").json()
+    snapshot = _wait_for_status(client, session_id, "completed")
+
+    assert response.status_code == 202
+    assert len(snapshot["runs"]) == 2
+    assert snapshot["sessionStatus"] == "open"
+    assert "Explain the strongest association." in prompts[-1]
+    assert "Answer 1" in prompts[-1]
+    assert followup_kwargs[-1]["session_message"] == "Explain the strongest association."
+    assert followup_kwargs[-1]["initial_memory_state"]["task_state"] == {}
+    assert followup_kwargs[-1]["prior_run_dirs"] == [str(tmp_path / "run_1")]
+
+
+def test_session_messages_and_runs_survive_store_reload(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    app = create_app(config=config, stream_runner=_fake_stream)
+    client = TestClient(app)
+    session_id = client.post("/api/sessions", json={"task": "Run demo"}).json()["sessionId"]
+    _wait_for_status(client, session_id, "completed")
+    client.post(f"/api/sessions/{session_id}/messages", json={"content": "Summarize the result."})
+    deadline = time.time() + 3
+    snapshot = client.get(f"/api/sessions/{session_id}").json()
+    while len(snapshot["runs"]) < 2 and time.time() < deadline:
+        time.sleep(0.01)
+        snapshot = client.get(f"/api/sessions/{session_id}").json()
+    _wait_for_status(client, session_id, "completed")
+
+    restored_client = TestClient(create_app(config=config, stream_runner=_fake_stream))
+    restored = restored_client.get(f"/api/sessions/{session_id}").json()
+
+    assert restored["sessionStatus"] == "open"
+    assert len(restored["runs"]) == 2
+    assert any(message["content"] == "Summarize the result." for message in restored["messages"])
+
+
+def test_workbench_session_composer_separates_send_pause_and_continue_controls() -> None:
+    root = Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static"
+    markup = (root / "index.html").read_text(encoding="utf-8")
+    script = (root / "assets" / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="sendButton"' in markup
+    assert 'id="pauseButton"' in markup
+    assert 'id="continueButton"' in markup
+    assert "async function sendSessionMessage" in script
+    assert "`/api/sessions/${sessionId}/messages`" in script
+    assert 'els.pauseButton.addEventListener("click", pauseTask)' in script
+    assert 'els.continueButton.addEventListener("click", resumeTask)' in script
+    assert 'els.taskInput.disabled = false' in script
 
 
 def _wait_for_status(client: TestClient, task_id: str, status: str) -> dict:
@@ -203,6 +523,43 @@ def test_turn_start_updates_compute_progress() -> None:
     assert compute["maxTurns"] == 20
 
 
+def test_start_events_do_not_overwrite_an_early_pause_request() -> None:
+    record = TaskRecord(id="task1", task="Run demo", title="Run demo", data_path=None, max_turns=20, status="pausing")
+
+    apply_event_to_record(record, {"type": "task_started", "status": "running"})
+    apply_event_to_record(record, {"type": "run_start", "run_id": "run_test", "status": "running"})
+
+    assert record.status == "pausing"
+
+
+def test_memory_state_event_is_exposed_and_persisted_in_task_snapshot() -> None:
+    memory = {
+        "taskState": {
+            "task": "Run demo",
+            "current_stage": "inspecting_skill",
+            "selected_skill": "scrnaseq-scanpy-core-analysis",
+        },
+        "priorEpisodes": [{"skill_id": "scrnaseq-scanpy-core-analysis", "outcome": "success"}],
+        "longTermEnabled": True,
+        "namespace": ["bioagent", "default"],
+    }
+    record = TaskRecord(id="task1", task="Run demo", title="Run demo", data_path=None, max_turns=20)
+
+    apply_event_to_record(record, {"type": "memory_state", "memory": memory})
+    restored = record_from_payload(
+        {
+            "id": "task1",
+            "task": "Run demo",
+            "title": "Run demo",
+            "max_turns": 20,
+            "memory": record.memory,
+        }
+    )
+
+    assert record.snapshot()["memory"] == memory
+    assert restored.snapshot()["memory"] == memory
+
+
 def test_history_load_normalizes_stale_running_tool_plan_steps() -> None:
     record = record_from_payload(
         {
@@ -278,6 +635,24 @@ def test_history_load_marks_orphaned_running_task_as_interrupted() -> None:
     assert record.final_answer == "Run failed: Run interrupted before completion."
     assert record.traces[0]["status"] == "failed"
     assert record.compute["currentTool"] == ""
+
+
+def test_run_error_replaces_stale_paused_final_answer() -> None:
+    record = TaskRecord(
+        id="task1",
+        task="Run demo",
+        title="Run demo",
+        data_path=None,
+        max_turns=20,
+        status="running",
+        final_answer="Task paused. Add instructions to continue.",
+    )
+
+    apply_event_to_record(record, {"type": "error", "error": "Context size has been exceeded."})
+
+    assert record.status == "failed"
+    assert record.final_answer == "Run failed: Context size has been exceeded."
+    assert record.messages[-1]["content"] == record.final_answer
 
 
 def test_task_api_turns_bioagent_stream_events_into_snapshot(tmp_path: Path) -> None:
@@ -455,6 +830,55 @@ def test_task_resume_continues_same_human_input_run(tmp_path: Path) -> None:
     assert snapshot["messages"][-1]["content"] == "Resumed with human"
 
 
+def test_task_can_pause_and_resume_same_run_with_user_instruction(tmp_path: Path) -> None:
+    app = create_app(config=_config(tmp_path), stream_runner=_pausable_stream, resume_runner=_fake_resume)
+    client = TestClient(app)
+    task_id = client.post("/api/tasks", json={"task": "Run demo"}).json()["taskId"]
+    _wait_for_status(client, task_id, "running")
+
+    pause_response = client.post(f"/api/tasks/{task_id}/pause")
+    paused = _wait_for_status(client, task_id, "paused")
+    resumed = client.post(
+        f"/api/tasks/{task_id}/resume",
+        json={"user_answer": "Use a faster vectorized method", "max_turns": 5},
+    ).json()
+    completed = _wait_for_status(client, task_id, "completed")
+
+    assert pause_response.status_code == 200
+    assert pause_response.json()["status"] in {"pausing", "paused"}
+    assert paused["status"] == "paused"
+    assert resumed["taskId"] == task_id
+    assert completed["messages"][-2]["content"] == "Use a faster vectorized method"
+
+
+def test_pause_stops_only_containers_named_by_run_cidfiles(tmp_path: Path, monkeypatch) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / ".docker-python.cid").write_text("python-container\n", encoding="utf-8")
+    job_dir = run_dir / "jobs" / "job_active"
+    job_dir.mkdir(parents=True)
+    (job_dir / "container.cid").write_text("job-container\n", encoding="utf-8")
+    (job_dir / "job.json").write_text(
+        json.dumps({"job_id": "job_active", "status": "running", "container_id": "job-container"}),
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return None
+
+    monkeypatch.setattr(web_state_module.subprocess, "run", fake_run)
+
+    stop_active_docker_containers(run_dir)
+
+    assert calls == [
+        ["docker", "rm", "-f", "python-container"],
+        ["docker", "rm", "-f", "job-container"],
+    ]
+    assert json.loads((job_dir / "job.json").read_text(encoding="utf-8"))["status"] == "cancelled"
+
+
 def test_task_resume_marks_waiting_for_input_step_completed(tmp_path: Path) -> None:
     app = create_app(config=_config(tmp_path), stream_runner=_needs_input_stream, resume_runner=_fake_resume)
     client = TestClient(app)
@@ -467,6 +891,40 @@ def test_task_resume_marks_waiting_for_input_step_completed(tmp_path: Path) -> N
 
     assert plan["Wait for user input"] == "completed"
     assert plan["Resume with user input"] == "completed"
+
+
+def test_task_resume_streams_updated_memory_state(tmp_path: Path) -> None:
+    def memory_resume(resume_id: str, user_answer: str, *, max_turns: int = 20, event_sink=None) -> dict:
+        assert event_sink is not None
+        event_sink(
+            {
+                "type": "memory_state",
+                "memory": {
+                    "taskState": {"current_stage": "resuming", "current_goal": user_answer},
+                    "priorEpisodes": [],
+                    "longTermEnabled": True,
+                    "namespace": ["bioagent", "default"],
+                },
+            }
+        )
+        return {
+            "final_answer": "Resumed",
+            "run_dir": "/tmp/resumed_run",
+            "log_path": "/tmp/resumed_run/run.log",
+            "turns": 1,
+            "status": "completed",
+        }
+
+    app = create_app(config=_config(tmp_path), stream_runner=_needs_input_stream, resume_runner=memory_resume)
+    client = TestClient(app)
+    task_id = client.post("/api/tasks", json={"task": "Run demo"}).json()["taskId"]
+    _wait_for_status(client, task_id, "needs_user_input")
+
+    client.post(f"/api/tasks/{task_id}/resume", json={"user_answer": "Continue without doublets", "max_turns": 5})
+    snapshot = _wait_for_status(client, task_id, "completed")
+
+    assert snapshot["memory"]["taskState"]["current_stage"] == "resuming"
+    assert snapshot["memory"]["taskState"]["current_goal"] == "Continue without doublets"
 
 
 def test_waiting_for_human_input_message_is_not_marked_final(tmp_path: Path) -> None:
@@ -544,15 +1002,15 @@ def test_workbench_serves_static_assets_alias_for_cached_paths(tmp_path: Path) -
     assert "const state" in response.text
 
 
-def test_workbench_disables_unimplemented_rail_navigation() -> None:
+def test_workbench_disables_only_unimplemented_rail_navigation() -> None:
     markup = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "index.html").read_text(encoding="utf-8")
     styles = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "styles.css").read_text(encoding="utf-8")
 
-    assert '<button class="rail-button active" title="Projects" aria-current="page">P</button>' in markup
+    assert '<button class="rail-button active" id="workbenchNavButton" title="Projects" aria-current="page">P</button>' in markup
     assert '<button class="rail-button" title="Resources (coming soon)" disabled>R</button>' in markup
     assert '<button class="rail-button" title="Skills (coming soon)" disabled>S</button>' in markup
     assert '<button class="rail-button" title="History (coming soon)" disabled>H</button>' in markup
-    assert '<button class="rail-button" title="Settings (coming soon)" disabled>G</button>' in markup
+    assert '<button class="rail-button" id="settingsNavButton" title="Model settings">G</button>' in markup
     assert ".rail-button:disabled" in styles
     assert "cursor: default" in styles[styles.index(".rail-button:disabled"):]
     assert "opacity: .45" in styles[styles.index(".rail-button:disabled"):]
@@ -564,7 +1022,7 @@ def test_workbench_js_closes_terminal_event_stream_and_throttles_refresh() -> No
 
     assert "function isTerminalStatus(status)" in script
     assert "scheduleSnapshotRefresh(taskId)" in script
-    assert "if (isTerminalStatus(state.snapshot?.status))" in script
+    assert "if (shouldCloseSessionStream(state.snapshot))" in script
     assert "closeEvents();" in script
 
 
@@ -576,7 +1034,7 @@ def test_workbench_ignores_stale_realtime_stream_events() -> None:
     snapshot_write = script.index("state.snapshot = JSON.parse(event.data)", snapshot_listener)
     error_handler = script.index("source.onerror", snapshot_write)
     error_guard = script.index("if (state.taskId !== taskId) return", error_handler)
-    error_status_check = script.index("if (isTerminalStatus(state.snapshot?.status))", error_handler)
+    error_status_check = script.index("if (shouldCloseSessionStream(state.snapshot))", error_handler)
 
     assert snapshot_guard < snapshot_write
     assert error_guard < error_status_check
@@ -614,17 +1072,17 @@ def test_workbench_js_supports_resume_mode_for_human_input() -> None:
     assert "Reply" in script
 
 
-def test_workbench_composer_labels_terminal_selected_runs_as_rerun() -> None:
+def test_workbench_composer_keeps_terminal_sessions_open_for_follow_up() -> None:
     script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
 
     composer = script.index("function renderComposer")
     terminal_check = script.index("isTerminalStatus(snapshot?.status)", composer)
-    rerun_label = script.index('els.sendButton.textContent = "Rerun"', terminal_check)
-    default_label = script.index('els.sendButton.textContent = "Run"', rerun_label)
+    send_label = script.index('els.sendButton.textContent = "Send"', terminal_check)
+    default_label = script.index('els.sendButton.textContent = "Run"', send_label)
     needs_input = script.index('snapshot?.status === "needs_user_input"', composer)
     active_status = script.index("isActiveStatus(snapshot?.status)", needs_input)
 
-    assert needs_input < active_status < terminal_check < rerun_label < default_label
+    assert needs_input < active_status < terminal_check < send_label < default_label
 
 
 def test_workbench_js_auto_selects_most_relevant_trace() -> None:
@@ -1576,7 +2034,7 @@ def test_workbench_topbar_uses_readable_task_display_title() -> None:
     render_start = script.index("function render")
     display_title = script.index("formatTaskDisplayTitle(snapshot)", render_start)
     topbar_title = script.index("els.taskTitle.textContent = displayTitle.title", display_title)
-    full_title = script.index('els.taskTitle.title = snapshot?.task || snapshot?.title || "New task"', topbar_title)
+    full_title = script.index('els.taskTitle.title = snapshot?.task || snapshot?.title || "New session"', topbar_title)
 
     assert render_start < display_title < topbar_title < full_title
 
@@ -1823,7 +2281,7 @@ def test_task_list_includes_run_activity_counts(tmp_path: Path) -> None:
 
     tasks = client.get("/api/tasks").json()["tasks"]
 
-    assert tasks[0]["messageCount"] == 2
+    assert tasks[0]["messageCount"] == 3
     assert tasks[0]["traceCount"] == 1
     assert tasks[0]["resultFileCount"] == 2
 
@@ -2613,8 +3071,8 @@ def test_workbench_result_summary_wraps_long_paths() -> None:
 def test_workbench_search_empty_states_distinguish_no_data_from_no_matches() -> None:
     script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
 
-    assert "No matching runs." in script
-    assert "No runs yet." in script
+    assert "No matching sessions." in script
+    assert "No sessions yet." in script
     assert "No matching files." in script
     assert "No output files yet." in script
     assert "tasks.length" in script
@@ -2645,14 +3103,48 @@ def test_workbench_failed_result_summary_offers_log_and_rerun_actions() -> None:
     trace_label = script.index("Inspect failed trace", open_trace)
     copy_details = script.index("Copy error details", trace_label)
     click_handler = script.index('event.target.closest("[data-rerun-current]")')
-    helper = script.index("function prepareRerunCurrent")
-    terminal_guard = script.index("isTerminalStatus(state.snapshot?.status)", helper)
-    focus_call = script.index("els.taskInput.focus()", terminal_guard)
+    helper = script.index("async function continueFailedRun")
+    terminal_guard = script.index('state.snapshot?.status !== "failed"', helper)
+    message_call = script.index("sendSessionMessage", terminal_guard)
+    continuation = script.index("Continue from the latest failed run", terminal_guard)
 
     assert failed_case < actions < primary_action < rerun < open_log < open_trace < trace_label < copy_details
-    assert click_handler < helper < terminal_guard < focus_call
+    assert click_handler < helper < terminal_guard < message_call < continuation
     assert ".result-actions" in styles
     assert ".result-primary" in styles
+
+
+def test_workbench_does_not_duplicate_session_task_in_message_stream() -> None:
+    script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
+
+    render_messages = script.index("function renderMessages")
+    fallback = script.index("snapshot.messages?.length", render_messages)
+    existing_messages = script.index("? snapshot.messages", fallback)
+    task_fallback = script.index("snapshot.task", existing_messages)
+
+    assert render_messages < fallback < existing_messages < task_fallback
+
+
+def test_history_loader_normalizes_legacy_anthropic_content_blocks(tmp_path: Path) -> None:
+    payload = {
+        "id": "legacy-anthropic",
+        "task": "Run analysis",
+        "status": "failed",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "[{'text': 'Inspecting the skill.', 'type': 'text'}, {'id': 'toolu_1', 'input': {}, 'name': 'list_files', 'type': 'tool_use'}]",
+            },
+            {
+                "role": "assistant",
+                "content": "[{'id': 'toolu_2', 'input': {}, 'name': 'list_jobs', 'type': 'tool_use'}]",
+            },
+        ],
+    }
+
+    record = record_from_payload(payload)
+
+    assert [message["content"] for message in record.messages] == ["Inspecting the skill."]
 
 
 def test_workbench_failed_result_summary_can_open_failed_trace() -> None:
@@ -2747,7 +3239,7 @@ def test_workbench_new_task_restores_default_composer_state() -> None:
     assert 'activateTab("trace")' in script
 
 
-def test_workbench_selected_terminal_run_populates_rerun_composer() -> None:
+def test_workbench_selected_session_prepares_an_empty_message_composer() -> None:
     script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
 
     select_start = script.index("async function selectTask")
@@ -2758,25 +3250,37 @@ def test_workbench_selected_terminal_run_populates_rerun_composer() -> None:
     render_call = select_body.index("render();", sync_call)
     scroll_call = select_body.index("scrollToLatest();", render_call)
     helper_start = script.index("function syncComposerFromSnapshot")
-    active_guard = script.index("isActiveStatus(snapshot.status)", helper_start)
-    input_guard = script.index('snapshot.status === "needs_user_input"', active_guard)
-    task_fill = script.index("els.taskInput.value = snapshot.task || \"\"", input_guard)
-    path_fill = script.index("els.dataPathInput.value = snapshot.dataPath || \"\"", task_fill)
+    session_guard = script.index("state.replyTaskId !== snapshot.id", helper_start)
+    clear_input = script.index('els.taskInput.value = ""', session_guard)
+    path_fill = script.index("els.dataPathInput.value = snapshot.dataPath || \"\"", clear_input)
     turns_fill = script.index("els.maxTurnsInput.value = String(snapshot.maxTurns || state.defaultMaxTurns)", path_fill)
 
     assert set_snapshot < sync_call < render_call < scroll_call
-    assert helper_start < active_guard < input_guard < task_fill < path_fill < turns_fill
+    assert helper_start < session_guard < clear_input < path_fill < turns_fill
 
 
-def test_workbench_disables_run_button_while_task_is_active() -> None:
+def test_workbench_selected_active_run_leaves_composer_available_for_steering() -> None:
+    script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
+
+    composer = script.index("function renderComposer")
+    active = script.index("if (isActiveStatus(snapshot?.status))", composer)
+    send = script.index('els.sendButton.textContent = "Send"', active)
+    enabled = script.index("els.taskInput.disabled = false", send)
+    pause = script.index("els.pauseButton.hidden = false", enabled)
+
+    assert composer < active < send < enabled < pause
+
+
+def test_workbench_keeps_send_enabled_and_exposes_pause_while_session_is_active() -> None:
     script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
     styles = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "styles.css").read_text(encoding="utf-8")
 
     assert "function isActiveStatus" in script
-    assert "isActiveStatus(state.snapshot?.status)" in script
+    assert "isActiveStatus(snapshot?.status)" in script
     assert "els.sendButton.disabled = true" in script
     assert "els.sendButton.disabled = false" in script
     assert ".send:disabled" in styles
+    assert "els.pauseButton.hidden = false" in script
 
 
 def test_workbench_disables_run_button_while_task_create_is_in_flight() -> None:
@@ -2784,7 +3288,7 @@ def test_workbench_disables_run_button_while_task_create_is_in_flight() -> None:
 
     start = script.index("async function startTask")
     begin_submit = script.index('const submitToken = beginSubmit("create")', start)
-    create_call = script.index('const created = await api("/api/tasks"', start)
+    create_call = script.index('const created = await api("/api/sessions"', start)
     clear_submitting = script.index("state.isSubmitting = false", create_call)
 
     assert begin_submit < create_call < clear_submitting
@@ -2796,7 +3300,7 @@ def test_workbench_ignores_stale_task_create_responses_after_navigation() -> Non
     script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
 
     start = script.index("async function startTask")
-    create_call = script.index('const created = await api("/api/tasks"', start)
+    create_call = script.index('const created = await api("/api/sessions"', start)
     stale_guard = script.index("if (state.submitToken !== submitToken) return", create_call)
     add_message = script.index("addUserMessage(payload.task)", create_call)
     push_state = script.index("history.pushState", create_call)
@@ -2810,12 +3314,12 @@ def test_workbench_disables_reply_button_while_resume_is_in_flight() -> None:
     script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
 
     start = script.index("async function resumeTask")
-    begin_submit = script.index('const submitToken = beginSubmit("reply")', start)
-    resume_call = script.index("await api(`/api/tasks/${taskId}/resume`", start)
+    begin_submit = script.index('const submitToken = beginSubmit(isPaused ? "continue" : "reply")', start)
+    resume_call = script.index("await api(`/api/sessions/${taskId}/resume`", start)
     clear_submitting = script.index("state.isSubmitting = false", resume_call)
 
     assert begin_submit < resume_call < clear_submitting
-    assert 'state.submitMode === "reply" ? "Replying" : "Creating"' in script
+    assert 'const labels = { reply: "Replying", continue: "Continuing", pause: "Pausing", message: "Sending" }' in script
     assert "state.submitMode = null" in script
 
 
@@ -2824,7 +3328,7 @@ def test_workbench_ignores_stale_resume_responses_after_navigation() -> None:
 
     start = script.index("async function resumeTask")
     task_id_capture = script.index("const taskId = state.taskId", start)
-    resume_call = script.index("await api(`/api/tasks/${taskId}/resume`", start)
+    resume_call = script.index("await api(`/api/sessions/${taskId}/resume`", start)
     stale_guard = script.index("if (state.submitToken !== submitToken) return", resume_call)
     clear_input = script.index('els.taskInput.value = ""', resume_call)
     select_task = script.index("await selectTask(taskId)", resume_call)
@@ -2832,21 +3336,57 @@ def test_workbench_ignores_stale_resume_responses_after_navigation() -> None:
     assert task_id_capture < resume_call < stale_guard < clear_input < select_task
 
 
-def test_workbench_does_not_close_stream_when_active_submit_is_blocked() -> None:
+def test_workbench_routes_existing_session_submits_to_message_endpoint_before_new_run_setup() -> None:
     script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
 
     start = script.index("async function startTask")
-    active_guard = script.index("if (isActiveStatus(state.snapshot?.status))", start)
+    active_guard = script.index("if (state.taskId && state.snapshot)", start)
+    send_message = script.index("await sendSessionMessage()", active_guard)
     close_events = script.index("closeEvents();", start)
 
-    assert active_guard < close_events
+    assert active_guard < send_message < close_events
+
+
+def test_workbench_pause_uses_a_separate_control_from_session_send() -> None:
+    script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
+
+    listener = script.index('els.pauseButton.addEventListener("click", pauseTask)')
+    endpoint = script.index("async function pauseTask", listener)
+    post = script.index("`/api/sessions/${taskId}/pause`", endpoint)
+
+    assert listener < endpoint < post
+
+
+def test_workbench_paused_composer_can_send_chat_or_explicitly_continue() -> None:
+    script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
+
+    composer = script.index("function renderComposer")
+    paused = script.index('snapshot?.status === "paused"', composer)
+    send_label = script.index('els.sendButton.textContent = "Send"', paused)
+    continue_control = script.index("els.continueButton.hidden = false", send_label)
+    pausing = script.index('snapshot?.status === "pausing"', continue_control)
+    running = script.index("isActiveStatus(snapshot?.status)", pausing)
+    pause_control = script.index("els.pauseButton.hidden = false", running)
+
+    assert composer < paused < send_label < continue_control < pausing < running < pause_control
+
+
+def test_workbench_pause_statuses_drive_stream_lifecycle() -> None:
+    script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
+
+    terminal = script.index("function isTerminalStatus")
+    paused = script.index('"paused"', terminal)
+    active = script.index("function isActiveStatus", paused)
+    pausing = script.index('"pausing"', active)
+
+    assert terminal < paused < active < pausing
 
 
 def test_workbench_only_adds_user_message_after_task_create_succeeds() -> None:
     script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
 
     start = script.index("async function startTask")
-    create_call = script.index('const created = await api("/api/tasks"', start)
+    create_call = script.index('const created = await api("/api/sessions"', start)
     add_message = script.index("addUserMessage(payload.task)", start)
 
     assert create_call < add_message
@@ -2941,9 +3481,10 @@ def test_workbench_detail_tabs_show_trace_and_result_counts() -> None:
 
     tabs = markup.index('id="detailTabs"')
     trace_tab = markup.index('id="traceTab"', tabs)
-    result_tab = markup.index('id="resultTab"', trace_tab)
+    memory_tab = markup.index('id="memoryTab"', trace_tab)
+    result_tab = markup.index('id="resultTab"', memory_tab)
     file_tab = markup.index('id="fileTab"', result_tab)
-    els_list = script.index('"traceTab", "resultTab", "fileTab"')
+    els_list = script.index('"traceTab", "memoryTab", "resultTab", "fileTab"')
     render_start = script.index("function render")
     render_counts = script.index("renderTabCounts(snapshot)", render_start)
     helper = script.index("function renderTabCounts")
@@ -2953,9 +3494,29 @@ def test_workbench_detail_tabs_show_trace_and_result_counts() -> None:
     result_text = script.index('els.resultTab.textContent = resultCount ? `Result ${resultCount}` : "Result"', trace_text)
     file_text = script.index('els.fileTab.textContent = "File"', result_text)
 
-    assert tabs < trace_tab < result_tab < file_tab
+    assert tabs < trace_tab < memory_tab < result_tab < file_tab
     assert els_list < render_start < render_counts < helper
     assert helper < trace_count < result_count < trace_text < result_text < file_text
+
+
+def test_workbench_has_read_only_memory_tab_for_task_state_and_verified_episodes() -> None:
+    root = Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static"
+    markup = (root / "index.html").read_text(encoding="utf-8")
+    script = (root / "assets" / "app.js").read_text(encoding="utf-8")
+    styles = (root / "assets" / "styles.css").read_text(encoding="utf-8")
+
+    assert 'id="memoryTab"' in markup
+    assert 'data-tab="memory"' in markup
+    assert 'id="memoryPane"' in markup
+    assert 'id="memoryState"' in markup
+    assert 'id="memoryEpisodes"' in markup
+    assert "function renderMemory(snapshot)" in script
+    assert "function formatMemoryTimestamp(value)" in script
+    assert "formatMemoryTimestamp(episode.timestamp)" in script
+    assert "snapshot?.memory" in script
+    assert "priorEpisodes" in script
+    assert ".memory-state-grid" in styles
+    assert ".memory-episode" in styles
 
 
 def test_workbench_detail_tab_switch_resets_shared_scroll_only_when_tab_changes() -> None:

@@ -2,12 +2,16 @@
 
 import queue
 import threading
+import json
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Callable, Iterator
+
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from .agent import BioAgent
 from .config import AgentConfig
 from .logging_utils import RunLogger, now_stamp
+from .llm import build_llm, message_text
 from .run_state import clear_pending_state, load_pending_state
 
 
@@ -42,6 +46,11 @@ def run_bio_agent_stream(
     data_path: str | None = None,
     result_dir: str | None = None,
     max_turns: int = 20,
+    pause_requested: Callable[[], bool] | None = None,
+    take_pending_messages: Callable[[], list[str]] | None = None,
+    initial_memory_state: dict[str, Any] | None = None,
+    session_message: str | None = None,
+    prior_run_dirs: list[str] | None = None,
 ) -> Iterator[dict]:
     """Notebook-facing streaming entrypoint."""
 
@@ -62,14 +71,26 @@ def run_bio_agent_stream(
     def worker() -> None:
         try:
             with RunLogger(config.logs_dir, run_id=run_id) as logger:
-                agent = BioAgent(config=config, logger=logger, run_dir=run_dir)
-                result = agent.run(
-                    task,
-                    data_path=data_path,
-                    result_dir=result_dir,
-                    max_turns=max_turns,
-                    event_sink=emit,
-                )
+                agent_kwargs: dict[str, Any] = {"config": config, "logger": logger, "run_dir": run_dir}
+                if prior_run_dirs:
+                    agent_kwargs["prior_run_dirs"] = [Path(path) for path in prior_run_dirs]
+                agent = BioAgent(**agent_kwargs)
+                run_kwargs = {
+                    "task": task,
+                    "data_path": data_path,
+                    "result_dir": result_dir,
+                    "max_turns": max_turns,
+                    "event_sink": emit,
+                }
+                if pause_requested is not None:
+                    run_kwargs["pause_requested"] = pause_requested
+                if take_pending_messages is not None:
+                    run_kwargs["take_pending_messages"] = take_pending_messages
+                if initial_memory_state is not None:
+                    run_kwargs["initial_memory_state"] = initial_memory_state
+                if session_message is not None:
+                    run_kwargs["resume_answer"] = session_message
+                result = agent.run(**run_kwargs)
                 result_dict = result.to_dict()
                 if not terminal_seen["final"]:
                     emit(
@@ -168,6 +189,9 @@ def resume_bio_agent(
     user_answer: str,
     *,
     max_turns: int = 20,
+    pause_requested: Callable[[], bool] | None = None,
+    event_sink: Callable[[dict], None] | None = None,
+    take_pending_messages: Callable[[], list[str]] | None = None,
 ) -> dict:
     """Resume a run that previously returned status='needs_user_input'."""
 
@@ -177,15 +201,47 @@ def resume_bio_agent(
 
     with RunLogger(config.logs_dir, run_id=pending.run_id, append=True) as logger:
         agent = BioAgent(config=config, logger=logger, run_dir=pending.run_dir)
-        result = agent.run(
+        run_kwargs = dict(
             task="",
             max_turns=max_turns,
             initial_messages=pending.messages,
             resume_answer=user_answer,
         )
-        if result.status != "needs_user_input":
+        memory_state = pending.metadata.get("memory_state")
+        if isinstance(memory_state, dict):
+            run_kwargs["initial_memory_state"] = memory_state
+        if pause_requested is not None:
+            run_kwargs["pause_requested"] = pause_requested
+        if event_sink is not None:
+            run_kwargs["event_sink"] = event_sink
+        if take_pending_messages is not None:
+            run_kwargs["take_pending_messages"] = take_pending_messages
+        result = agent.run(**run_kwargs)
+        if result.status not in {"needs_user_input", "paused"}:
             clear_pending_state(config, resume_id)
         return result.to_dict()
+
+
+def answer_bio_agent_message(session_context: dict[str, Any], user_message: str) -> str:
+    """Answer a conversational side question without resuming the paused run."""
+
+    config = AgentConfig.from_env()
+    compact_context = json.dumps(session_context, ensure_ascii=False, default=str)
+    if len(compact_context) > 12_000:
+        compact_context = compact_context[-12_000:]
+    response = build_llm(config).invoke(
+        [
+            SystemMessage(
+                content=(
+                    "You are the conversational interface for a paused BioAgent session. "
+                    "Answer the user's question from the supplied verified session context. "
+                    "Do not claim to run tools, do not resume the analysis, and say clearly when the context is insufficient."
+                )
+            ),
+            HumanMessage(content=f"Session context:\n{compact_context}\n\nUser question:\n{user_message}"),
+        ]
+    )
+    return message_text(response)
 
 
 def run_bmmc_singlecell_demo(max_turns: int = 20) -> dict:

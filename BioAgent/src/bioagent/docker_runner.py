@@ -136,7 +136,7 @@ class DockerRunner:
         *,
         env_profile: str = "py-general-v1",
         requirements: str = "",
-        timeout_s: int = 900,
+        timeout_s: int = 1800,
     ) -> ExecutionResult:
         script = self.scripts_dir / "code.py"
         script.write_text(code, encoding="utf-8")
@@ -220,7 +220,7 @@ class DockerRunner:
         code: str,
         *,
         env_profile: str = "r-bioc-v1",
-        timeout_s: int = 900,
+        timeout_s: int = 1800,
     ) -> ExecutionResult:
         script = self.scripts_dir / "code.R"
         script.write_text(code, encoding="utf-8")

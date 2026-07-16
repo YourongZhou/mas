@@ -12,7 +12,7 @@ supervisor -> code_dev -> critic -> supervisor
 用户任务
 -> 单个主 Agent 维护完整上下文
 -> 主 Agent 判断是否需要工具
--> 工具执行：读文件 / 查 Skill / 查 Docker 环境 / 通用代码执行 / Skill 工作流
+-> 工具执行：读文件 / 查 Skill / 写持久脚本 / 异步 Docker job / 产物验证
 -> 工具结果回灌给同一个主 Agent
 -> 主 Agent 继续推理或给出最终结果
 ```
@@ -50,23 +50,22 @@ mas/
 | `mas_2` 旧能力 | 新系统迁移状态 | 说明 |
 |---|---:|---|
 | Supervisor 任务规划 | 已改造 | 不再单独存在，由主 Agent 在同一循环内完成计划和工具选择 |
-| Code Dev 代码生成 | 已改造 | 主 Agent 可直接生成代码并调用 `execute_python` / `execute_r` |
+| Code Dev 代码生成 | 已改造 | 主 Agent 把代码写入 run workspace，并按脚本路径启动 Docker job |
 | Critic 审核 | 设计上移除 | 通过工具返回值、退出码、stdout/stderr 和最终输出检查形成闭环，不再额外启一个 Critic Agent |
 | Workflow Skill 选择和读取 | 已迁移 | `list_workflow_skills`、`inspect_workflow_skill` |
 | Docker image catalog 解析 | 已迁移 | `inspect_image_catalog`，执行工具也会检查 profile/image |
-| Python Docker 执行 | 已迁移 | `execute_python` |
-| R Docker 执行 | 已迁移 | `execute_r` |
-| Skill-driven 生信工作流 | 已改为薄工具模式 | 主 Agent 自主读取 Skill/scripts/function 签名，生成代码后用 `execute_python` / `execute_r` 执行和修复 |
-| 无 Skill 通用任务 | 已支持 | 主 Agent 直接生成 Python/R 代码并用执行工具运行 |
+| Python/R Docker 执行 | 已迁移 | `start_job` / `poll_job` / `tail_job` / `cancel_job`；旧 inline 执行保留兼容 |
+| Skill-driven 生信工作流 | 已改为薄工具模式 | 主 Agent 自主读取 Skill/scripts/function 签名，写持久脚本后启动、观察和修复 job |
+| 无 Skill 通用任务 | 已支持 | 主 Agent 直接写 Python/R 脚本并使用同一套异步 job lifecycle |
 | MyGene 查询 | 已通用化 | 不再写死专用 Tool；无匹配 Skill 时由主 Agent 生成可审计脚本执行 |
 | 基因集富集 | 已通用化 | 优先读取 `functional-enrichment-from-degs` Skill；无匹配场景时由主 Agent 生成脚本执行 |
 | 细胞类型注释 | 已通用化 | 优先读取单细胞相关 Skill；无匹配场景时由主 Agent 生成脚本执行 |
 | RAG Researcher | 未作为独立 Agent 迁移 | 当前通过 Skill 文档读取替代；如需文献 RAG，可后续作为 Tool 加入 |
 | Chainlit 前端 | 不迁移 | 旧 Chainlit UI 不再沿用 |
-| 本地 Workbench 前端 | 已支持 | Biomni-style 本地页面，展示实时事件、工具调用、结果文件和历史 run |
+| 本地 Workbench 前端 | 已支持 | Session 级多轮对话，展示实时事件、工具调用、结果文件和历史 run |
 | Notebook 执行 | 已支持 | `notebooks/run_agent_loop.ipynb` |
 | 运行日志 | 已支持 | 每次运行写入 `BioAgent/logs/run_*.log` |
-| LangMem Memory Harness | 已支持 | 主 Agent 暴露 `manage_memory` / `search_memory`，当前默认使用进程内 LangGraph store |
+| Two-level Memory Harness | 已支持 | 每个 run 维护结构化 TaskState；任务结束后只持久化经过工具结果验证的精简 episode |
 | 中途等待用户输入 | 已支持 | `request_user_input` 和 Skill preflight 可返回 `status="needs_user_input"`，通过 `resume_bio_agent()` 继续 |
 
 ---
@@ -86,16 +85,21 @@ BioAgent/
       docker_runner.py      Docker 沙箱执行
       llm.py                ChatOpenAI 创建与运行时摘要
       logging_utils.py      运行日志
+      memory/               TaskState、verified episode store、检索与提取
       runner.py             Notebook 入口函数
       webapp/
         app.py              FastAPI 本地 Workbench 后端与静态文件服务
-        state.py            Web 任务状态、事件映射和结果文件树
+        state.py            Web Session、run、消息调度、事件映射和结果文件树
         static/             无构建依赖的前端页面
       skills/
         registry.py         扫描/读取 mas_2 workflow skills 与 Docker catalog
       tools/
         registry.py         LangChain Tool 注册
         filesystem.py       文件读取、搜索、glob
+        workspace.py        run workspace 文件写入、精确修改和语法检查
+        jobs.py             持久异步 Docker job 生命周期
+        artifacts.py        通用产物检查、evidence 和 grounded finish
+        attempts.py         跨 pause/resume 的全局执行预算
         workflow.py         workflow skill / image catalog 工具
         execution.py        Python/R 代码执行工具
         skill_workflow.py   Skill-driven 代码生成、执行与修复闭环
@@ -118,10 +122,11 @@ Turn 2:
   如果有匹配 Skill，读取 scripts/function 签名并自己写代码
   如果没有匹配 Skill，直接写 Python/R 脚本
 
-Turn 3:
-  LLM 调用 execute_python / execute_r 并看到执行结果
-  如果成功，汇总输出文件
-  如果失败，基于 stderr/stdout 再查函数签名或源码，最小修复后重试
+Turn 3+:
+  LLM 调用 write_run_file -> validate_script -> start_job
+  使用 poll_job 等待长任务，按需 tail_job 查看日志
+  如果失败，基于精确错误调用 edit_run_file，随后启动新 job
+  如果成功，inspect_artifact 登记 evidence，finish_task 验证后收束
 ```
 
 相比旧的 `supervisor + code_dev + critic`，新的链路更短：
@@ -155,36 +160,56 @@ Turn 3:
 | `inspect_skill_function` | 查看某个 Skill 函数的签名、docstring 和源码预览 |
 | `inspect_image_catalog` | 读取 `mas_2/docker/image_catalog.json` |
 
-### 沙箱执行
+### Run Workspace、Job 与验证
 
 | Tool | 作用 |
 |---|---|
-| `execute_python` | 在指定 Python Docker profile 中执行 Python 脚本 |
-| `execute_r` | 在指定 R Docker profile 中执行 R 脚本 |
+| `write_run_file` | 把持久脚本写入当前 run workspace |
+| `edit_run_file` | 用唯一精确文本匹配做最小修改 |
+| `validate_script` | 不消耗 attempt 的轻量语法检查 |
+| `start_job` | 按脚本路径启动异步 Docker job，返回持久 `job_id` |
+| `list_jobs` | 列出当前 session 各 run 的持久 job 记录和 active job ID |
+| `get_job` | 查看指定或 active job 的完整持久状态 |
+| `poll_job` | 查询 job；可等待 0-300 秒以支持长任务 |
+| `tail_job` | 按需读取实时或持久化的 job 日志尾部 |
+| `cancel_job` | 终止指定 job |
+| `inspect_artifact` | 检查表格、JSON、图片、gzip、H5AD 或文本并登记 evidence |
+| `finish_task` | 重新验证 evidence 和文件哈希后形成 grounded final answer |
+| `execute_python` / `execute_r` | 兼容旧调用的 inline 执行；完整分析不推荐使用 |
 | `request_user_input` | 缺少关键输入且不能安全默认时暂停 run，保存状态并等待用户回答后 resume |
-| `manage_memory` | LangMem 记忆写入/更新/删除工具；启用 LangMem 后自动暴露 |
-| `search_memory` | LangMem 记忆检索工具；启用 LangMem 后自动暴露 |
+
+执行 attempt 记录在 `run_dir/state/execution_attempts.json`，不会因 pause/resume 或重新构建 Agent 而重置。`max_turns` 只限制会改变任务状态的模型决策；skill 阅读、上下文查询、脚本验证、job 轮询、日志读取、artifact 检查和最终验证不会消耗决策预算，因此长任务等待不会挤占正常分析轮次。
+
+Active job ID 位于每个 run 的 `state/job_state.json`；每个 job 的状态和日志位于 `run_dir/jobs/<job_id>/job.json`。同一 session 的后续 run 可以发现并继续查询之前 run 的 job 和产物，同时 session 内只允许一个运行中的 job，避免 Continue 后重复启动分析。最终 evidence 位于 `run_dir/state/artifact_evidence.json` 和 `final_verification.json`。
 
 ### Memory Harness
 
-BioAgent 通过 LangMem 的 hot-path memory tools 为主 Agent 增加记忆能力：
+BioAgent 使用两级 memory harness：
 
 ```text
-manage_memory  -> 记录用户偏好、项目约定、环境事实、可复用失败经验
-search_memory  -> 在后续 run 中检索相关记忆
+Short-term TaskState
+  -> 每轮按已确认输入和工具结果覆盖更新
+  -> 每次 LLM 调用临时注入最新紧凑摘要
+  -> pause / request_user_input 时随 checkpoint 保存
+
+Long-term verified episodes
+  -> 仅在任务真正结束且有执行结果证据时写入
+  -> 新任务开始时检索 top 3 并注入 Prior verified experience
 ```
 
-每次新 run 开始时，BioAgent 会用当前任务文本检索最多 5 条相关记忆，并把压缩后的 `Relevant BioAgent memories` 注入初始上下文。主 Agent 仍然可以在推理中主动调用 `search_memory` 或 `manage_memory`。
+TaskState 包含当前目标、确认输入、预期输出、Skill、runtime、阶段、活动/已解决错误、产物、阻塞项和下一步。它不是追加式聊天摘要；Agent 每轮只看到当前版本。
+
+长期 episode 只包含任务/数据签名、Skill、runtime、结果、经过验证的根因/修复/经验、来源 run ID 和时间戳。不会保存原始对话、stdout、生成代码或临时路径。历史经验前会明确提示：当前观测始终优先。
 
 配置项：
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `BIOAGENT_MEMORY_ENABLED` | `true` | 是否启用 memory harness |
-| `BIOAGENT_MEMORY_USER_ID` | `default` | LangMem namespace 中的用户维度 |
-| `BIOAGENT_MEMORY_NAMESPACE` | `bioagent` | LangMem namespace 前缀 |
+| `BIOAGENT_MEMORY_ENABLED` | `true` | 是否启用长期 episode 持久化和检索；短期 TaskState 始终启用 |
+| `BIOAGENT_MEMORY_USER_ID` | `default` | 长期 memory 文件的用户维度 |
+| `BIOAGENT_MEMORY_NAMESPACE` | `bioagent` | 长期 memory namespace |
 
-当前默认 store 是进程内 `InMemoryStore`。这是真实 LangMem 工具接入，但不是跨 Python 进程的长期持久化数据库；如果需要生产级长期记忆，下一步应把 store 替换成 Postgres/Mongo 等 LangGraph `BaseStore` 后端。
+默认长期 store 位于 `BioAgent/memory/<namespace>-<user>-episodes.json`，可跨进程保留。Agent 只依赖 `EpisodeStore` 接口，后续可以用 LangMem backend 替换 JSON store，而不改 Agent loop。
 
 依赖安装：
 
@@ -194,7 +219,7 @@ python -m pip install -r BioAgent/requirements.txt
 
 ### 本地 Workbench 前端
 
-BioAgent 提供一个轻量本地 Web UI，路径是 `bioagent.webapp`。它不复用旧 Chainlit，也不把分析逻辑包成 deterministic workflow；前端直接消费 `run_bio_agent_stream()` 的标准事件。
+BioAgent 提供一个轻量本地 Web UI，路径是 `bioagent.webapp`。它不复用旧 Chainlit，也不把分析逻辑包成 deterministic workflow；前端直接消费 `run_bio_agent_stream()` 的标准事件。一个 Session 可以包含多次 run，用户消息、暂停和恢复是相互独立的操作。
 
 启动：
 
@@ -209,17 +234,30 @@ cd /home/luting/projects/mas/BioAgent
 http://127.0.0.1:8013/
 ```
 
+模型设置页面位于 `http://127.0.0.1:8013/settings`。保存后的显式覆盖写入
+`BioAgent/state/model-settings.json`（权限 `0600`）；API key 只以掩码返回前端。新 run 会重新加载该配置，
+无需重启 Workbench。Reset 会删除覆盖文件并恢复启动时的环境配置。
+
 主要接口：
 
 | API | 作用 |
 |---|---|
-| `POST /api/tasks` | 创建一个 BioAgent run |
-| `GET /api/tasks` | 查看历史 run 列表 |
-| `GET /api/tasks/{task_id}` | 获取当前 snapshot |
-| `GET /api/tasks/{task_id}/events` | SSE 实时事件流 |
+| `POST /api/sessions` | 创建 Session 并启动首次 BioAgent run |
+| `GET /api/sessions` | 查看历史 Session 列表 |
+| `GET /api/sessions/{session_id}` | 获取 Session、当前 run 和消息 snapshot |
+| `POST /api/sessions/{session_id}/messages` | 追加消息；运行中作为 steering，暂停时只回答，结束后启动 follow-up run |
+| `POST /api/sessions/{session_id}/pause` | 请求暂停当前 run |
+| `POST /api/sessions/{session_id}/resume` | 显式恢复已暂停的 run |
+| `GET /api/sessions/{session_id}/events` | Session SSE 实时事件流 |
+| `GET /api/settings/model` | 获取脱敏后的当前模型配置 |
+| `PUT /api/settings/model` | 持久化模型配置并应用到新 run |
+| `POST /api/settings/model/test` | 使用未保存的表单配置测试 LangChain 连接 |
+| `DELETE /api/settings/model` | 清除前端覆盖并恢复环境配置 |
 | `GET /api/tasks/{task_id}/files` | 查看 run 输出文件树 |
 | `GET /api/tasks/{task_id}/files/content` | 预览文本/JSON/CSV/日志 |
 | `GET /api/tasks/{task_id}/files/download` | 下载或显示结果文件 |
+
+旧 `/api/tasks` 创建、查询、暂停和恢复接口继续保留，供已有 notebook 或前端兼容使用。
 
 ### 中途等待用户输入与 Resume
 
@@ -251,7 +289,7 @@ result = resume_bio_agent(
 
 | 任务类型 | 推荐路径 |
 |---|---|
-| MyGene / 外部基因信息查询 | 主 Agent 生成可审计脚本并用 `execute_python` 执行 |
+| MyGene / 外部基因信息查询 | 主 Agent 生成可审计脚本并用持久 job 执行 |
 | DEG 后功能富集 | 读取 `functional-enrichment-from-degs` Skill 和 scripts 后生成脚本执行 |
 | 单细胞 marker / 细胞类型注释 | 读取 Scanpy/Seurat 单细胞 Skill、scripts 和函数签名后生成脚本执行 |
 | 没有明确 Skill 的临时生信分析 | 主 Agent 直接生成 Python/R 脚本并执行 |
@@ -272,10 +310,12 @@ BioAgent 不会强制所有任务都走 Skill。它的路由策略更接近 `age
 有明确匹配的生信工作流
 -> inspect_workflow_skill
 -> inspect_skill_script_symbols / inspect_skill_function / read_skill_script
--> execute_python / execute_r
+-> write_run_file / validate_script / start_job / poll_job
+-> inspect_artifact / finish_task
 
 没有匹配 Skill 的通用数据分析
--> execute_python / execute_r
+-> write_run_file / validate_script / start_job / poll_job
+-> inspect_artifact / finish_task
 ```
 
 这样单细胞、bulk RNA-seq、Seurat、生存分析等任务可以借助对应 Skill；而简单表格汇总、文件转换、画图、日志解析、临时统计等任务不需要强行套 Skill。
@@ -294,7 +334,8 @@ BioAgent 不会强制所有任务都走 Skill。它的路由策略更接近 `age
 list_workflow_skills
 inspect_workflow_skill
 inspect_skill_script_symbols / inspect_skill_function / read_skill_script
-execute_python
+write_run_file / validate_script / start_job / poll_job
+inspect_artifact / finish_task
 ```
 
 对单细胞 `.h5ad` 示例，Agent 会选择 `scrnaseq-scanpy-core-analysis` Skill，默认使用：
@@ -444,4 +485,4 @@ C:\Users\WYX\.conda\envs\mas_agent\python.exe -c "import ast, pathlib; files=lis
 - Chainlit 前端
 - 对每个 Skill 的专用 deterministic runner
 
-不过所有 `mas_2/workflows/*/SKILL.md` 都可以通过 Skill 工具读取，所有 Docker profile 都可以通过 catalog 工具识别。默认路径是主 Agent 自主读取 Skill/scripts/function 签名，生成 Python/R 代码并用执行工具迭代。后续如果要继续增强，最建议补充每个 Skill 的输出 schema、QC gate 和结果验证器，而不是回到硬编码单流程。
+不过所有 `mas_2/workflows/*/SKILL.md` 都可以通过 Skill 工具读取，所有 Docker profile 都可以通过 catalog 工具识别。默认路径是主 Agent 自主读取 Skill/scripts/function 签名，生成持久 Python/R 脚本，通过异步 job 执行和修复，并在 grounded finish 前验证产物。后续如果要继续增强，最建议补充每个 Skill 的输出 schema 和通用 QC gate，而不是回到硬编码单流程。

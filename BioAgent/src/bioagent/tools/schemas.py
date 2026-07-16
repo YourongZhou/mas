@@ -63,13 +63,72 @@ class ExecutePythonArgs(BaseModel):
     code: str = Field(..., description="Complete Python script to execute.")
     env_profile: str = Field("py-general-v1", description="Docker profile, e.g. py-general-v1 or py-scverse-v1.")
     requirements: str = Field("", description="Optional pip requirements not already provided by the profile.")
-    timeout_s: int = 900
+    timeout_s: int = 1800
 
 
 class ExecuteRArgs(BaseModel):
     code: str = Field(..., description="Complete R script to execute.")
     env_profile: str = Field("r-bioc-v1", description="Docker profile, e.g. r-bioc-v1 or r-singlecell-v1.")
-    timeout_s: int = 900
+    timeout_s: int = 1800
+
+
+class WriteRunFileArgs(BaseModel):
+    path: str = Field(..., description="Path inside the run workspace, e.g. scripts/analysis.py or /work/scripts/analysis.py.")
+    content: str = Field(..., description="Complete text content to write.")
+    overwrite: bool = Field(True, description="Allow replacing an existing run workspace file.")
+
+
+class EditRunFileArgs(BaseModel):
+    path: str = Field(..., description="Existing text file inside the run workspace.")
+    old_text: str = Field(..., description="Exact text to replace. Include enough context to make it unique.")
+    new_text: str = Field(..., description="Replacement text.")
+    replace_all: bool = Field(False, description="Replace all exact matches. False requires a unique match.")
+
+
+class ValidateScriptArgs(BaseModel):
+    path: str = Field(..., description="Script inside the run workspace.")
+    runtime: str = Field("python", description="python or r.")
+
+
+class StartJobArgs(BaseModel):
+    runtime: str = Field(..., description="python or r.")
+    script_path: str = Field(..., description="Script path inside the run workspace. Write it before starting the job.")
+    env_profile: str = Field(..., description="Verified Docker profile from the skill or image catalog.")
+    requirements: str = Field("", description="Optional Python pip requirements, one per line.")
+    timeout_s: int = Field(1800, description="Hard job timeout in seconds.")
+
+
+class PollJobArgs(BaseModel):
+    job_id: str = Field("", description="Harness-issued job id. Leave empty to use the persisted active job.")
+    wait_s: int = Field(0, ge=0, le=300, description="Wait up to this many seconds before returning. Use 60-300 for long jobs.")
+
+
+class ListJobsArgs(BaseModel):
+    status: str = Field("", description="Optional exact status filter, e.g. running, completed, or failed.")
+
+
+class GetJobArgs(BaseModel):
+    job_id: str = Field("", description="Harness-issued job id. Leave empty to use the persisted active job.")
+    refresh: bool = Field(False, description="Refresh a running job from Docker before returning.")
+
+
+class TailJobArgs(BaseModel):
+    job_id: str = Field("", description="Harness-issued job id. Leave empty to use the persisted active job.")
+    lines: int = Field(200, ge=1, le=2000)
+
+
+class CancelJobArgs(BaseModel):
+    job_id: str = Field("", description="Harness-issued job id. Leave empty to cancel the persisted active job.")
+
+
+class InspectArtifactArgs(BaseModel):
+    path: str = Field(..., description="Artifact path inside the run workspace, usually outputs/...")
+    max_rows: int = Field(10, ge=1, le=50)
+
+
+class FinishTaskArgs(BaseModel):
+    summary: str = Field(..., description="Concise conclusion supported by the inspected evidence.")
+    evidence_ids: list[str] = Field(..., description="Evidence ids returned by inspect_artifact.")
 
 
 class RequestUserInputArgs(BaseModel):

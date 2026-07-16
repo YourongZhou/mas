@@ -14,6 +14,8 @@ const state = {
   defaultTaskText: "",
   defaultDataPath: "",
   defaultMaxTurns: "20",
+  view: "workbench",
+  settingsBusy: false,
 };
 
 const els = {};
@@ -22,10 +24,14 @@ document.addEventListener("DOMContentLoaded", () => {
   for (const id of [
     "taskTitle", "runtimeLine", "currentToolPill", "statusPill", "refreshButton", "newTaskButton", "taskSearch", "clearTaskSearchButton",
     "taskList", "messageStream", "scrollLatestButton", "taskForm", "taskInput", "dataPathInput", "maxTurnsInput",
-    "errorLine", "detailTabs", "detailBody", "traceTab", "resultTab", "fileTab", "traceTitle", "traceMeta", "tracePlanCount", "tracePlanList", "traceInput", "traceOutput", "traceListCount", "traceList",
+    "errorLine", "detailTabs", "detailBody", "traceTab", "memoryTab", "resultTab", "fileTab", "traceTitle", "traceMeta", "tracePlanCount", "tracePlanList", "traceInput", "traceOutput", "traceListCount", "traceList",
+    "memoryMeta", "memoryState", "memoryEpisodes",
     "resultSummary", "resultVisuals", "resultFileList", "fileTitle", "fileMeta", "copyFilePathButton", "downloadLink", "filePreview", "planCount",
-    "planList", "filesRefreshButton", "fileSearch", "clearFileSearchButton", "fileTree", "computeState", "computeGrid", "resultComputeGrid", "sendButton",
-    "composerOptions"
+    "planList", "filesRefreshButton", "fileSearch", "clearFileSearchButton", "fileTree", "computeState", "computeGrid", "resultComputeGrid", "sendButton", "pauseButton", "continueButton",
+    "composerOptions", "workbenchNavButton", "settingsNavButton", "modelSettingsPage", "modelSettingsForm",
+    "modelSettingsSource", "modelConnectionStatus", "modelProviderInput", "modelBaseUrlInput", "modelNameInput", "modelApiKeyInput",
+    "modelTemperatureInput", "modelTimeoutInput", "modelChatThinkingInput", "modelMimoThinkingInput",
+    "modelSettingsFeedback", "testModelButton", "saveModelSettingsButton", "resetModelSettingsButton"
   ]) {
     els[id] = document.getElementById(id);
   }
@@ -34,8 +40,10 @@ document.addEventListener("DOMContentLoaded", () => {
   state.defaultMaxTurns = els.maxTurnsInput.value;
 
   els.taskForm.addEventListener("submit", startTask);
+  els.pauseButton.addEventListener("click", pauseTask);
+  els.continueButton.addEventListener("click", resumeTask);
   els.currentToolPill.addEventListener("click", () => {
-    if (state.snapshot?.status === "needs_user_input") {
+    if (state.snapshot?.status === "needs_user_input" || state.snapshot?.status === "paused") {
       els.taskInput.focus();
       return;
     }
@@ -76,6 +84,17 @@ document.addEventListener("DOMContentLoaded", () => {
     history.pushState(null, "", "/");
     showNewTask();
   });
+  els.workbenchNavButton.addEventListener("click", () => {
+    history.pushState(null, "", "/");
+    showNewTask();
+  });
+  els.settingsNavButton.addEventListener("click", () => {
+    history.pushState(null, "", "/settings");
+    showModelSettings();
+  });
+  els.modelSettingsForm.addEventListener("submit", saveModelSettings);
+  els.testModelButton.addEventListener("click", testModelConnection);
+  els.resetModelSettingsButton.addEventListener("click", resetModelSettings);
   els.detailTabs.addEventListener("click", (event) => {
     if (event.target.matches(".tab")) {
       activateTab(event.target.dataset.tab, { user: true });
@@ -90,7 +109,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     const rerunCurrentButton = event.target.closest("[data-rerun-current]");
     if (rerunCurrentButton) {
-      prepareRerunCurrent();
+      await continueFailedRun();
       return;
     }
     const failedTraceButton = event.target.closest("[data-open-failed-trace]");
@@ -133,6 +152,10 @@ async function init() {
 async function handleLocationChange() {
   cancelSubmit();
   try {
+    if (location.pathname === "/settings") {
+      await showModelSettings();
+      return;
+    }
     const match = location.pathname.match(/\/tasks\/([^/]+)/);
     if (match) {
       await selectTask(match[1]);
@@ -151,6 +174,7 @@ function restoreRouteAfterNavigationFailure() {
 }
 
 function showNewTask() {
+  enterWorkbenchView();
   state.taskId = null;
   state.snapshot = null;
   state.selectedTraceId = null;
@@ -168,16 +192,161 @@ function showNewTask() {
   render();
 }
 
+function enterWorkbenchView() {
+  state.view = "workbench";
+  document.body.classList.remove("settings-mode");
+  els.modelSettingsPage.hidden = true;
+  els.workbenchNavButton.classList.add("active");
+  els.workbenchNavButton.setAttribute("aria-current", "page");
+  els.settingsNavButton.classList.remove("active");
+  els.settingsNavButton.removeAttribute("aria-current");
+  els.currentToolPill.hidden = false;
+  els.statusPill.hidden = false;
+  els.refreshButton.hidden = false;
+}
+
+async function showModelSettings() {
+  cancelSubmit();
+  closeEvents();
+  state.view = "settings";
+  document.body.classList.add("settings-mode");
+  els.modelSettingsPage.hidden = false;
+  els.workbenchNavButton.classList.remove("active");
+  els.workbenchNavButton.removeAttribute("aria-current");
+  els.settingsNavButton.classList.add("active");
+  els.settingsNavButton.setAttribute("aria-current", "page");
+  els.currentToolPill.hidden = true;
+  els.statusPill.hidden = true;
+  els.refreshButton.hidden = true;
+  els.taskTitle.textContent = "Model settings";
+  els.taskTitle.title = "Model settings";
+  await loadModelSettings();
+}
+
+async function loadModelSettings() {
+  setModelSettingsBusy(true);
+  setModelSettingsFeedback("");
+  try {
+    const settings = await api("/api/settings/model");
+    populateModelSettings(settings);
+  } catch (error) {
+    setModelSettingsFeedback(error.message, "error");
+  } finally {
+    setModelSettingsBusy(false);
+  }
+}
+
+function populateModelSettings(settings) {
+  els.modelProviderInput.value = settings.provider || "openai_compatible";
+  els.modelBaseUrlInput.value = settings.baseUrl || "";
+  els.modelNameInput.value = settings.modelName || "";
+  els.modelApiKeyInput.value = "";
+  els.modelApiKeyInput.placeholder = settings.apiKeyConfigured ? `Configured: ${settings.apiKeyMasked}` : "Not configured";
+  els.modelTemperatureInput.value = settings.temperature ?? 0.2;
+  els.modelTimeoutInput.value = settings.requestTimeout ?? 600;
+  els.modelMimoThinkingInput.value = settings.mimoThinkingType || "";
+  els.modelChatThinkingInput.value = settings.chatTemplateEnableThinking == null
+    ? ""
+    : String(settings.chatTemplateEnableThinking);
+  els.modelSettingsSource.textContent = settings.source || "environment";
+  els.runtimeLine.textContent = `${settings.modelName || "model"} · ${settings.baseUrl || "local"}`;
+  els.modelConnectionStatus.textContent = "Not tested";
+  els.modelConnectionStatus.className = "settings-status";
+}
+
+function modelSettingsPayload() {
+  const chatThinking = els.modelChatThinkingInput.value;
+  return {
+    provider: els.modelProviderInput.value,
+    base_url: els.modelBaseUrlInput.value.trim(),
+    api_key: els.modelApiKeyInput.value.trim(),
+    model_name: els.modelNameInput.value.trim(),
+    temperature: Number(els.modelTemperatureInput.value),
+    request_timeout: Number(els.modelTimeoutInput.value),
+    mimo_thinking_type: els.modelMimoThinkingInput.value,
+    chat_template_enable_thinking: chatThinking === "" ? null : chatThinking === "true",
+  };
+}
+
+async function saveModelSettings(event) {
+  event.preventDefault();
+  if (state.settingsBusy || !els.modelSettingsForm.reportValidity()) return;
+  setModelSettingsBusy(true);
+  setModelSettingsFeedback("");
+  try {
+    const settings = await api("/api/settings/model", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(modelSettingsPayload()),
+    });
+    populateModelSettings(settings);
+    setModelSettingsFeedback("Settings saved. New runs will use this model.", "success");
+  } catch (error) {
+    setModelSettingsFeedback(error.message, "error");
+  } finally {
+    setModelSettingsBusy(false);
+  }
+}
+
+async function testModelConnection() {
+  if (state.settingsBusy || !els.modelSettingsForm.reportValidity()) return;
+  setModelSettingsBusy(true);
+  setModelSettingsFeedback("Testing connection...");
+  els.modelConnectionStatus.textContent = "Testing";
+  els.modelConnectionStatus.className = "settings-status testing";
+  try {
+    const result = await api("/api/settings/model/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(modelSettingsPayload()),
+    });
+    const latency = result.latencyMs == null ? "" : ` · ${result.latencyMs} ms`;
+    const preview = result.preview ? ` · ${result.preview}` : "";
+    els.modelConnectionStatus.textContent = `Connected${latency}`;
+    els.modelConnectionStatus.className = "settings-status success";
+    setModelSettingsFeedback(`${result.model}${preview}`, "success");
+  } catch (error) {
+    els.modelConnectionStatus.textContent = "Failed";
+    els.modelConnectionStatus.className = "settings-status error";
+    setModelSettingsFeedback(error.message, "error");
+  } finally {
+    setModelSettingsBusy(false);
+  }
+}
+
+async function resetModelSettings() {
+  if (state.settingsBusy || !window.confirm("Reset model settings to the environment configuration?")) return;
+  setModelSettingsBusy(true);
+  setModelSettingsFeedback("");
+  try {
+    const settings = await api("/api/settings/model", { method: "DELETE" });
+    populateModelSettings(settings);
+    setModelSettingsFeedback("Environment configuration restored.", "success");
+  } catch (error) {
+    setModelSettingsFeedback(error.message, "error");
+  } finally {
+    setModelSettingsBusy(false);
+  }
+}
+
+function setModelSettingsBusy(busy) {
+  state.settingsBusy = busy;
+  els.testModelButton.disabled = busy;
+  els.saveModelSettingsButton.disabled = busy;
+  els.resetModelSettingsButton.disabled = busy;
+}
+
+function setModelSettingsFeedback(message, status = "") {
+  els.modelSettingsFeedback.textContent = message || "";
+  els.modelSettingsFeedback.className = `settings-feedback ${status}`.trim();
+}
+
 async function startTask(event) {
   event.preventDefault();
   showError("");
   if (state.isSubmitting) return;
-  if (state.snapshot?.status === "needs_user_input" && state.taskId) {
-    await resumeTask();
-    return;
-  }
-  if (isActiveStatus(state.snapshot?.status)) {
-    showError("This task is still running. Start a new task from New if needed.");
+  if (state.taskId && state.snapshot) {
+    await sendSessionMessage();
     return;
   }
   closeEvents();
@@ -192,7 +361,7 @@ async function startTask(event) {
   }
   const submitToken = beginSubmit("create");
   try {
-    const created = await api("/api/tasks", {
+    const created = await api("/api/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -209,16 +378,41 @@ async function startTask(event) {
   }
 }
 
-async function resumeTask() {
-  const userAnswer = els.taskInput.value.trim();
-  const taskId = state.taskId;
-  if (!userAnswer) {
-    showError("Reply is required.");
+async function sendSessionMessage(contentOverride = "", submitMode = "message") {
+  const content = contentOverride || els.taskInput.value.trim();
+  const sessionId = state.taskId;
+  if (!sessionId || !content) {
+    showError("Message is required.");
     return;
   }
-  const submitToken = beginSubmit("reply");
+  const submitToken = beginSubmit(submitMode);
   try {
-    await api(`/api/tasks/${taskId}/resume`, {
+    await api(`/api/sessions/${sessionId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        content,
+        max_turns: Number(els.maxTurnsInput.value || 20),
+      }),
+    });
+    if (state.submitToken !== submitToken) return;
+    els.taskInput.value = "";
+    await loadTasks();
+    await selectTask(sessionId);
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    finishSubmit(submitToken);
+  }
+}
+
+async function resumeTask() {
+  const userAnswer = els.taskInput.value.trim() || "Continue the paused run from its saved checkpoint.";
+  const taskId = state.taskId;
+  const isPaused = state.snapshot?.status === "paused";
+  const submitToken = beginSubmit(isPaused ? "continue" : "reply");
+  try {
+    await api(`/api/sessions/${taskId}/resume`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -237,12 +431,28 @@ async function resumeTask() {
   }
 }
 
+async function pauseTask() {
+  const taskId = state.taskId;
+  if (!taskId || !["queued", "running"].includes(state.snapshot?.status)) return;
+  const submitToken = beginSubmit("pause");
+  try {
+    await api(`/api/sessions/${taskId}/pause`, { method: "POST" });
+    if (state.submitToken !== submitToken) return;
+    await refresh();
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    finishSubmit(submitToken);
+  }
+}
+
 async function selectTask(taskId) {
+  enterWorkbenchView();
   const previousTaskId = state.taskId;
   const previousSnapshot = state.snapshot;
   state.taskId = taskId;
   try {
-    const snapshot = await api(`/api/tasks/${taskId}`);
+    const snapshot = await api(`/api/sessions/${taskId}`);
     if (state.taskId !== taskId) return;
     state.snapshot = snapshot;
     state.selectedTraceId = chooseTraceId(state.snapshot, null);
@@ -268,7 +478,7 @@ async function refresh() {
   await loadTasks();
   const taskId = state.taskId;
   if (taskId) {
-    const snapshot = await api(`/api/tasks/${taskId}`);
+    const snapshot = await api(`/api/sessions/${taskId}`);
     if (state.taskId !== taskId) return;
     state.snapshot = snapshot;
     state.selectedTraceId = chooseTraceId(state.snapshot, state.selectedTraceId);
@@ -287,14 +497,14 @@ async function runRefresh() {
 }
 
 async function loadTasks() {
-  const payload = await api("/api/tasks");
-  state.tasks = payload.tasks || [];
+  const payload = await api("/api/sessions");
+  state.tasks = payload.sessions || payload.tasks || [];
   renderTasks(state.tasks);
 }
 
 function subscribe(taskId) {
   closeEvents();
-  const source = new EventSource(`/api/tasks/${taskId}/events`);
+  const source = new EventSource(`/api/sessions/${taskId}/events`);
   state.eventSource = source;
   source.addEventListener("bioagent_event", () => {
     scheduleSnapshotRefresh(taskId);
@@ -305,13 +515,13 @@ function subscribe(taskId) {
     state.selectedTraceId = chooseTraceId(state.snapshot, state.selectedTraceId);
     mergeTaskSnapshot(state.snapshot);
     render();
-    if (isTerminalStatus(state.snapshot?.status)) {
+    if (shouldCloseSessionStream(state.snapshot)) {
       closeEvents();
     }
   });
   source.onerror = () => {
     if (state.taskId !== taskId) return;
-    if (isTerminalStatus(state.snapshot?.status)) {
+    if (shouldCloseSessionStream(state.snapshot)) {
       closeEvents();
       return;
     }
@@ -338,13 +548,13 @@ function scheduleSnapshotRefresh(taskId) {
     state.refreshTimer = null;
     if (state.taskId !== taskId) return;
     try {
-      const snapshot = await api(`/api/tasks/${taskId}`);
+      const snapshot = await api(`/api/sessions/${taskId}`);
       if (state.taskId !== taskId) return;
       state.snapshot = snapshot;
       state.selectedTraceId = chooseTraceId(state.snapshot, state.selectedTraceId);
       mergeTaskSnapshot(state.snapshot);
       render();
-      if (isTerminalStatus(state.snapshot?.status)) {
+      if (shouldCloseSessionStream(state.snapshot)) {
         closeEvents();
       }
     } catch (error) {
@@ -354,20 +564,24 @@ function scheduleSnapshotRefresh(taskId) {
 }
 
 function isTerminalStatus(status) {
-  return ["completed", "failed", "needs_user_input"].includes(status);
+  return ["completed", "failed", "needs_user_input", "paused"].includes(status);
 }
 
 function isActiveStatus(status) {
-  return ["queued", "running"].includes(status);
+  return ["queued", "running", "pausing"].includes(status);
+}
+
+function shouldCloseSessionStream(snapshot) {
+  return isTerminalStatus(snapshot?.status) && !snapshot?.interactionStatus;
 }
 
 function render() {
   const snapshot = state.snapshot;
   const status = snapshot?.status || "idle";
-  const displayTitle = snapshot ? formatTaskDisplayTitle(snapshot) : { title: "New task" };
+  const displayTitle = snapshot ? formatTaskDisplayTitle(snapshot) : { title: "New session" };
   activateDefaultTab(snapshot);
   els.taskTitle.textContent = displayTitle.title;
-  els.taskTitle.title = snapshot?.task || snapshot?.title || "New task";
+  els.taskTitle.title = snapshot?.task || snapshot?.title || "New session";
   els.statusPill.textContent = formatStatusLabel(status);
   els.statusPill.className = `pill ${statusClass(status)}`;
   els.computeState.textContent = formatStatusLabel(status);
@@ -382,6 +596,7 @@ function render() {
   renderResultSummary(snapshot);
   renderResultVisuals(snapshot);
   renderResultFileList(snapshot);
+  renderMemory(snapshot);
   renderComposer(snapshot);
 }
 
@@ -436,6 +651,13 @@ function renderCurrentTool(snapshot) {
     els.currentToolPill.title = "Focus reply box";
     return;
   }
+  if (snapshot?.status === "paused") {
+    els.currentToolPill.textContent = "Paused for instruction";
+    els.currentToolPill.className = "tool-pill paused";
+    els.currentToolPill.disabled = false;
+    els.currentToolPill.title = "Focus instruction box";
+    return;
+  }
   const failure = formatSnapshotFailure(snapshot);
   if (failure) {
     els.currentToolPill.textContent = `Failed: ${failure}`;
@@ -463,9 +685,11 @@ function renderCurrentTool(snapshot) {
 function renderTabCounts(snapshot) {
   const traceCount = snapshot?.traces?.length || 0;
   const resultCount = flattenFiles(snapshot?.resultFiles || []).length;
+  const memoryCount = snapshot?.memory?.priorEpisodes?.length || 0;
   els.traceTab.textContent = traceCount ? `Trace ${traceCount}` : "Trace";
   els.resultTab.textContent = resultCount ? `Result ${resultCount}` : "Result";
   els.fileTab.textContent = "File";
+  els.memoryTab.textContent = memoryCount ? `Memory ${memoryCount}` : "Memory";
 }
 
 function currentToolLabelPrefix(currentTool, snapshot) {
@@ -485,7 +709,7 @@ function renderTasks(tasks) {
   const query = els.taskSearch.value.trim().toLowerCase();
   syncTaskSearchClearButton(query);
   const filtered = tasks.filter((task) => taskSearchText(task).includes(query));
-  els.taskList.innerHTML = filtered.length ? "" : `<div class="empty">${tasks.length ? "No matching runs." : "No runs yet."}</div>`;
+  els.taskList.innerHTML = filtered.length ? "" : `<div class="empty">${tasks.length ? "No matching sessions." : "No sessions yet."}</div>`;
   for (const task of filtered) {
     const row = document.createElement("div");
     const displayTitle = formatTaskDisplayTitle(task);
@@ -499,7 +723,7 @@ function renderTasks(tasks) {
         <span class="pill ${statusClass(task.status)}">${escapeHtml(formatStatusLabel(task.status))}</span>
         ${Number(task.traceCount || 0) > 0 ? `<button class="icon-button task-trace" type="button" data-open-task-trace-id="${escapeHtml(task.id)}">Trace</button>` : ""}
         ${task.logPath ? `<button class="icon-button task-log" type="button" data-open-task-log-id="${escapeHtml(task.id)}">Log</button>` : ""}
-        ${isRerunnableTask(task) ? `<button class="icon-button task-rerun" type="button" data-rerun-task-id="${escapeHtml(task.id)}">Rerun</button>` : ""}
+        ${isRerunnableTask(task) ? `<button class="icon-button task-rerun" type="button" data-rerun-task-id="${escapeHtml(task.id)}">Continue</button>` : ""}
       </div>
       <div class="row-sub">${escapeHtml(formatTaskDisplayMeta(task, query))}</div>
     `;
@@ -568,12 +792,12 @@ async function prepareRerunFromList(event, task) {
   els.taskInput.setSelectionRange?.(els.taskInput.value.length, els.taskInput.value.length);
 }
 
-function prepareRerunCurrent() {
-  if (!isTerminalStatus(state.snapshot?.status)) return;
-  syncComposerFromSnapshot(state.snapshot);
-  renderComposer(state.snapshot);
-  els.taskInput.focus();
-  els.taskInput.setSelectionRange?.(els.taskInput.value.length, els.taskInput.value.length);
+async function continueFailedRun() {
+  if (state.snapshot?.status !== "failed") return;
+  return sendSessionMessage(
+    "Continue from the latest failed run. Inspect the exact last error and existing script before editing, make the smallest repair, rerun the analysis, verify the output artifacts, and finish the task.",
+    "continue",
+  );
 }
 
 function formatTaskDisplayTitle(task) {
@@ -734,42 +958,77 @@ function finishSubmit(submitToken) {
 }
 
 function renderComposer(snapshot) {
+  els.pauseButton.hidden = true;
+  els.continueButton.hidden = true;
+  els.pauseButton.disabled = false;
+  els.continueButton.disabled = false;
   if (state.isSubmitting) {
-    els.sendButton.textContent = state.submitMode === "reply" ? "Replying" : "Creating";
+    const labels = { reply: "Replying", continue: "Continuing", pause: "Pausing", message: "Sending" };
+    els.sendButton.textContent = labels[state.submitMode] || "Creating";
     els.sendButton.disabled = true;
-    els.taskInput.placeholder = state.submitMode === "reply" ? "Sending reply..." : "Creating a new BioAgent run...";
-    els.composerOptions.hidden = state.submitMode === "reply";
+    els.taskInput.disabled = true;
+    els.taskInput.placeholder = state.submitMode === "pause" ? "Waiting for the current operation to stop..." : "Sending...";
+    els.composerOptions.hidden = state.submitMode !== "create";
+    return;
+  }
+  if (snapshot?.interactionStatus === "answering") {
+    els.sendButton.textContent = "Answering";
+    els.sendButton.disabled = true;
+    els.taskInput.disabled = true;
+    els.taskInput.placeholder = "BioAgent is answering without resuming the paused run...";
+    els.composerOptions.hidden = true;
+    return;
+  }
+  if (snapshot?.status === "paused") {
+    els.sendButton.textContent = "Send";
+    els.sendButton.disabled = false;
+    els.taskInput.disabled = false;
+    els.taskInput.placeholder = "Ask about this session, or add an instruction before continuing...";
+    els.composerOptions.hidden = true;
+    els.continueButton.hidden = false;
     return;
   }
   if (snapshot?.status === "needs_user_input") {
     const replyPrompt = latestAssistantPrompt(snapshot);
     els.sendButton.textContent = "Reply";
     els.sendButton.disabled = false;
+    els.taskInput.disabled = false;
     els.taskInput.placeholder = replyPrompt ? `Reply to: ${replyPrompt}` : "Reply to BioAgent and continue this run...";
     els.composerOptions.hidden = true;
-    if (state.replyTaskId !== snapshot.id) {
-      els.taskInput.value = "";
-      state.replyTaskId = snapshot.id;
-    }
     return;
   }
-  state.replyTaskId = null;
-  if (isActiveStatus(snapshot?.status)) {
-    els.sendButton.textContent = "Running";
-    els.sendButton.disabled = true;
-    els.taskInput.placeholder = "BioAgent is running. Watch the stream or open a new task.";
+  if (snapshot?.status === "pausing") {
+    els.sendButton.textContent = "Send";
+    els.sendButton.disabled = false;
+    els.taskInput.disabled = false;
+    els.taskInput.placeholder = "Queue a message while BioAgent saves its checkpoint...";
     els.composerOptions.hidden = true;
+    els.pauseButton.hidden = false;
+    els.pauseButton.disabled = true;
+    els.pauseButton.textContent = "Pausing";
+    return;
+  }
+  if (isActiveStatus(snapshot?.status)) {
+    els.sendButton.textContent = "Send";
+    els.sendButton.disabled = false;
+    els.taskInput.disabled = false;
+    els.taskInput.placeholder = "Send guidance; it will be applied at the next safe boundary...";
+    els.composerOptions.hidden = true;
+    els.pauseButton.hidden = false;
+    els.pauseButton.textContent = "Pause";
     return;
   }
   if (isTerminalStatus(snapshot?.status)) {
-    els.sendButton.textContent = "Rerun";
+    els.sendButton.textContent = "Send";
     els.sendButton.disabled = false;
-    els.taskInput.placeholder = "Edit this task or rerun it as a new BioAgent run...";
-    els.composerOptions.hidden = false;
+    els.taskInput.disabled = false;
+    els.taskInput.placeholder = "Ask a follow-up or continue working in this session...";
+    els.composerOptions.hidden = true;
     return;
   }
   els.sendButton.textContent = "Run";
   els.sendButton.disabled = false;
+  els.taskInput.disabled = false;
   els.taskInput.placeholder = "Describe an analysis task...";
   els.composerOptions.hidden = false;
 }
@@ -781,20 +1040,25 @@ function latestAssistantPrompt(snapshot) {
 }
 
 function syncComposerFromSnapshot(snapshot) {
-  if (!snapshot || isActiveStatus(snapshot.status) || snapshot.status === "needs_user_input") return;
-  els.taskInput.value = snapshot.task || "";
+  if (!snapshot) return;
+  if (state.replyTaskId !== snapshot.id) {
+    els.taskInput.value = "";
+    state.replyTaskId = snapshot.id;
+  }
   els.dataPathInput.value = snapshot.dataPath || "";
   els.maxTurnsInput.value = String(snapshot.maxTurns || state.defaultMaxTurns);
 }
 
 function renderMessages(snapshot) {
   if (!snapshot) {
-    els.messageStream.innerHTML = `<article class="message"><div class="speaker">BioAgent</div><p>Start a task to watch the agent work.</p></article>`;
+    els.messageStream.innerHTML = `<article class="message"><div class="speaker">BioAgent</div><p>Start a session.</p></article>`;
     setScrollLatestVisible(false);
     return;
   }
   const stickToBottom = shouldStickToBottom(els.messageStream);
-  const messages = [{ role: "user", content: snapshot.task }, ...(snapshot.messages || [])];
+  const messages = snapshot.messages?.length
+    ? snapshot.messages
+    : [{ role: "user", content: snapshot.task }];
   els.messageStream.innerHTML = messages.map((message) => `
     <article class="message ${message.role === "user" ? "user" : ""} ${message.error ? "error" : ""} ${message.final ? "final" : ""}">
       <div class="speaker">${message.role === "user" ? "User" : message.final ? "Final" : "BioAgent"}</div>
@@ -917,6 +1181,83 @@ function renderTraceDetail() {
   els.traceOutput.textContent = trace.output == null
     ? missingOutput
     : formatTracePayload(trace.output, ["stdout", "stderr"]);
+}
+
+function renderMemory(snapshot) {
+  const memory = snapshot?.memory || {};
+  const taskState = memory.taskState || {};
+  const episodes = Array.isArray(memory.priorEpisodes) ? memory.priorEpisodes : [];
+  const namespace = Array.isArray(memory.namespace) ? memory.namespace.join(" / ") : "";
+  const storeStatus = memory.longTermEnabled === false ? "Long-term off" : "Long-term on";
+  els.memoryMeta.textContent = Object.keys(taskState).length
+    ? `${storeStatus}${namespace ? ` · ${namespace}` : ""} · ${episodes.length} retrieved`
+    : "No task memory loaded.";
+
+  const rows = [
+    ["Task", taskState.task],
+    ["Current goal", taskState.current_goal],
+    ["Confirmed inputs", taskState.confirmed_inputs],
+    ["Expected outputs", taskState.expected_outputs],
+    ["Selected skill", taskState.selected_skill],
+    ["Runtime", taskState.runtime_environment],
+    ["Current stage", taskState.current_stage],
+    ["Active errors", taskState.active_errors, "error"],
+    ["Resolved errors", taskState.resolved_errors],
+    ["Generated artifacts", taskState.generated_artifacts],
+    ["Blockers", taskState.blockers, "warning"],
+    ["Next action", taskState.next_action],
+  ];
+  els.memoryState.innerHTML = Object.keys(taskState).length
+    ? rows.map(([label, value, tone = ""]) => `
+        <div class="memory-state-row ${escapeHtml(tone)}">
+          <span>${escapeHtml(label)}</span>
+          <div>${formatMemoryValue(value)}</div>
+        </div>
+      `).join("")
+    : `<div class="empty">Task state appears when a run starts.</div>`;
+
+  els.memoryEpisodes.innerHTML = episodes.length
+    ? episodes.map((episode) => renderMemoryEpisode(episode)).join("")
+    : `<div class="empty">No relevant verified episodes retrieved.</div>`;
+}
+
+function formatMemoryValue(value) {
+  if (Array.isArray(value)) {
+    if (!value.length) return `<span class="memory-none">None</span>`;
+    return `<ul>${value.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
+  }
+  if (value == null || value === "") return `<span class="memory-none">Not set</span>`;
+  return `<span>${escapeHtml(value)}</span>`;
+}
+
+function renderMemoryEpisode(episode) {
+  const outcome = String(episode.outcome || "unknown").toLowerCase();
+  const details = [
+    ["Task signature", episode.task_signature],
+    ["Data", episode.data_signature],
+    ["Runtime", episode.runtime_environment],
+    ["Root cause", episode.verified_root_cause],
+    ["Verified fix", episode.verified_fix],
+    ["Reusable lesson", episode.reusable_lesson],
+    ["Source", episode.source_run_id],
+  ].filter(([, value]) => value);
+  return `
+    <article class="memory-episode">
+      <header>
+        <strong>${escapeHtml(episode.skill_id || "No skill")}</strong>
+        <span class="memory-outcome ${escapeHtml(outcome)}">${escapeHtml(outcome)}</span>
+      </header>
+      <dl>
+        ${details.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}
+      </dl>
+      ${episode.timestamp ? `<time datetime="${escapeHtml(episode.timestamp)}">${escapeHtml(formatMemoryTimestamp(episode.timestamp))}</time>` : ""}
+    </article>
+  `;
+}
+
+function formatMemoryTimestamp(value) {
+  const timestamp = new Date(value);
+  return Number.isNaN(timestamp.getTime()) ? String(value || "") : timestamp.toLocaleString();
 }
 
 function formatTraceMeta(trace, snapshot) {
@@ -1257,7 +1598,7 @@ function renderResultSummary(snapshot) {
         <strong>Run failed</strong>
         <span>${escapeHtml(error)}</span>
         <div class="result-actions">
-          <button class="icon-button result-primary" type="button" data-rerun-current>Rerun</button>
+          <button class="icon-button result-primary" type="button" data-rerun-current>Continue</button>
           <button class="icon-button" type="button" data-open-log${logDisabled}>Open log</button>
           <button class="icon-button" type="button" data-open-failed-trace${traceDisabled}>Inspect failed trace</button>
           ${finalAnswer ? '<button class="icon-button" type="button" data-copy="resultFinalAnswerText">Copy error details</button>' : ""}

@@ -61,6 +61,25 @@ class _ToolThenFinalLLM:
         return AIMessage(content="All done.")
 
 
+class _InvalidToolCallLLM:
+    def bind_tools(self, tools):
+        return self
+
+    def invoke(self, messages):
+        return AIMessage(
+            content="",
+            invalid_tool_calls=[
+                {
+                    "name": "write_run_file",
+                    "args": '{}{"path":"scripts/code.py"}',
+                    "id": "toolu_invalid",
+                    "error": "JSONDecodeError: Extra data",
+                }
+            ],
+            response_metadata={"finish_reason": "tool_calls"},
+        )
+
+
 def test_agent_run_emits_standard_conversation_events(tmp_path: Path, monkeypatch) -> None:
     config = _config(tmp_path)
     run_dir = config.runs_dir / "run_test"
@@ -86,6 +105,43 @@ def test_agent_run_emits_standard_conversation_events(tmp_path: Path, monkeypatc
     assert result.final_answer == "All done."
     assert events[-2]["content"] == "All done."
     assert events[-1]["result"]["final_answer"] == "All done."
+
+
+def test_agent_surfaces_invalid_provider_tool_calls_as_failure(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    run_dir = config.runs_dir / "run_invalid_tool"
+    run_dir.mkdir(parents=True)
+    events: list[dict] = []
+
+    with RunLogger(config.logs_dir, run_id="run_invalid_tool") as logger:
+        agent = BioAgent(config=config, logger=logger, run_dir=run_dir)
+        agent.llm = _InvalidToolCallLLM()
+        result = agent.run("Analyze data", max_turns=1, event_sink=events.append)
+
+    assert result.status == "failed"
+    assert "tool call" in result.final_answer.lower()
+    assert any(event["type"] == "model_error" for event in events)
+
+
+def test_agent_does_not_mark_placeholder_answer_completed(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    run_dir = config.runs_dir / "run_placeholder"
+    run_dir.mkdir(parents=True)
+
+    class PlaceholderLLM:
+        def bind_tools(self, tools):
+            return self
+
+        def invoke(self, messages):
+            return AIMessage(content="...")
+
+    with RunLogger(config.logs_dir, run_id="run_placeholder") as logger:
+        agent = BioAgent(config=config, logger=logger, run_dir=run_dir)
+        agent.llm = PlaceholderLLM()
+        result = agent.run("Analyze data", max_turns=1)
+
+    assert result.status == "failed"
+    assert "usable final answer" in result.final_answer
 
 
 def test_run_bio_agent_stream_yields_events_from_notebook_entrypoint(tmp_path: Path, monkeypatch) -> None:
@@ -115,6 +171,35 @@ def test_run_bio_agent_stream_yields_events_from_notebook_entrypoint(tmp_path: P
     assert [event["type"] for event in events] == ["assistant_message", "final", "run_end"]
     assert events[0]["content"] == "streaming"
     assert events[-1]["result"]["final_answer"] == "completed"
+
+
+def test_streaming_entrypoint_forwards_pause_callback_to_agent(tmp_path: Path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    pause_requested = lambda: True
+    captured: dict = {}
+
+    class FakeBioAgent:
+        def __init__(self, *, config, logger, run_dir):
+            self.logger = logger
+            self.run_dir = run_dir
+
+        def run(self, task, *, data_path=None, result_dir=None, max_turns=20, event_sink=None, pause_requested=None):
+            captured["callback"] = pause_requested
+            return AgentRunResult(
+                final_answer="Task paused. Add instructions to continue.",
+                run_dir=str(self.run_dir),
+                log_path=str(self.logger.path),
+                turns=1,
+                status="paused",
+            )
+
+    monkeypatch.setattr(runner_module.AgentConfig, "from_env", classmethod(lambda cls: config))
+    monkeypatch.setattr(runner_module, "BioAgent", FakeBioAgent)
+
+    events = list(runner_module.run_bio_agent_stream("Analyze data", pause_requested=pause_requested))
+
+    assert captured["callback"] is pause_requested
+    assert events[-1]["status"] == "paused"
 
 
 def test_streaming_entrypoint_is_exported_from_package() -> None:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import queue
+import subprocess
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -11,11 +13,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from bioagent.config import AgentConfig
-from bioagent.runner import resume_bio_agent, run_bio_agent_stream
+from bioagent.runner import answer_bio_agent_message, resume_bio_agent, run_bio_agent_stream
+from bioagent.skills.registry import list_workflow_skills
+from bioagent.tools.jobs import cancel_run_jobs
 
 
 StreamRunner = Callable[..., Iterator[dict[str, Any]]]
 ResumeRunner = Callable[..., dict[str, Any]]
+ChatRunner = Callable[[dict[str, Any], str], str]
 
 
 def utc_now() -> str:
@@ -38,10 +43,17 @@ class TaskRecord:
     events: list[dict[str, Any]] = field(default_factory=list)
     event_queue: queue.Queue[dict[str, Any] | None] = field(default_factory=queue.Queue)
     compute: dict[str, Any] = field(default_factory=dict)
+    memory: dict[str, Any] = field(default_factory=dict)
+    session_status: str = "open"
+    interaction_status: str = ""
+    runs: list[dict[str, Any]] = field(default_factory=list)
+    active_run_id: str = ""
+    pending_user_messages: list[dict[str, str]] = field(default_factory=list)
     final_answer: str = ""
     run_dir: str = ""
     log_path: str = ""
     error: str = ""
+    pause_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -51,6 +63,11 @@ class TaskRecord:
             "dataPath": self.data_path,
             "maxTurns": self.max_turns,
             "status": self.status,
+            "sessionStatus": self.session_status,
+            "runStatus": self.status,
+            "interactionStatus": self.interaction_status,
+            "runs": self.runs,
+            "activeRunId": self.active_run_id,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
             "messages": self.messages,
@@ -58,6 +75,7 @@ class TaskRecord:
             "plan": self.plan,
             "resultFiles": build_file_tree(self.result_root()),
             "compute": self.compute_snapshot(),
+            "memory": self.memory,
             "finalAnswer": self.final_answer,
             "error": self.error,
         }
@@ -99,10 +117,12 @@ class TaskStore:
         config: AgentConfig,
         stream_runner: StreamRunner = run_bio_agent_stream,
         resume_runner: ResumeRunner = resume_bio_agent,
+        chat_runner: ChatRunner = answer_bio_agent_message,
     ) -> None:
         self.config = config
         self.stream_runner = stream_runner
         self.resume_runner = resume_runner
+        self.chat_runner = chat_runner
         self.history_dir = config.runs_dir / "web_tasks"
         self.history_dir.mkdir(parents=True, exist_ok=True)
         self._tasks: dict[str, TaskRecord] = {}
@@ -114,6 +134,8 @@ class TaskStore:
         title = task.strip().splitlines()[0][:90] or "Untitled BioAgent task"
         record = TaskRecord(id=task_id, task=task, title=title, data_path=data_path, max_turns=max_turns)
         record.compute.update({"model": self.config.model_name, "baseUrl": self.config.base_url})
+        message = append_session_message(record, "user", task, delivery="consumed")
+        start_session_run(record, kind="agent", trigger_message_id=message["id"])
         with self._lock:
             self._tasks[task_id] = record
             self._persist_record(record)
@@ -121,25 +143,112 @@ class TaskStore:
         thread.start()
         return record
 
+    def send_message(self, *, task_id: str, content: str, max_turns: int = 20) -> TaskRecord:
+        record = self.get_task(task_id)
+        content = content.strip()
+        if not content:
+            raise ValueError("Message content is required")
+        if record.interaction_status:
+            raise ValueError(f"Session {task_id} is already answering a message")
+        if record.status == "needs_user_input":
+            return self.resume_task(task_id=task_id, user_answer=content, max_turns=max_turns)
+        if record.status in {"queued", "running", "pausing"}:
+            with self._lock:
+                message = append_session_message(record, "user", content, delivery="queued")
+                record.pending_user_messages.append({"id": message["id"], "content": content})
+                event = {"type": "user_message", "message": message, "delivery": "queued"}
+                record.events.append(event)
+                record.updated_at = utc_now()
+                self._persist_record(record)
+            record.event_queue.put(event)
+            return record
+        if record.status == "paused":
+            with self._lock:
+                message = append_session_message(record, "user", content, delivery="consumed")
+                record.interaction_status = "answering"
+                record.event_queue = queue.Queue()
+                chat_run = start_session_run(record, kind="chat", trigger_message_id=message["id"], activate=False)
+                record.updated_at = utc_now()
+                self._persist_record(record)
+            thread = threading.Thread(
+                target=self._run_chat,
+                args=(record, chat_run["id"], content),
+                name=f"bioagent-web-chat-{task_id}",
+                daemon=True,
+            )
+            thread.start()
+            return record
+        if record.status in {"completed", "failed"}:
+            with self._lock:
+                message = append_session_message(record, "user", content, delivery="consumed")
+                start_session_run(record, kind="agent", trigger_message_id=message["id"])
+                record.status = "queued"
+                record.error = ""
+                record.final_answer = ""
+                record.event_queue = queue.Queue()
+                record.updated_at = utc_now()
+                self._persist_record(record)
+            thread = threading.Thread(
+                target=self._run_follow_up,
+                args=(record,),
+                name=f"bioagent-web-followup-{task_id}",
+                daemon=True,
+            )
+            thread.start()
+            return record
+        raise ValueError(f"Session {task_id} cannot accept messages while status={record.status}")
+
     def resume_task(self, *, task_id: str, user_answer: str, max_turns: int = 20) -> TaskRecord:
         record = self.get_task(task_id)
-        if record.status != "needs_user_input":
-            raise ValueError(f"Task {task_id} is not waiting for user input")
+        if record.status not in {"needs_user_input", "paused"}:
+            raise ValueError(f"Task {task_id} is not waiting for user input or paused")
+        resume_kind = record.status
         with self._lock:
+            record.pause_event.clear()
             record.status = "running"
             record.error = ""
+            record.final_answer = ""
             record.event_queue = queue.Queue()
-            record.messages.append({"role": "user", "content": user_answer, "createdAt": utc_now(), "resume": True})
+            append_session_message(record, "user", user_answer, delivery="consumed", resume=True)
             record.updated_at = utc_now()
             self._persist_record(record)
         thread = threading.Thread(
             target=self._run_resume,
-            args=(record, user_answer, max_turns),
+            args=(record, user_answer, max_turns, resume_kind),
             name=f"bioagent-web-resume-{task_id}",
             daemon=True,
         )
         thread.start()
         return record
+
+    def pause_task(self, task_id: str) -> TaskRecord:
+        record = self.get_task(task_id)
+        event = {"type": "pause_requested", "status": "pausing"}
+        with self._lock:
+            if record.status not in {"queued", "running"}:
+                raise ValueError(f"Task {task_id} is not running")
+            record.pause_event.set()
+            apply_event_to_record(record, event)
+            record.events.append(event)
+            record.updated_at = utc_now()
+            self._persist_record(record)
+        record.event_queue.put(event)
+        stop_active_docker_containers(Path(record.run_dir)) if record.run_dir else None
+        return record
+
+    def take_pending_messages(self, task_id: str) -> list[str]:
+        record = self.get_task(task_id)
+        with self._lock:
+            pending = list(record.pending_user_messages)
+            record.pending_user_messages.clear()
+            pending_ids = {item["id"] for item in pending}
+            for message in record.messages:
+                if message.get("id") in pending_ids:
+                    message["delivery"] = "consumed"
+            if pending:
+                record.updated_at = utc_now()
+                self._persist_record(record)
+        return [item["content"] for item in pending]
 
     def list_tasks(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -159,6 +268,9 @@ class TaskStore:
                 "traceCount": len(record.traces),
                 "resultFileCount": count_result_files(record.result_root()),
                 "resultFileNames": result_file_names(record.result_root()),
+                "sessionStatus": record.session_status,
+                "runStatus": record.status,
+                "runCount": len(record.runs),
             }
             for record in sorted(records, key=lambda item: item.updated_at, reverse=True)
         ]
@@ -174,45 +286,125 @@ class TaskStore:
         self._apply_event(record, {"type": "task_started", "status": "running"})
         try:
             result_dir = str(self.config.runs_dir / f"web_{record.id}")
-            for event in self.stream_runner(
-                record.task,
-                data_path=record.data_path,
-                result_dir=result_dir,
-                max_turns=record.max_turns,
-            ):
+            kwargs: dict[str, Any] = {
+                "data_path": record.data_path,
+                "result_dir": result_dir,
+                "max_turns": record.max_turns,
+            }
+            if callable_accepts(self.stream_runner, "pause_requested"):
+                kwargs["pause_requested"] = record.pause_event.is_set
+            if callable_accepts(self.stream_runner, "take_pending_messages"):
+                kwargs["take_pending_messages"] = lambda: self.take_pending_messages(record.id)
+            for event in self.stream_runner(record.task, **kwargs):
                 self._apply_event(record, event)
         except Exception as exc:
             self._apply_event(record, {"type": "error", "error": str(exc)})
         finally:
             record.event_queue.put(None)
 
-    def _run_resume(self, record: TaskRecord, user_answer: str, max_turns: int) -> None:
-        self._apply_event(record, {"type": "resume_started", "status": "running"})
+    def _run_resume(self, record: TaskRecord, user_answer: str, max_turns: int, resume_kind: str) -> None:
+        self._apply_event(record, {"type": "resume_started", "status": "running", "resume_kind": resume_kind})
         try:
             resume_id = str(record.compute.get("runId") or "")
-            result = self.resume_runner(resume_id, user_answer, max_turns=max_turns)
-            self._apply_event(
-                record,
-                {
-                    "type": "final",
-                    "content": str(result.get("final_answer") or ""),
-                    "status": str(result.get("status") or "completed"),
-                    "result": result,
-                },
-            )
-            self._apply_event(
-                record,
-                {
-                    "type": "run_end",
-                    "run_id": resume_id or record.compute.get("runId", ""),
-                    "run_dir": str(result.get("run_dir") or record.run_dir),
-                    "log_path": str(result.get("log_path") or record.log_path),
-                    "status": str(result.get("status") or "completed"),
-                    "result": result,
-                },
-            )
+            kwargs: dict[str, Any] = {"max_turns": max_turns}
+            terminal_seen = {"final": False, "run_end": False}
+
+            def emit(event: dict[str, Any]) -> None:
+                event_type = str(event.get("type") or "")
+                if event_type in terminal_seen:
+                    terminal_seen[event_type] = True
+                self._apply_event(record, event)
+
+            if callable_accepts(self.resume_runner, "pause_requested"):
+                kwargs["pause_requested"] = record.pause_event.is_set
+            if callable_accepts(self.resume_runner, "event_sink"):
+                kwargs["event_sink"] = emit
+            if callable_accepts(self.resume_runner, "take_pending_messages"):
+                kwargs["take_pending_messages"] = lambda: self.take_pending_messages(record.id)
+            result = self.resume_runner(resume_id, user_answer, **kwargs)
+            if not terminal_seen["final"]:
+                self._apply_event(
+                    record,
+                    {
+                        "type": "final",
+                        "content": str(result.get("final_answer") or ""),
+                        "status": str(result.get("status") or "completed"),
+                        "result": result,
+                    },
+                )
+            if not terminal_seen["run_end"]:
+                self._apply_event(
+                    record,
+                    {
+                        "type": "run_end",
+                        "run_id": resume_id or record.compute.get("runId", ""),
+                        "run_dir": str(result.get("run_dir") or record.run_dir),
+                        "log_path": str(result.get("log_path") or record.log_path),
+                        "status": str(result.get("status") or "completed"),
+                        "result": result,
+                    },
+                )
         except Exception as exc:
             self._apply_event(record, {"type": "error", "error": str(exc)})
+        finally:
+            record.event_queue.put(None)
+
+    def _run_follow_up(self, record: TaskRecord) -> None:
+        self._apply_event(record, {"type": "task_started", "status": "running"})
+        try:
+            kwargs: dict[str, Any] = {
+                "data_path": record.data_path,
+                "result_dir": str(self.config.runs_dir / f"web_{record.id}"),
+                "max_turns": record.max_turns,
+            }
+            if callable_accepts(self.stream_runner, "pause_requested"):
+                kwargs["pause_requested"] = record.pause_event.is_set
+            if callable_accepts(self.stream_runner, "take_pending_messages"):
+                kwargs["take_pending_messages"] = lambda: self.take_pending_messages(record.id)
+            if callable_accepts(self.stream_runner, "initial_memory_state"):
+                kwargs["initial_memory_state"] = session_memory_state(record)
+            if callable_accepts(self.stream_runner, "session_message"):
+                kwargs["session_message"] = latest_user_message(record)
+            if callable_accepts(self.stream_runner, "prior_run_dirs"):
+                kwargs["prior_run_dirs"] = session_run_dirs(record)
+            prompt = build_session_follow_up_prompt(record)
+            for event in self.stream_runner(prompt, **kwargs):
+                self._apply_event(record, event)
+        except Exception as exc:
+            self._apply_event(record, {"type": "error", "error": str(exc)})
+        finally:
+            record.event_queue.put(None)
+
+    def _run_chat(self, record: TaskRecord, chat_run_id: str, content: str) -> None:
+        try:
+            context = build_session_chat_context(record)
+            context["availableSkills"] = [
+                {
+                    "skillId": skill.skill_id,
+                    "name": skill.name,
+                    "description": skill.short_description,
+                    "runtime": skill.runtime,
+                    "environment": skill.env_profile,
+                }
+                for skill in list_workflow_skills(self.config.workflows_root)
+            ]
+            answer = self.chat_runner(context, content)
+            with self._lock:
+                append_session_message(record, "assistant", answer, delivery="consumed", interaction="chat")
+                record.interaction_status = ""
+                finish_session_run(record, chat_run_id, "completed")
+                event = {"type": "chat_message", "content": answer, "status": "completed"}
+                record.events.append(event)
+                record.updated_at = utc_now()
+                self._persist_record(record)
+            record.event_queue.put(event)
+        except Exception as exc:
+            with self._lock:
+                record.interaction_status = ""
+                finish_session_run(record, chat_run_id, "failed", error=str(exc))
+                append_session_message(record, "assistant", f"Unable to answer: {exc}", delivery="consumed", error=True)
+                record.updated_at = utc_now()
+                self._persist_record(record)
         finally:
             record.event_queue.put(None)
 
@@ -255,6 +447,12 @@ def record_to_payload(record: TaskRecord) -> dict[str, Any]:
         "plan": record.plan,
         "events": record.events,
         "compute": record.compute,
+        "memory": record.memory,
+        "session_status": record.session_status,
+        "interaction_status": record.interaction_status,
+        "runs": record.runs,
+        "active_run_id": record.active_run_id,
+        "pending_user_messages": record.pending_user_messages,
         "final_answer": record.final_answer,
         "run_dir": record.run_dir,
         "log_path": record.log_path,
@@ -272,21 +470,38 @@ def record_from_payload(payload: dict[str, Any]) -> TaskRecord:
         status=str(payload.get("status") or "queued"),
         created_at=str(payload.get("created_at") or utc_now()),
         updated_at=str(payload.get("updated_at") or utc_now()),
-        messages=list(payload.get("messages") or []),
+        messages=_normalize_stored_messages(payload.get("messages") or []),
         traces=list(payload.get("traces") or []),
         plan=list(payload.get("plan") or []),
         events=list(payload.get("events") or []),
         compute=dict(payload.get("compute") or {}),
+        memory=dict(payload.get("memory") or {}),
+        session_status=str(payload.get("session_status") or "open"),
+        interaction_status="",
+        runs=list(payload.get("runs") or []),
+        active_run_id=str(payload.get("active_run_id") or ""),
+        pending_user_messages=list(payload.get("pending_user_messages") or []),
         final_answer=str(payload.get("final_answer") or ""),
         run_dir=str(payload.get("run_dir") or ""),
         log_path=str(payload.get("log_path") or ""),
         error=str(payload.get("error") or ""),
     )
+    if not record.runs and record.compute.get("runId"):
+        run = start_session_run(record, kind="agent", activate=True)
+        run.update(
+            {
+                "agentRunId": str(record.compute.get("runId") or ""),
+                "status": record.status,
+                "runDir": record.run_dir,
+                "logPath": record.log_path,
+                "endedAt": record.updated_at if record.status in {"completed", "failed", "paused", "needs_user_input"} else "",
+            }
+        )
     for trace in record.traces:
         output = trace.get("output")
         if isinstance(output, dict) and output.get("ok") is False:
             trace["status"] = "failed"
-    if record.status == "running":
+    if record.status in {"running", "pausing"}:
         record.status = "failed"
         record.error = "Run interrupted before completion."
         record.compute["currentTool"] = ""
@@ -319,32 +534,93 @@ def record_from_payload(payload: dict[str, Any]) -> TaskRecord:
     return record
 
 
+def _normalize_stored_messages(messages: Any) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for value in messages if isinstance(messages, list) else []:
+        if not isinstance(value, dict):
+            continue
+        message = dict(value)
+        if message.get("role") == "assistant":
+            content, recognized = _legacy_anthropic_text(str(message.get("content") or ""))
+            if recognized:
+                if not content:
+                    continue
+                message["content"] = content
+        normalized.append(message)
+    return normalized
+
+
+def _legacy_anthropic_text(content: str) -> tuple[str, bool]:
+    if not content.lstrip().startswith("["):
+        return content, False
+    try:
+        blocks = ast.literal_eval(content)
+    except (SyntaxError, ValueError):
+        return content, False
+    if not isinstance(blocks, list) or not blocks or not all(isinstance(block, dict) for block in blocks):
+        return content, False
+    block_types = {str(block.get("type") or "") for block in blocks}
+    if not block_types or not block_types.issubset({"text", "tool_use"}):
+        return content, False
+    text = "\n".join(
+        str(block.get("text") or "").strip()
+        for block in blocks
+        if block.get("type") == "text" and str(block.get("text") or "").strip()
+    )
+    return text, True
+
+
 def apply_event_to_record(record: TaskRecord, event: dict[str, Any]) -> None:
     event_type = str(event.get("type", ""))
     if event_type == "task_started":
-        record.status = "running"
+        if record.status != "pausing":
+            record.status = "running"
         ensure_plan_step(record, "Understand request", "completed")
+        update_active_session_run(record, status="running")
         return
     if event_type == "resume_started":
         record.status = "running"
-        ensure_plan_step(record, "Wait for user input", "completed")
-        ensure_plan_step(record, "Resume with user input", "completed")
+        update_active_session_run(record, status="running")
+        if event.get("resume_kind") == "paused":
+            ensure_plan_step(record, "Pause task", "completed")
+            ensure_plan_step(record, "Continue with user instruction", "completed")
+        else:
+            ensure_plan_step(record, "Wait for user input", "completed")
+            ensure_plan_step(record, "Resume with user input", "completed")
+        return
+    if event_type == "pause_requested":
+        record.status = "pausing"
+        update_active_session_run(record, status="pausing")
+        ensure_plan_step(record, "Pause task", "running")
         return
     if event_type == "run_start":
-        record.status = "running"
+        if record.status != "pausing":
+            record.status = "running"
         record.run_dir = str(event.get("run_dir") or record.run_dir)
         record.log_path = str(event.get("log_path") or record.log_path)
         record.compute["runId"] = str(event.get("run_id") or record.compute.get("runId") or "")
+        update_active_session_run(
+            record,
+            status="running",
+            agentRunId=record.compute["runId"],
+            runDir=record.run_dir,
+            logPath=record.log_path,
+        )
         ensure_plan_step(record, "Start BioAgent run", "completed")
         return
     if event_type == "turn_start":
         record.compute["turn"] = int(event.get("turn") or 0)
         record.compute["maxTurns"] = int(event.get("max_turns") or record.max_turns)
         return
+    if event_type == "memory_state":
+        memory = event.get("memory")
+        if isinstance(memory, dict):
+            record.memory = memory
+        return
     if event_type == "assistant_message":
         content = str(event.get("content") or "")
         if content:
-            record.messages.append({"role": "assistant", "content": content, "createdAt": utc_now()})
+            append_session_message(record, "assistant", content, delivery="consumed")
         return
     if event_type == "tool_call":
         call_id = str(event.get("call_id") or uuid.uuid4().hex[:8])
@@ -367,7 +643,7 @@ def apply_event_to_record(record: TaskRecord, event: dict[str, Any]) -> None:
         call_id = str(event.get("call_id") or "")
         trace = next((item for item in record.traces if item["id"] == call_id), None)
         tool_name = str(event.get("tool_name") or (trace or {}).get("toolName") or "tool")
-        status = "completed" if event.get("ok") else "failed"
+        status = str(event.get("status") or ("completed" if event.get("ok") else "failed"))
         if trace is not None:
             trace["status"] = status
             trace["output"] = event.get("result")
@@ -380,6 +656,7 @@ def apply_event_to_record(record: TaskRecord, event: dict[str, Any]) -> None:
         content = str(event.get("content") or "")
         record.final_answer = content
         record.status = str(event.get("status") or record.status or "completed")
+        update_active_session_run(record, status=record.status)
         if content:
             duplicate_prompt = (
                 record.status == "needs_user_input"
@@ -388,12 +665,14 @@ def apply_event_to_record(record: TaskRecord, event: dict[str, Any]) -> None:
                 and str(record.messages[-1].get("content") or "") == content
             )
             if not duplicate_prompt:
-                message = {"role": "assistant", "content": content, "createdAt": utc_now()}
+                message = append_session_message(record, "assistant", content, delivery="consumed")
                 if record.status == "completed":
                     message["final"] = True
-                record.messages.append(message)
         if record.status == "needs_user_input":
             ensure_plan_step(record, "Wait for user input", "running")
+            return
+        if record.status == "paused":
+            ensure_plan_step(record, "Pause task", "completed")
             return
         ensure_plan_step(record, "Summarize result", "completed")
         return
@@ -402,20 +681,149 @@ def apply_event_to_record(record: TaskRecord, event: dict[str, Any]) -> None:
         record.run_dir = str(event.get("run_dir") or record.run_dir)
         record.log_path = str(event.get("log_path") or record.log_path)
         record.compute["runId"] = str(event.get("run_id") or record.compute.get("runId") or "")
+        update_active_session_run(
+            record,
+            status=record.status,
+            agentRunId=record.compute["runId"],
+            runDir=record.run_dir,
+            logPath=record.log_path,
+            endedAt=utc_now() if record.status in {"completed", "failed", "paused", "needs_user_input"} else "",
+        )
         result = event.get("result") if isinstance(event.get("result"), dict) else {}
         if not record.final_answer:
             record.final_answer = str(result.get("final_answer") or "")
         if record.status == "needs_user_input":
+            return
+        if record.status == "paused":
+            ensure_plan_step(record, "Pause task", "completed")
             return
         ensure_plan_step(record, "Finish run", "completed" if record.status == "completed" else record.status)
         return
     if event_type == "error":
         record.status = "failed"
         record.error = str(event.get("error") or "Unknown error")
-        if not record.final_answer:
-            record.final_answer = f"Run failed: {record.error}"
-        record.messages.append({"role": "assistant", "content": record.final_answer, "createdAt": utc_now(), "error": True})
+        record.final_answer = f"Run failed: {record.error}"
+        append_session_message(record, "assistant", record.final_answer, delivery="consumed", error=True)
+        update_active_session_run(record, status="failed", endedAt=utc_now(), error=record.error)
         ensure_plan_step(record, "Handle error", "failed")
+
+
+def append_session_message(
+    record: TaskRecord,
+    role: str,
+    content: str,
+    *,
+    delivery: str,
+    **metadata: Any,
+) -> dict[str, Any]:
+    message = {
+        "id": uuid.uuid4().hex[:12],
+        "role": role,
+        "content": content,
+        "createdAt": utc_now(),
+        "delivery": delivery,
+        **metadata,
+    }
+    record.messages.append(message)
+    return message
+
+
+def start_session_run(
+    record: TaskRecord,
+    *,
+    kind: str,
+    trigger_message_id: str = "",
+    activate: bool = True,
+) -> dict[str, Any]:
+    run = {
+        "id": uuid.uuid4().hex[:12],
+        "kind": kind,
+        "status": "queued" if kind == "agent" else "running",
+        "triggerMessageId": trigger_message_id,
+        "agentRunId": "",
+        "runDir": "",
+        "logPath": "",
+        "startedAt": utc_now(),
+        "endedAt": "",
+        "error": "",
+    }
+    record.runs.append(run)
+    if activate:
+        record.active_run_id = run["id"]
+    return run
+
+
+def update_active_session_run(record: TaskRecord, **updates: Any) -> None:
+    run = next((item for item in record.runs if item.get("id") == record.active_run_id), None)
+    if run is not None:
+        run.update(updates)
+
+
+def finish_session_run(record: TaskRecord, run_id: str, status: str, *, error: str = "") -> None:
+    run = next((item for item in record.runs if item.get("id") == run_id), None)
+    if run is None:
+        return
+    run.update({"status": status, "endedAt": utc_now(), "error": error})
+
+
+def build_session_chat_context(record: TaskRecord) -> dict[str, Any]:
+    task_state = record.memory.get("taskState") if isinstance(record.memory, dict) else {}
+    return {
+        "sessionId": record.id,
+        "originalTask": record.task,
+        "runStatus": record.status,
+        "taskState": task_state or {},
+        "recentMessages": record.messages[-12:],
+        "runId": record.compute.get("runId", ""),
+        "resultRoot": record.compute_snapshot().get("resultRoot", ""),
+    }
+
+
+def build_session_follow_up_prompt(record: TaskRecord) -> str:
+    recent = record.messages[-12:]
+    transcript = "\n".join(
+        f"{str(message.get('role') or 'unknown').upper()}: {str(message.get('content') or '')[:3000]}"
+        for message in recent
+    )
+    task_state = record.memory.get("taskState") if isinstance(record.memory, dict) else {}
+    failed_trace = next((trace for trace in reversed(record.traces) if trace.get("status") == "failed"), None)
+    failure_context = json.dumps(failed_trace or {}, ensure_ascii=False, default=str)[:5000]
+    return (
+        "Continue an existing BioAgent conversation session. Current observations override prior messages.\n"
+        f"Original task:\n{record.task}\n\n"
+        f"Compact task state:\n{json.dumps(task_state or {}, ensure_ascii=False, default=str)}\n\n"
+        f"Previous run workspace:\n{record.run_dir or '(not available)'}\n"
+        f"Previous run log:\n{record.log_path or '(not available)'}\n\n"
+        f"Latest failed tool trace:\n{failure_context or '(none)'}\n\n"
+        f"Recent conversation:\n{transcript}\n\n"
+        "Respond to the latest USER message. Use tools when needed and reuse verified artifacts from the existing session."
+    )
+
+
+def session_memory_state(record: TaskRecord) -> dict[str, Any]:
+    memory = record.memory if isinstance(record.memory, dict) else {}
+    task_state = memory.get("taskState") if isinstance(memory.get("taskState"), dict) else {}
+    return {
+        "task_state": task_state,
+        "execution_outcome": memory.get("executionOutcome"),
+        "execution_tool": str(memory.get("executionTool") or "execution"),
+    }
+
+
+def latest_user_message(record: TaskRecord) -> str:
+    for message in reversed(record.messages):
+        if message.get("role") == "user":
+            return str(message.get("content") or "")
+    return ""
+
+
+def session_run_dirs(record: TaskRecord) -> list[str]:
+    result: list[str] = []
+    for run in record.runs:
+        run_dir = str(run.get("runDir") or "").strip()
+        if run_dir and run_dir not in result:
+            result.append(run_dir)
+    return result
 
 
 def ensure_plan_step(record: TaskRecord, title: str, status: str) -> None:
@@ -424,6 +832,36 @@ def ensure_plan_step(record: TaskRecord, title: str, status: str) -> None:
         existing["status"] = status
         return
     record.plan.append({"id": uuid.uuid4().hex[:8], "title": title, "status": status})
+
+
+def callable_accepts(function: Callable[..., Any], parameter: str) -> bool:
+    try:
+        signature = inspect.signature(function)
+    except (TypeError, ValueError):
+        return False
+    return parameter in signature.parameters or any(
+        item.kind == inspect.Parameter.VAR_KEYWORD for item in signature.parameters.values()
+    )
+
+
+def stop_active_docker_containers(run_dir: Path) -> None:
+    for name in (".docker-python.cid", ".docker-r.cid"):
+        cidfile = run_dir / name
+        if not cidfile.is_file():
+            continue
+        container_id = cidfile.read_text(encoding="utf-8").strip()
+        if not container_id:
+            continue
+        subprocess.run(
+            ["docker", "rm", "-f", container_id],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    cancel_run_jobs(run_dir)
 
 
 def normalize_plan_from_traces(record: TaskRecord) -> None:

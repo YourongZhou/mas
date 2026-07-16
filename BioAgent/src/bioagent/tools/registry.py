@@ -8,23 +8,37 @@ from bioagent.config import AgentConfig
 from bioagent.logging_utils import RunLogger
 from bioagent.memory import MemoryHarness
 
+from .artifacts import ArtifactStore
+from .attempts import ExecutionAttemptBudget
 from .execution import execute_python_impl, execute_r_impl
 from .filesystem import glob_search_impl, grep_text_impl, list_files_impl, read_file_impl
+from .jobs import DockerJobManager
 from .schemas import (
+    CancelJobArgs,
+    EditRunFileArgs,
     ExecutePythonArgs,
     ExecuteRArgs,
+    FinishTaskArgs,
+    GetJobArgs,
     GlobArgs,
     GrepArgs,
+    InspectArtifactArgs,
     InspectSkillFunctionArgs,
     InspectSkillArgs,
     InspectSkillScriptSymbolsArgs,
     ListFilesArgs,
+    ListJobsArgs,
     ListWorkflowSkillsArgs,
+    PollJobArgs,
     ReadFileArgs,
     ReadSkillScriptArgs,
     RequestUserInputArgs,
     RunCodeWorkflowArgs,
     RunSkillWorkflowArgs,
+    StartJobArgs,
+    TailJobArgs,
+    ValidateScriptArgs,
+    WriteRunFileArgs,
 )
 from .skill_workflow import run_code_workflow_impl, run_skill_workflow_impl
 from .workflow import (
@@ -35,6 +49,7 @@ from .workflow import (
     list_workflow_skills_impl,
     read_skill_script_impl,
 )
+from .workspace import edit_run_file_impl, validate_script_impl, write_run_file_impl
 
 
 def build_tools(
@@ -43,8 +58,11 @@ def build_tools(
     run_dir: Path,
     *,
     memory_harness: MemoryHarness | None = None,
+    prior_run_dirs: list[Path] | None = None,
 ) -> list:
-    execution_attempts = 0
+    attempt_budget = ExecutionAttemptBudget(run_dir, config.max_execution_attempts)
+    job_manager = DockerJobManager(config, logger, run_dir, prior_run_dirs=prior_run_dirs)
+    artifact_store = ArtifactStore(run_dir, config=config, prior_run_dirs=prior_run_dirs)
 
     def list_files(path: str = ".", recursive: bool = False, max_entries: int = 200) -> str:
         return list_files_impl(config, run_dir, path=path, recursive=recursive, max_entries=max_entries)
@@ -112,15 +130,10 @@ def build_tools(
     def inspect_image_catalog() -> list[dict]:
         return inspect_image_catalog_impl(config)
 
-    def execute_python(code: str, env_profile: str = "py-general-v1", requirements: str = "", timeout_s: int = 900) -> dict:
-        nonlocal execution_attempts
-        if execution_attempts >= config.max_execution_attempts:
-            return {
-                "ok": False,
-                "error": f"Reached global max_execution_attempts={config.max_execution_attempts}.",
-                "attempts_used": execution_attempts,
-            }
-        execution_attempts += 1
+    def execute_python(code: str, env_profile: str = "py-general-v1", requirements: str = "", timeout_s: int = 1800) -> dict:
+        attempt = attempt_budget.consume(tool="execute_python")
+        if not attempt.get("ok"):
+            return attempt
         return execute_python_impl(
             config,
             logger,
@@ -131,16 +144,62 @@ def build_tools(
             timeout_s=timeout_s,
         )
 
-    def execute_r(code: str, env_profile: str = "r-bioc-v1", timeout_s: int = 900) -> dict:
-        nonlocal execution_attempts
-        if execution_attempts >= config.max_execution_attempts:
-            return {
-                "ok": False,
-                "error": f"Reached global max_execution_attempts={config.max_execution_attempts}.",
-                "attempts_used": execution_attempts,
-            }
-        execution_attempts += 1
+    def execute_r(code: str, env_profile: str = "r-bioc-v1", timeout_s: int = 1800) -> dict:
+        attempt = attempt_budget.consume(tool="execute_r")
+        if not attempt.get("ok"):
+            return attempt
         return execute_r_impl(config, logger, run_dir, code=code, env_profile=env_profile, timeout_s=timeout_s)
+
+    def write_run_file(path: str, content: str, overwrite: bool = True) -> dict:
+        return write_run_file_impl(run_dir, path=path, content=content, overwrite=overwrite)
+
+    def edit_run_file(path: str, old_text: str, new_text: str, replace_all: bool = False) -> dict:
+        return edit_run_file_impl(
+            run_dir,
+            path=path,
+            old_text=old_text,
+            new_text=new_text,
+            replace_all=replace_all,
+        )
+
+    def validate_script(path: str, runtime: str = "python") -> dict:
+        return validate_script_impl(run_dir, path=path, runtime=runtime)
+
+    def start_job(
+        runtime: str,
+        script_path: str,
+        env_profile: str,
+        requirements: str = "",
+        timeout_s: int = 1800,
+    ) -> dict:
+        return job_manager.start_job(
+            runtime=runtime,
+            script_path=script_path,
+            env_profile=env_profile,
+            requirements=requirements,
+            timeout_s=timeout_s,
+        )
+
+    def list_jobs(status: str = "") -> dict:
+        return job_manager.list_jobs(status=status)
+
+    def get_job(job_id: str = "", refresh: bool = False) -> dict:
+        return job_manager.get_job(job_id, refresh=refresh)
+
+    def poll_job(job_id: str = "", wait_s: int = 0) -> dict:
+        return job_manager.poll_job(job_id, wait_s=wait_s)
+
+    def tail_job(job_id: str = "", lines: int = 200) -> dict:
+        return job_manager.tail_job(job_id, lines=lines)
+
+    def cancel_job(job_id: str = "") -> dict:
+        return job_manager.cancel_job(job_id)
+
+    def inspect_artifact(path: str, max_rows: int = 10) -> dict:
+        return artifact_store.inspect(path, max_rows=max_rows)
+
+    def finish_task(summary: str, evidence_ids: list[str]) -> dict:
+        return artifact_store.finish_task(summary=summary, evidence_ids=evidence_ids)
 
     def run_skill_workflow(
         skill_id: str,
@@ -218,8 +277,19 @@ def build_tools(
         StructuredTool.from_function(inspect_skill_script_symbols, name="inspect_skill_script_symbols", description="解析 workflow skill 的 Python 脚本。默认只列函数/类签名；需要 docstring 时设置 include_docstrings=true。", args_schema=InspectSkillScriptSymbolsArgs),
         StructuredTool.from_function(inspect_skill_function, name="inspect_skill_function", description="按函数名查看 workflow skill 脚本中的签名、docstring 和源码预览。", args_schema=InspectSkillFunctionArgs),
         StructuredTool.from_function(inspect_image_catalog, name="inspect_image_catalog", description="查看 mas_2/docker/image_catalog.json 中配置的 Docker profiles。"),
-        StructuredTool.from_function(execute_python, name="execute_python", description="在指定 Python Docker profile 中执行生成的 Python 脚本。", args_schema=ExecutePythonArgs),
-        StructuredTool.from_function(execute_r, name="execute_r", description="在指定 R Docker profile 中执行生成的 R 脚本。", args_schema=ExecuteRArgs),
+        StructuredTool.from_function(write_run_file, name="write_run_file", description="把持久脚本或文本写入当前 run workspace；返回路径而不是把代码带进后续上下文。", args_schema=WriteRunFileArgs),
+        StructuredTool.from_function(edit_run_file, name="edit_run_file", description="对 run workspace 文件做精确文本替换，适合根据报错进行最小修复。", args_schema=EditRunFileArgs),
+        StructuredTool.from_function(validate_script, name="validate_script", description="执行不计 attempt 的轻量脚本语法检查。Python 使用 AST parse；R 完整 parse 在 start_job 中执行。", args_schema=ValidateScriptArgs),
+        StructuredTool.from_function(start_job, name="start_job", description="按当前 run workspace 中的脚本路径启动持久异步 Docker job，并立即返回 job_id；同一 session 已有运行中 job 时会拒绝重复启动。", args_schema=StartJobArgs),
+        StructuredTool.from_function(list_jobs, name="list_jobs", description="列出当前 conversation session 各 run 中由 harness 签发并持久化的 jobs，以及 active_job_id。", args_schema=ListJobsArgs),
+        StructuredTool.from_function(get_job, name="get_job", description="读取 session 内一个已登记 job 的持久状态；job_id 留空时优先使用仍在运行的 active job。", args_schema=GetJobArgs),
+        StructuredTool.from_function(poll_job, name="poll_job", description="查询异步 job；job_id 留空时使用持久 active job。长任务可设置 wait_s=60..300；返回最新 stdout/stderr。", args_schema=PollJobArgs),
+        StructuredTool.from_function(tail_job, name="tail_job", description="按需读取异步 job 的最新 Docker 日志。", args_schema=TailJobArgs),
+        StructuredTool.from_function(cancel_job, name="cancel_job", description="终止指定异步 Docker job。", args_schema=CancelJobArgs),
+        StructuredTool.from_function(inspect_artifact, name="inspect_artifact", description="通用检查 run 输出文件并登记可复核 evidence；支持表格、JSON、图片、gzip 和文本。", args_schema=InspectArtifactArgs),
+        StructuredTool.from_function(finish_task, name="finish_task", description="用 inspect_artifact 返回的 evidence_ids 验证最终产物并形成 grounded final answer。", args_schema=FinishTaskArgs),
+        StructuredTool.from_function(execute_python, name="execute_python", description="兼容工具：直接执行完整 Python 代码。优先使用 write_run_file + start_job。", args_schema=ExecutePythonArgs),
+        StructuredTool.from_function(execute_r, name="execute_r", description="兼容工具：直接执行完整 R 代码。优先使用 write_run_file + start_job。", args_schema=ExecuteRArgs),
     ]
     if config.enable_legacy_workflow_tools:
         tools.extend([
@@ -245,3 +315,5 @@ def build_tools(
     if memory_harness and memory_harness.enabled:
         tools.extend(memory_harness.tools)
     return tools
+    InspectArtifactArgs,
+    PollJobArgs,

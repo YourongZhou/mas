@@ -10,17 +10,17 @@
     <main class="app">
       <nav class="rail" aria-label="Global navigation">
         <div class="logo" title="BioAgent"></div>
-        <button class="rail-button active" title="Projects" aria-current="page">P</button>
+        <button class="rail-button active" id="workbenchNavButton" title="Projects" aria-current="page">P</button>
         <button class="rail-button" title="Resources (coming soon)" disabled>R</button>
         <button class="rail-button" title="Skills (coming soon)" disabled>S</button>
         <button class="rail-button" title="History (coming soon)" disabled>H</button>
         <div class="rail-spacer"></div>
-        <button class="rail-button" title="Settings (coming soon)" disabled>G</button>
+        <button class="rail-button" id="settingsNavButton" title="Model settings">G</button>
       </nav>
 
       <header class="topbar">
         <div class="topbar-title">
-          <div class="crumbs">BioAgent / <strong id="taskTitle">New task</strong></div>
+          <div class="crumbs">BioAgent / <strong id="taskTitle">New session</strong></div>
           <div class="subtle" id="runtimeLine">Local single-agent workbench</div>
         </div>
         <div class="top-actions">
@@ -32,17 +32,17 @@
 
       <aside class="sidebar">
         <div class="project-title">
-          <span>Quick Tasks</span>
-          <button class="icon-button" id="newTaskButton">New</button>
+          <span>Sessions</span>
+          <button class="icon-button" id="newTaskButton">New session</button>
         </div>
         <div class="task-search-row">
-          <input class="search" id="taskSearch" placeholder="Search past runs" />
+          <input class="search" id="taskSearch" placeholder="Search sessions" />
           <button class="icon-button search-clear" id="clearTaskSearchButton" type="button" hidden>Clear</button>
         </div>
 
-        <div class="section-title">Past Runs</div>
+        <div class="section-title">Past Sessions</div>
         <div class="list" id="taskList">
-          <div class="empty">No runs yet.</div>
+          <div class="empty">No sessions yet.</div>
         </div>
 
         <div class="section-title">Project Files</div>
@@ -57,7 +57,7 @@
         <div class="stream" id="messageStream">
           <article class="message">
             <div class="speaker">BioAgent</div>
-            <p>Start a task to watch model turns, tool calls, result files, and final outputs stream into this workspace.</p>
+            <p>Start a session.</p>
           </article>
         </div>
         <button class="scroll-latest" id="scrollLatestButton" type="button">Jump to latest</button>
@@ -70,7 +70,11 @@
                 <input id="dataPathInput" value="mas_2/data/bmmc_b_cell.h5ad" />
                 <label class="turns-label">turns <input id="maxTurnsInput" type="number" min="1" max="100" value="20" /></label>
               </div>
-              <button class="send" id="sendButton" type="submit">Run</button>
+              <div class="composer-actions">
+                <button class="composer-control pause-control" id="pauseButton" type="button" hidden>Pause</button>
+                <button class="composer-control" id="continueButton" type="button" hidden>Continue</button>
+                <button class="send" id="sendButton" type="submit">Run</button>
+              </div>
             </div>
           </div>
           <div class="error-line" id="errorLine"></div>
@@ -78,8 +82,9 @@
       </section>
 
       <section class="detail">
-        <div class="tabs" id="detailTabs" role="tablist" aria-label="Task details">
+        <div class="tabs" id="detailTabs" role="tablist" aria-label="Session details">
           <button class="tab active" id="traceTab" role="tab" aria-controls="tracePane" aria-selected="true" tabindex="0" data-tab="trace">Trace</button>
+          <button class="tab" id="memoryTab" role="tab" aria-controls="memoryPane" aria-selected="false" tabindex="-1" data-tab="memory">Memory</button>
           <button class="tab" id="resultTab" role="tab" aria-controls="resultPane" aria-selected="false" tabindex="-1" data-tab="result">Result</button>
           <button class="tab" id="fileTab" role="tab" aria-controls="filePane" aria-selected="false" tabindex="-1" data-tab="file">File</button>
         </div>
@@ -111,6 +116,27 @@
                 </section>
               </div>
             </div>
+          </section>
+
+          <section class="detail-pane" id="memoryPane" role="tabpanel" aria-labelledby="memoryTab" hidden>
+            <div class="detail-header">
+              <div>
+                <h2>Working memory</h2>
+                <div class="meta" id="memoryMeta">No task memory loaded.</div>
+              </div>
+            </div>
+            <section class="memory-section" aria-labelledby="taskStateHeading">
+              <div class="group-head" id="taskStateHeading"><span>Task state</span></div>
+              <div class="memory-state-grid" id="memoryState">
+                <div class="empty">Task state appears when a run starts.</div>
+              </div>
+            </section>
+            <section class="memory-section" aria-labelledby="priorEpisodesHeading">
+              <div class="group-head" id="priorEpisodesHeading"><span>Prior verified experience</span></div>
+              <div class="memory-episodes" id="memoryEpisodes">
+                <div class="empty">No relevant verified episodes retrieved.</div>
+              </div>
+            </section>
           </section>
 
           <section class="detail-pane" id="resultPane" role="tabpanel" aria-labelledby="resultTab" hidden>
@@ -172,6 +198,87 @@
           <div class="compute-grid" id="computeGrid"></div>
         </section>
       </aside>
+
+      <section class="settings-page" id="modelSettingsPage" hidden>
+        <div class="settings-shell">
+          <header class="settings-header">
+            <div>
+              <div class="section-title">Runtime</div>
+              <h1>Model settings</h1>
+            </div>
+            <span class="pill" id="modelSettingsSource">environment</span>
+          </header>
+
+          <form class="settings-form" id="modelSettingsForm">
+            <section class="settings-section">
+              <div class="settings-section-head">
+                <h2>Connection</h2>
+                <span class="settings-status" id="modelConnectionStatus">Not tested</span>
+              </div>
+              <div class="settings-grid">
+                <label class="settings-field">
+                  <span>Provider</span>
+                  <select id="modelProviderInput" name="provider">
+                    <option value="openai_compatible">OpenAI compatible</option>
+                    <option value="anthropic">Anthropic</option>
+                  </select>
+                </label>
+                <label class="settings-field">
+                  <span>Base URL</span>
+                  <input id="modelBaseUrlInput" name="base_url" type="url" required autocomplete="url" />
+                </label>
+                <label class="settings-field">
+                  <span>Model</span>
+                  <input id="modelNameInput" name="model_name" required autocomplete="off" />
+                </label>
+                <label class="settings-field">
+                  <span>API key</span>
+                  <input id="modelApiKeyInput" type="password" name="api_key" autocomplete="new-password" />
+                </label>
+              </div>
+            </section>
+
+            <section class="settings-section">
+              <div class="settings-section-head"><h2>Generation</h2></div>
+              <div class="settings-grid">
+                <label class="settings-field">
+                  <span>Temperature</span>
+                  <input id="modelTemperatureInput" type="number" min="0" max="2" step="0.05" required />
+                </label>
+                <label class="settings-field">
+                  <span>Request timeout (seconds)</span>
+                  <input id="modelTimeoutInput" type="number" min="1" max="7200" step="1" required />
+                </label>
+                <label class="settings-field">
+                  <span>Chat-template thinking</span>
+                  <select id="modelChatThinkingInput">
+                    <option value="">Provider default</option>
+                    <option value="true">Enabled</option>
+                    <option value="false">Disabled</option>
+                  </select>
+                </label>
+                <label class="settings-field">
+                  <span>MIMO thinking</span>
+                  <select id="modelMimoThinkingInput">
+                    <option value="">Provider default</option>
+                    <option value="enabled">Enabled</option>
+                    <option value="disabled">Disabled</option>
+                  </select>
+                </label>
+              </div>
+            </section>
+
+            <div class="settings-feedback" id="modelSettingsFeedback" role="status" aria-live="polite"></div>
+            <div class="settings-actions">
+              <button class="icon-button danger-action" id="resetModelSettingsButton" type="button">Reset to environment</button>
+              <div>
+                <button class="icon-button" id="testModelButton" type="button">Test connection</button>
+                <button class="send" id="saveModelSettingsButton" type="submit">Save settings</button>
+              </div>
+            </div>
+          </form>
+        </div>
+      </section>
     </main>
     <script src="/assets/app.js"></script>
   </body>
