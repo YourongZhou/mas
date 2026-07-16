@@ -10,8 +10,15 @@ def build_llm(config: AgentConfig) -> ChatOpenAI:
     extra: dict = {
         "request_timeout": config.request_timeout,
     }
+    extra_body: dict = {}
     if config.mimo_thinking_type in {"enabled", "disabled"}:
-        extra["extra_body"] = {"thinking": {"type": config.mimo_thinking_type}}
+        extra_body["thinking"] = {"type": config.mimo_thinking_type}
+    if config.chat_template_enable_thinking is not None:
+        extra_body["chat_template_kwargs"] = {
+            "enable_thinking": config.chat_template_enable_thinking,
+        }
+    if extra_body:
+        extra["extra_body"] = extra_body
     if (config.base_url or "").startswith("http"):
         timeout = httpx.Timeout(config.request_timeout, connect=min(60.0, config.request_timeout))
         extra["http_client"] = httpx.Client(timeout=timeout, trust_env=False)
@@ -29,6 +36,11 @@ def build_llm(config: AgentConfig) -> ChatOpenAI:
 
 def runtime_summary(config: AgentConfig) -> str:
     thinking = config.mimo_thinking_type or "(not set)"
+    chat_template_thinking = (
+        "(not set)"
+        if config.chat_template_enable_thinking is None
+        else str(config.chat_template_enable_thinking)
+    )
     return (
         "LLM RUNTIME SUMMARY\n"
         f"model={config.model_name}\n"
@@ -36,6 +48,6 @@ def runtime_summary(config: AgentConfig) -> str:
         f"api_key={config.mask_api_key()}\n"
         f"temperature={config.temperature}\n"
         f"request_timeout={config.request_timeout}\n"
-        f"mimo_thinking_type={thinking}"
+        f"mimo_thinking_type={thinking}\n"
+        f"chat_template_enable_thinking={chat_template_thinking}"
     )
-

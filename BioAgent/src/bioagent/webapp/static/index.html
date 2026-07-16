@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BioAgent Workbench</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <nav class="rail" aria-label="Global navigation">
+        <div class="logo" title="BioAgent"></div>
+        <button class="rail-button active" title="Projects" aria-current="page">P</button>
+        <button class="rail-button" title="Resources (coming soon)" disabled>R</button>
+        <button class="rail-button" title="Skills (coming soon)" disabled>S</button>
+        <button class="rail-button" title="History (coming soon)" disabled>H</button>
+        <div class="rail-spacer"></div>
+        <button class="rail-button" title="Settings (coming soon)" disabled>G</button>
+      </nav>
+
+      <header class="topbar">
+        <div class="topbar-title">
+          <div class="crumbs">BioAgent / <strong id="taskTitle">New task</strong></div>
+          <div class="subtle" id="runtimeLine">Local single-agent workbench</div>
+        </div>
+        <div class="top-actions">
+          <button class="tool-pill idle" id="currentToolPill" type="button">Tool: idle</button>
+          <span class="pill" id="statusPill">idle</span>
+          <button class="icon-button" id="refreshButton">Refresh</button>
+        </div>
+      </header>
+
+      <aside class="sidebar">
+        <div class="project-title">
+          <span>Quick Tasks</span>
+          <button class="icon-button" id="newTaskButton">New</button>
+        </div>
+        <div class="task-search-row">
+          <input class="search" id="taskSearch" placeholder="Search past runs" />
+          <button class="icon-button search-clear" id="clearTaskSearchButton" type="button" hidden>Clear</button>
+        </div>
+
+        <div class="section-title">Past Runs</div>
+        <div class="list" id="taskList">
+          <div class="empty">No runs yet.</div>
+        </div>
+
+        <div class="section-title">Project Files</div>
+        <div class="file-row" data-demo-path="mas_2/data/bmmc_b_cell.h5ad" role="button" tabindex="0" title="Use this demo file as the data path">
+          <div class="row-title">mas_2/data/bmmc_b_cell.h5ad</div>
+          <span>demo</span>
+          <div class="row-sub">Use as data path for the single-cell demo.</div>
+        </div>
+      </aside>
+
+      <section class="chat">
+        <div class="stream" id="messageStream">
+          <article class="message">
+            <div class="speaker">BioAgent</div>
+            <p>Start a task to watch model turns, tool calls, result files, and final outputs stream into this workspace.</p>
+          </article>
+        </div>
+        <button class="scroll-latest" id="scrollLatestButton" type="button">Jump to latest</button>
+
+        <form class="composer" id="taskForm">
+          <div class="composer-box">
+            <textarea id="taskInput" placeholder="Describe an analysis task...">使用 bmmc_b_cell.h5ad 做单细胞核心分析：读取数据、QC、标准化、HVG、PCA、neighbors、Leiden、UMAP、summary JSON、关键图和 processed h5ad。不要额外做 DE、marker gene、rank_genes_groups、轨迹或 PDF 报告。</textarea>
+            <div class="composer-tools">
+              <div class="tool-buttons" id="composerOptions">
+                <input id="dataPathInput" value="mas_2/data/bmmc_b_cell.h5ad" />
+                <label class="turns-label">turns <input id="maxTurnsInput" type="number" min="1" max="100" value="20" /></label>
+              </div>
+              <button class="send" id="sendButton" type="submit">Run</button>
+            </div>
+          </div>
+          <div class="error-line" id="errorLine"></div>
+        </form>
+      </section>
+
+      <section class="detail">
+        <div class="tabs" id="detailTabs" role="tablist" aria-label="Task details">
+          <button class="tab active" id="traceTab" role="tab" aria-controls="tracePane" aria-selected="true" tabindex="0" data-tab="trace">Trace</button>
+          <button class="tab" id="resultTab" role="tab" aria-controls="resultPane" aria-selected="false" tabindex="-1" data-tab="result">Result</button>
+          <button class="tab" id="fileTab" role="tab" aria-controls="filePane" aria-selected="false" tabindex="-1" data-tab="file">File</button>
+        </div>
+        <div class="detail-body" id="detailBody">
+          <section class="detail-pane active" id="tracePane" role="tabpanel" aria-labelledby="traceTab">
+            <div class="detail-header">
+              <div>
+                <h2 id="traceTitle">No tool selected</h2>
+                <div class="meta" id="traceMeta">Click a trace row to inspect tool input and output.</div>
+              </div>
+            </div>
+            <div class="trace-workbench" id="traceWorkbench">
+              <section class="trace-browser" aria-label="Tool calls">
+                <div class="group-head"><span>Tool calls</span><span class="pill" id="traceListCount">0</span></div>
+                <div class="trace-list" id="traceList"><div class="empty">Tool calls appear as the run progresses.</div></div>
+              </section>
+              <div class="trace-inspector">
+                <section class="group">
+                  <div class="group-head"><span>Input</span><button class="icon-button" data-copy="traceInput">Copy</button></div>
+                  <pre id="traceInput">{}</pre>
+                </section>
+                <section class="group">
+                  <div class="group-head"><span>Output</span><button class="icon-button" data-copy="traceOutput">Copy</button></div>
+                  <pre id="traceOutput">{}</pre>
+                </section>
+                <section class="trace-plan">
+                  <div class="group-head"><span>Plan</span><span class="pill" id="tracePlanCount">0</span></div>
+                  <div id="tracePlanList"><div class="empty">Plan updates appear as the run progresses.</div></div>
+                </section>
+              </div>
+            </div>
+          </section>
+
+          <section class="detail-pane" id="resultPane" role="tabpanel" aria-labelledby="resultTab" hidden>
+            <div class="detail-header">
+              <div>
+                <h2>Result visualization</h2>
+                <div class="meta">Images and summary JSON from the selected run.</div>
+              </div>
+            </div>
+            <article class="result-summary" id="resultSummary">
+              <div class="empty">Final summary appears here when the run finishes.</div>
+            </article>
+            <div class="viz-grid" id="resultVisuals">
+              <div class="empty">No result files yet.</div>
+            </div>
+            <section class="result-files">
+              <div class="group-head"><span>Output files</span></div>
+              <div class="output-file-list" id="resultFileList">
+                <div class="empty">No output files yet.</div>
+              </div>
+            </section>
+            <section class="result-compute">
+              <div class="group-head"><span>Run details</span></div>
+              <div class="compute-grid compact" id="resultComputeGrid"></div>
+            </section>
+          </section>
+
+          <section class="detail-pane" id="filePane" role="tabpanel" aria-labelledby="fileTab" hidden>
+            <div class="detail-header">
+              <div>
+                <h2 id="fileTitle">No file selected</h2>
+                <div class="meta" id="fileMeta">Open an output file to preview text/images or download binary results.</div>
+              </div>
+              <button class="icon-button disabled" id="copyFilePathButton" type="button" data-copy aria-disabled="true" disabled>Copy path</button>
+              <a class="icon-button" id="downloadLink" href="#" target="_blank" rel="noreferrer">Download</a>
+            </div>
+            <div class="file-preview" id="filePreview"></div>
+          </section>
+        </div>
+      </section>
+
+      <aside class="right">
+        <section class="side-panel">
+          <div class="panel-head"><h3>Plan</h3><span class="pill" id="planCount">0</span></div>
+          <div id="planList"><div class="empty">Plan updates appear as the run progresses.</div></div>
+        </section>
+
+        <section class="side-panel">
+          <div class="panel-head"><h3>Results</h3><button class="icon-button" id="filesRefreshButton">Refresh</button></div>
+          <div class="file-search-row">
+            <input class="search" id="fileSearch" placeholder="Filter files" />
+            <button class="icon-button search-clear" id="clearFileSearchButton" type="button" hidden>Clear</button>
+          </div>
+          <div class="file-tree" id="fileTree"><div class="empty">No output files yet.</div></div>
+        </section>
+
+        <section class="side-panel">
+          <div class="panel-head"><h3>Compute</h3><span class="pill" id="computeState">idle</span></div>
+          <div class="compute-grid" id="computeGrid"></div>
+        </section>
+      </aside>
+    </main>
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

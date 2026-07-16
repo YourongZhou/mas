@@ -32,7 +32,9 @@ def resolve_allowed_path(config: AgentConfig, run_dir: Path, raw_path: str) -> P
 def resolve_data_path(config: AgentConfig, run_dir: Path, raw_path: str) -> Path:
     candidates: list[Path] = []
     p = Path(raw_path)
-    if p.is_absolute():
+    if p.is_absolute() and len(p.parts) >= 2 and p.parts[1] == "repo":
+        candidates.append(config.repo_root.joinpath(*p.parts[2:]))
+    elif p.is_absolute():
         candidates.append(p)
     else:
         candidates.extend(
@@ -58,4 +60,3 @@ def to_repo_mount_path(config: AgentConfig, host_path: Path) -> str:
     repo_root = config.repo_root.resolve()
     rel = resolved.relative_to(repo_root)
     return "/repo/" + rel.as_posix()
-

@@ -30,15 +30,16 @@ class TimedBlock:
 
 
 class RunLogger:
-    def __init__(self, logs_dir: Path, *, run_id: str | None = None) -> None:
+    def __init__(self, logs_dir: Path, *, run_id: str | None = None, append: bool = False) -> None:
         self.run_id = run_id or f"run_{now_stamp()}"
         self.path = logs_dir / f"{self.run_id}.log"
+        self.append = append
         self._handle = None
 
     def __enter__(self) -> "RunLogger":
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._handle = self.path.open("w", encoding="utf-8-sig")
-        self.log(f"RUN START id={self.run_id}")
+        self._handle = self.path.open("a" if self.append else "w", encoding="utf-8-sig")
+        self.log(f"{'RUN RESUME' if self.append else 'RUN START'} id={self.run_id}")
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
@@ -105,4 +106,3 @@ class TeeStdout:
 
     def flush(self) -> None:
         self.original.flush()
-
