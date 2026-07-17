@@ -79,18 +79,31 @@ class DockerRunner:
         )
         return result.returncode == 0
 
-    def _run(self, command: list[str], timeout_s: int) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self,
+        command: list[str],
+        timeout_s: int,
+        *,
+        cidfile: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         self.logger.progress("Docker 命令启动", f"timeout={timeout_s}s command={' '.join(command)}")
         started = time.perf_counter()
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_s,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_s,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            self._remove_timed_out_container(cidfile)
+            raise
+        finally:
+            if cidfile is not None:
+                cidfile.unlink(missing_ok=True)
         elapsed = time.perf_counter() - started
         self.logger.progress(
             "Docker 命令结束",
@@ -100,13 +113,30 @@ class DockerRunner:
             self.logger.error_reason(_summarize_process_error(result.stderr or "", result.stdout or ""))
         return result
 
+    def _remove_timed_out_container(self, cidfile: Path | None) -> None:
+        if cidfile is None or not cidfile.is_file():
+            return
+        container_id = cidfile.read_text(encoding="utf-8").strip()
+        if not container_id:
+            return
+        self.logger.progress("清理超时 Docker 容器", f"container_id={container_id}")
+        subprocess.run(
+            ["docker", "rm", "-f", container_id],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+
     def execute_python(
         self,
         code: str,
         *,
         env_profile: str = "py-general-v1",
         requirements: str = "",
-        timeout_s: int = 900,
+        timeout_s: int = 1800,
     ) -> ExecutionResult:
         script = self.scripts_dir / "code.py"
         script.write_text(code, encoding="utf-8")
@@ -146,10 +176,14 @@ class DockerRunner:
             inner += "python -m pip install -r /work/scripts/requirements.txt\n"
         inner += "python /work/scripts/code.py\n"
 
+        cidfile = self.run_dir / ".docker-python.cid"
+        cidfile.unlink(missing_ok=True)
         command = [
             "docker",
             "run",
             "--rm",
+            "--cidfile",
+            str(cidfile),
             "-v",
             f"{self.config.repo_root}:/repo:ro",
             "-v",
@@ -162,7 +196,7 @@ class DockerRunner:
             inner,
         ]
         try:
-            result = self._run(command, timeout_s)
+            result = self._run(command, timeout_s, cidfile=cidfile)
             return ExecutionResult(
                 result.returncode == 0,
                 "python",
@@ -177,14 +211,16 @@ class DockerRunner:
             )
         except subprocess.TimeoutExpired as exc:
             self.logger.error_reason(f"Docker Python 执行超过 timeout={timeout_s}s。")
-            return ExecutionResult(False, "python", env_profile, image, str(self.run_dir), str(script), -1, exc.stdout or "", (exc.stderr or "") + "\nTimed out", command)
+            stdout = _decode_process_output(exc.stdout)
+            stderr = _decode_process_output(exc.stderr)
+            return ExecutionResult(False, "python", env_profile, image, str(self.run_dir), str(script), -1, stdout, stderr + "\nTimed out", command)
 
     def execute_r(
         self,
         code: str,
         *,
         env_profile: str = "r-bioc-v1",
-        timeout_s: int = 900,
+        timeout_s: int = 1800,
     ) -> ExecutionResult:
         script = self.scripts_dir / "code.R"
         script.write_text(code, encoding="utf-8")
@@ -214,10 +250,14 @@ class DockerRunner:
                 [],
             )
 
+        cidfile = self.run_dir / ".docker-r.cid"
+        cidfile.unlink(missing_ok=True)
         command = [
             "docker",
             "run",
             "--rm",
+            "--cidfile",
+            str(cidfile),
             "-v",
             f"{self.config.repo_root}:/repo:ro",
             "-v",
@@ -229,7 +269,7 @@ class DockerRunner:
             "/work/scripts/code.R",
         ]
         try:
-            result = self._run(command, timeout_s)
+            result = self._run(command, timeout_s, cidfile=cidfile)
             return ExecutionResult(
                 result.returncode == 0,
                 "r",
@@ -244,7 +284,17 @@ class DockerRunner:
             )
         except subprocess.TimeoutExpired as exc:
             self.logger.error_reason(f"Docker R 执行超过 timeout={timeout_s}s。")
-            return ExecutionResult(False, "r", env_profile, image, str(self.run_dir), str(script), -1, exc.stdout or "", (exc.stderr or "") + "\nTimed out", command)
+            stdout = _decode_process_output(exc.stdout)
+            stderr = _decode_process_output(exc.stderr)
+            return ExecutionResult(False, "r", env_profile, image, str(self.run_dir), str(script), -1, stdout, stderr + "\nTimed out", command)
+
+
+def _decode_process_output(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
 
 def _summarize_process_error(stderr: str, stdout: str) -> str:
@@ -283,4 +333,3 @@ def _looks_like_exception_line(line: str) -> bool:
             )
         )
     )
-

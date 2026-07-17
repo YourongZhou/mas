@@ -27,7 +27,14 @@ def list_files_impl(config: AgentConfig, run_dir: Path, path: str = ".", recursi
     return "\n".join(lines)
 
 
-def read_file_impl(config: AgentConfig, run_dir: Path, path: str, line_offset: int = 1, max_lines: int = 200) -> str:
+def read_file_impl(
+    config: AgentConfig,
+    run_dir: Path,
+    path: str,
+    line_offset: int = 1,
+    max_lines: int = 200,
+    max_chars: int = 3000,
+) -> str:
     resolved = resolve_allowed_path(config, run_dir, path)
     if not resolved.is_file():
         return f"File not found: {resolved}"
@@ -41,8 +48,26 @@ def read_file_impl(config: AgentConfig, run_dir: Path, path: str, line_offset: i
     lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
     start = max(0, line_offset - 1)
     subset = lines[start : start + max_lines]
-    body = "\n".join(f"{idx} | {line}" for idx, line in enumerate(subset, start=start + 1))
+    rendered_lines = [f"{idx} | {line}" for idx, line in enumerate(subset, start=start + 1)]
+    body = "\n".join(rendered_lines)
+    next_line = start + len(rendered_lines) + 1
     suffix = "\n[truncated]" if start + max_lines < len(lines) else ""
+    if max_chars > 0 and len(body) > max_chars:
+        clipped_lines: list[str] = []
+        char_count = 0
+        for line in rendered_lines:
+            line_len = len(line) + (1 if clipped_lines else 0)
+            if clipped_lines and char_count + line_len > max_chars:
+                break
+            if not clipped_lines and len(line) > max_chars:
+                clipped_lines.append(line[:max_chars])
+                char_count = max_chars
+                break
+            clipped_lines.append(line)
+            char_count += line_len
+        body = "\n".join(clipped_lines)
+        next_line = start + len(clipped_lines) + 1
+        suffix = f"\n[truncated: continue with line_offset={next_line}]"
     return f"File: {resolved}\n{body}{suffix}"
 
 
@@ -79,4 +104,3 @@ def grep_text_impl(
     text = result.stdout if result.returncode in (0, 1) else (result.stderr or result.stdout)
     lines = text.splitlines()
     return "\n".join(lines[:max_matches]) or "(no matches)"
-

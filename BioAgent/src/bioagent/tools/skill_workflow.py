@@ -4,6 +4,7 @@ import json
 import re
 import time
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -85,6 +86,11 @@ def run_skill_workflow_impl(
         logger.error_reason(f"读取 Skill 失败：{skill['error']}")
         return {"ok": False, "error": skill["error"], "skill_id": skill_id}
 
+    preflight_request = _preflight_user_input_request(skill=skill, skill_id=skill_id, task=task, data_path=data_path)
+    if preflight_request:
+        logger.progress("Skill 工作流暂停等待用户输入", preflight_request["question"])
+        return preflight_request
+
     metadata = skill.get("metadata") if isinstance(skill.get("metadata"), dict) else {}
     runtime = (runtime or str(metadata.get("runtime") or "")).strip().lower()
     env_profile = (env_profile or str(metadata.get("env_profile") or "")).strip()
@@ -105,6 +111,9 @@ def run_skill_workflow_impl(
     if host_data_path:
         logger.progress("输入数据", f"host={host_data_path} container={container_data_path}")
     logger.progress("输出目录", f"container=/work/outputs host={run_dir / 'outputs'}")
+    required_outputs = _required_output_paths_from_task(task)
+    if required_outputs:
+        logger.progress("要求输出文件", ", ".join(required_outputs))
 
     docker = DockerRunner(config=config, logger=logger, run_dir=run_dir)
     attempts: list[dict[str, Any]] = []
@@ -152,6 +161,38 @@ def run_skill_workflow_impl(
         if not code:
             return {"ok": False, "error": "Code generator returned empty code.", "attempts": attempts}
 
+        if _looks_like_malformed_generator_json(code):
+            error_reason = "Code generator returned malformed JSON-like content instead of executable code."
+            result = {
+                "ok": False,
+                "runtime": runtime,
+                "env_profile": env_profile,
+                "script_path": "",
+                "exit_code": 2,
+                "stdout": "",
+                "stderr": error_reason,
+                "error_reason": error_reason,
+            }
+            attempt_record = {
+                "attempt": attempt,
+                "ok": False,
+                "runtime": runtime,
+                "env_profile": env_profile,
+                "script_path": "",
+                "exit_code": 2,
+                "error_reason": error_reason,
+                "stdout_tail": "",
+                "stderr_tail": error_reason,
+                "rationale": generated.get("rationale", ""),
+            }
+            attempts.append(attempt_record)
+            logger.preview(f"SKILL_ATTEMPT_RESULT attempt={attempt}", json.dumps(attempt_record, ensure_ascii=False, indent=2), max_chars=8000)
+            previous_code = code[-4000:]
+            previous_result = result
+            logger.progress("本次生成无效", f"attempt={attempt} will_retry={attempt < max(1, max_attempts)}")
+            logger.error_reason(error_reason)
+            continue
+
         generated_runtime = str(generated.get("runtime") or runtime).strip().lower()
         generated_profile = str(generated.get("env_profile") or env_profile).strip()
         runtime, env_profile = _resolve_runtime_and_profile(config, generated_runtime, generated_profile)
@@ -167,6 +208,15 @@ def run_skill_workflow_impl(
                 requirements=str(generated.get("requirements") or ""),
                 timeout_s=timeout_s,
             ).to_dict()
+
+        missing_outputs = _missing_required_outputs(run_dir, required_outputs) if result.get("ok") else []
+        if missing_outputs:
+            message = "Missing required output files after successful exit: " + ", ".join(missing_outputs)
+            result = dict(result)
+            result["ok"] = False
+            result["error_reason"] = message
+            result["stderr"] = (str(result.get("stderr") or "").rstrip() + "\n" + message).strip()
+            logger.error_reason(message)
 
         error_reason = str(result.get("error_reason") or _extract_error_reason(result.get("stderr"), result.get("stdout")))
         attempt_record = {
@@ -431,6 +481,13 @@ def _looks_like_exception_line(line: str) -> bool:
     )
 
 
+def _looks_like_malformed_generator_json(code: str) -> bool:
+    stripped = code.lstrip()
+    if not stripped.startswith("{"):
+        return False
+    return '"code"' in stripped[:2000] or "'code'" in stripped[:2000]
+
+
 def _build_generation_prompt(
     *,
     config: AgentConfig,
@@ -465,6 +522,7 @@ def _build_generation_prompt(
         "repo_mount": "/repo",
         "work_mount": "/work",
         "output_dir": "/work/outputs",
+        "required_output_paths": _required_output_paths_from_task(task),
         "run_dir_host": str(run_dir),
         "skill_metadata": skill.get("metadata", {}),
         "context_policy": {
@@ -472,7 +530,7 @@ def _build_generation_prompt(
             "script_previews": "Only selected scripts include signatures/previews. All script paths remain listed.",
             "reference_previews": "Only selected references include previews. Load behavior should be inferred conservatively from Skill instructions.",
         },
-        "skill_body": skill_body[:18000],
+        "skill_body": skill_body[:10000],
         "available_script_paths": _relative_files(skill_path / "scripts", skill_path),
         "available_reference_paths": _relative_files(skill_path / "references", skill_path),
         "selected_script_context": scripts,
@@ -480,12 +538,64 @@ def _build_generation_prompt(
     }
     if previous_result is not None:
         payload["repair_context"] = {
-            "previous_code": previous_code[-20000:],
+            "previous_code": previous_code[-8000:],
+            "error_reason": _extract_error_reason(previous_result.get("stderr"), previous_result.get("stdout")),
             "exit_code": previous_result.get("exit_code"),
-            "stdout_tail": str(previous_result.get("stdout") or "")[-5000:],
-            "stderr_tail": str(previous_result.get("stderr") or "")[-8000:],
+            "stdout_tail": str(previous_result.get("stdout") or "")[-2000:],
+            "stderr_tail": str(previous_result.get("stderr") or "")[-3000:],
         }
     return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+
+
+def _preflight_user_input_request(
+    *,
+    skill: dict[str, Any],
+    skill_id: str,
+    task: str,
+    data_path: str,
+) -> dict[str, Any] | None:
+    if data_path.strip():
+        return None
+    lowered_task = task.lower()
+    if any(token in lowered_task for token in ("example", "demo", "示例", "演示")):
+        return None
+
+    body = str(skill.get("body_preview") or "")
+    body_lower = body.lower()
+    requires_first_question = "always ask question 1 first" in body_lower or "ask this first" in body_lower
+    asks_for_input_files = "input files" in body_lower or "输入文件" in body_lower
+    if not (requires_first_question and asks_for_input_files):
+        return None
+
+    question = _extract_first_clarification_question(body) or (
+        "Which input data file should this workflow analyze? "
+        "Please provide a repo-relative or absolute path, or say that you want to use the example/demo data."
+    )
+    return {
+        "status": "needs_user_input",
+        "skill_id": skill_id,
+        "question": question,
+        "reason": "The selected workflow skill explicitly requires the input data choice before execution.",
+        "required_fields": ["data_path"],
+        "resume_hint": "Use the user's answer as data_path if it is a path; if they request demo/example data, rerun with the skill's documented example defaults.",
+    }
+
+
+def _extract_first_clarification_question(body: str) -> str:
+    lines = [line.strip(" -*\t") for line in body.splitlines()]
+    in_questions = False
+    for line in lines:
+        lowered = line.lower()
+        if "clarification questions" in lowered:
+            in_questions = True
+            continue
+        if not in_questions:
+            continue
+        if line.endswith("?") or line.endswith("？"):
+            return line
+        if "do you have specific" in lowered and "data" in lowered:
+            return line.rstrip(".") + "?"
+    return ""
 
 
 def _build_code_generation_prompt(
@@ -531,7 +641,7 @@ def _build_code_generation_prompt(
     return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
 
 
-def _script_inventory(skill_path: Path, *, query: str, skill_body: str, max_items: int = 12) -> list[dict[str, str]]:
+def _script_inventory(skill_path: Path, *, query: str, skill_body: str, max_items: int = 10) -> list[dict[str, str]]:
     scripts_dir = skill_path / "scripts"
     if not scripts_dir.is_dir():
         return []
@@ -556,7 +666,7 @@ def _script_inventory(skill_path: Path, *, query: str, skill_body: str, max_item
     ]
 
 
-def _reference_inventory(skill_path: Path, *, query: str, skill_body: str, max_items: int = 4) -> list[dict[str, str]]:
+def _reference_inventory(skill_path: Path, *, query: str, skill_body: str, max_items: int = 2) -> list[dict[str, str]]:
     references_dir = skill_path / "references"
     if not references_dir.is_dir():
         return []
@@ -575,7 +685,7 @@ def _reference_inventory(skill_path: Path, *, query: str, skill_body: str, max_i
     return [
         {
             "path": str(path.relative_to(skill_path)).replace("\\", "/"),
-            "preview": body[:1800],
+            "preview": body[:1200],
             "selection_score": str(score),
         }
         for score, path, body in selected
@@ -590,10 +700,33 @@ def _relative_files(root: Path, base: Path) -> list[str]:
 
 def _context_query(task: str, previous_result: dict[str, Any] | None) -> str:
     parts = [task]
+    parts.extend(_context_query_expansions(task))
     if previous_result is not None:
         parts.append(str(previous_result.get("stderr") or "")[-2000:])
         parts.append(str(previous_result.get("stdout") or "")[-1200:])
     return "\n".join(parts)
+
+
+def _context_query_expansions(task: str) -> list[str]:
+    lowered = task.lower()
+    expansions: list[str] = []
+    if any(token in lowered for token in ("qc", "quality", "质量")):
+        expansions.append("qc quality metrics filter cells mitochondrial ribosomal violin")
+    if any(token in lowered for token in ("hvg", "variable", "高变")):
+        expansions.append("hvg highly variable genes find_variable_genes")
+    if any(token in lowered for token in ("normalize", "normalization", "标准化")):
+        expansions.append("normalize normalization log1p normalize_data")
+    if any(token in lowered for token in ("pca", "principal")):
+        expansions.append("pca scale scale_and_pca principal components")
+    if any(token in lowered for token in ("neighbor", "neighbors", "邻居", "leiden", "cluster", "聚类")):
+        expansions.append("neighbors leiden cluster cluster_cells")
+    if any(token in lowered for token in ("umap", "降维")):
+        expansions.append("umap dimreduction run_umap plot_dimreduction")
+    if any(token in lowered for token in ("plot", "figure", "visual", "图", "可视化")):
+        expansions.append("plot figure visualization violin scatter umap plot_qc plot_dimreduction")
+    if any(token in lowered for token in ("summary", "json", "processed", "h5ad", "输出", "export")):
+        expansions.append("summary json processed h5ad output export_results")
+    return expansions
 
 
 def _context_score(path: Path, text: str, query: str) -> int:
@@ -632,17 +765,95 @@ def _query_tokens(text: str) -> list[str]:
     return tokens[:80]
 
 
-def _compact_source_preview(text: str) -> str:
+def _compact_source_preview(text: str, max_chars: int = 2500) -> str:
     lines = text.splitlines()
     selected: list[str] = []
-    for line in lines:
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         stripped = line.strip()
-        if stripped.startswith(("def ", "class ", "import ", "from ")):
+        if stripped.startswith(("import ", "from ")):
             selected.append(line)
+            i += 1
+            continue
+        if stripped.startswith(("def ", "class ")):
+            block: list[str] = [line]
+            paren_balance = line.count("(") - line.count(")")
+            i += 1
+            while i < len(lines) and paren_balance > 0:
+                block.append(lines[i])
+                paren_balance += lines[i].count("(") - lines[i].count(")")
+                i += 1
+            while i < len(lines) and len(block) < 18:
+                next_stripped = lines[i].strip()
+                if not next_stripped:
+                    block.append(lines[i])
+                    i += 1
+                    continue
+                if next_stripped.startswith(('"""', "'''")):
+                    block.append(lines[i])
+                    quote = next_stripped[:3]
+                    i += 1
+                    while i < len(lines) and quote not in lines[i] and len(block) < 18:
+                        block.append(lines[i])
+                        i += 1
+                    if i < len(lines) and len(block) < 18:
+                        block.append(lines[i])
+                        i += 1
+                break
+            selected.extend(block)
+            continue
+        i += 1
     preview = "\n".join(selected[:120])
     if not preview:
         preview = "\n".join(lines[:80])
-    return preview[:5000]
+    return preview[:max_chars]
+
+
+def _required_output_paths_from_task(task: str) -> list[str]:
+    seen: set[str] = set()
+    paths: list[str] = []
+    for match in re.findall(r"/work/outputs/[^\s`'\"<>\])},;]+", task):
+        path = match.rstrip(".:")
+        if path in {"/work/outputs", "/work/outputs/"}:
+            continue
+        rel = path.removeprefix("/work/outputs/").strip("/")
+        if not rel or _unsafe_relative_output_path(rel):
+            continue
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
+    if "/work/outputs" in task:
+        output_section = task.split("/work/outputs", 1)[1]
+        for filename in re.findall(
+            r"(?<![/\w.-])([A-Za-z0-9][A-Za-z0-9_.-]*\.(?:h5ad|h5|json|png|svg|pdf|csv|tsv|txt|xlsx|rds|mtx))(?=$|[\s,;:.)\]}。；，、])",
+            output_section,
+            flags=re.I,
+        ):
+            path = f"/work/outputs/{filename.rstrip('.:')}"
+            rel = path.removeprefix("/work/outputs/").strip("/")
+            if not rel or _unsafe_relative_output_path(rel):
+                continue
+            if path not in seen:
+                seen.add(path)
+                paths.append(path)
+    return paths
+
+
+def _missing_required_outputs(run_dir: Path, required_outputs: list[str]) -> list[str]:
+    missing: list[str] = []
+    for output_path in required_outputs:
+        rel = output_path.removeprefix("/work/outputs/").strip("/")
+        if not rel or _unsafe_relative_output_path(rel):
+            continue
+        host_path = run_dir / "outputs" / rel
+        if not host_path.exists() or (host_path.is_file() and host_path.stat().st_size == 0):
+            missing.append(output_path)
+    return missing
+
+
+def _unsafe_relative_output_path(path: str) -> bool:
+    return PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts
 
 
 def _invoke_code_generator(config: AgentConfig, prompt: str, *, system_prompt: str = GENERATOR_SYSTEM_PROMPT) -> dict[str, Any]:
@@ -679,12 +890,36 @@ def _parse_json_object(text: str) -> dict[str, Any]:
         pass
     match = re.search(r"\{.*\}", text, flags=re.S)
     if not match:
-        return {}
+        return _parse_json_like_fields(text)
     try:
         parsed = json.loads(match.group(0))
     except Exception:
-        return {}
+        return _parse_json_like_fields(text)
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _parse_json_like_fields(text: str) -> dict[str, Any]:
+    code = _extract_json_string_field(text, "code")
+    if not code:
+        return {}
+    return {
+        "runtime": _extract_json_string_field(text, "runtime") or "python",
+        "env_profile": _extract_json_string_field(text, "env_profile"),
+        "code": code,
+        "requirements": _extract_json_string_field(text, "requirements"),
+        "rationale": _extract_json_string_field(text, "rationale") or "Recovered code from a malformed JSON-like generator response.",
+    }
+
+
+def _extract_json_string_field(text: str, field: str) -> str:
+    match = re.search(rf'"{re.escape(field)}"\s*:\s*"((?:\\.|[^"\\])*)"', text, flags=re.S)
+    if not match:
+        return ""
+    try:
+        value = json.loads('"' + match.group(1) + '"')
+    except Exception:
+        return ""
+    return value if isinstance(value, str) else ""
 
 
 def _extract_fenced_code(text: str) -> str:

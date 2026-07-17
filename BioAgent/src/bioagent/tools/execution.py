@@ -14,7 +14,7 @@ def execute_python_impl(
     code: str,
     env_profile: str = "py-general-v1",
     requirements: str = "",
-    timeout_s: int = 900,
+    timeout_s: int = 1800,
 ) -> dict:
     runner = DockerRunner(config=config, logger=logger, run_dir=run_dir)
     return runner.execute_python(
@@ -31,8 +31,7 @@ def execute_r_impl(
     run_dir: Path,
     code: str,
     env_profile: str = "r-bioc-v1",
-    timeout_s: int = 900,
+    timeout_s: int = 1800,
 ) -> dict:
     runner = DockerRunner(config=config, logger=logger, run_dir=run_dir)
     return runner.execute_r(code, env_profile=env_profile, timeout_s=timeout_s).to_dict()
-
