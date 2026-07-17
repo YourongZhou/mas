@@ -48,6 +48,10 @@ class ArtifactStore:
             "sha256": digest,
             "facts": facts,
         }
+        provenance = _execution_provenance(self.run_dirs, target)
+        if provenance:
+            record["artifact_id"] = provenance.get("artifact_id")
+            record["provenance"] = provenance
         evidence_id = "evidence_" + hashlib.sha256(
             json.dumps(record, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()[:12]
@@ -283,6 +287,21 @@ def _unsupported_numbers(summary: str, evidence: list[dict[str, Any]]) -> list[s
         return []
     evidence_text = json.dumps(evidence, ensure_ascii=False, default=str)
     return sorted(value for value in claims if value not in evidence_text)
+
+
+def _execution_provenance(run_dirs: list[Path], target: Path) -> dict[str, Any]:
+    resolved = target.resolve()
+    for run_dir in run_dirs:
+        manifest_path = run_dir / "state" / "execution_manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        artifacts = manifest.get("artifacts") if isinstance(manifest, dict) else None
+        for artifact in artifacts.values() if isinstance(artifacts, dict) else []:
+            if isinstance(artifact, dict) and Path(str(artifact.get("path") or "")).resolve() == resolved:
+                return dict(artifact)
+    return {}
 
 
 def _artifact_run_dirs(

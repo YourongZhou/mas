@@ -90,6 +90,7 @@ BioAgent/
       webapp/
         app.py              FastAPI 本地 Workbench 后端与静态文件服务
         state.py            Web Session、run、消息调度、事件映射和结果文件树
+        protocol.py         稳定 event/session/run/turn/tool-call envelope
         static/             无构建依赖的前端页面
       skills/
         registry.py         扫描/读取 mas_2 workflow skills 与 Docker catalog
@@ -100,6 +101,7 @@ BioAgent/
         jobs.py             持久异步 Docker job 生命周期
         artifacts.py        通用产物检查、evidence 和 grounded finish
         attempts.py         跨 pause/resume 的全局执行预算
+        planning.py         持久语义 Plan、步骤状态和审批交互
         workflow.py         workflow skill / image catalog 工具
         execution.py        Python/R 代码执行工具
         skill_workflow.py   Skill-driven 代码生成、执行与修复闭环
@@ -140,6 +142,14 @@ Turn 3+:
 
 ## 5. 当前可用 Tools
 
+### Planning 与用户交互
+
+| Tool | 作用 |
+|---|---|
+| `propose_plan` | 为复杂任务创建带目标、依赖和成功标准的持久语义计划；需要时阻塞等待审批 |
+| `update_plan` | 按稳定 step ID 更新步骤状态、证据说明或整个计划状态 |
+| `request_user_input` | 用 question ID、选项和输入类型请求关键澄清，保存 checkpoint 后原链路 resume |
+
 ### 文件与搜索
 
 | Tool | 作用 |
@@ -176,11 +186,16 @@ Turn 3+:
 | `inspect_artifact` | 检查表格、JSON、图片、gzip、H5AD 或文本并登记 evidence |
 | `finish_task` | 重新验证 evidence 和文件哈希后形成 grounded final answer |
 | `execute_python` / `execute_r` | 兼容旧调用的 inline 执行；完整分析不推荐使用 |
-| `request_user_input` | 缺少关键输入且不能安全默认时暂停 run，保存状态并等待用户回答后 resume |
 
 执行 attempt 记录在 `run_dir/state/execution_attempts.json`，不会因 pause/resume 或重新构建 Agent 而重置。`max_turns` 只限制会改变任务状态的模型决策；skill 阅读、上下文查询、脚本验证、job 轮询、日志读取、artifact 检查和最终验证不会消耗决策预算，因此长任务等待不会挤占正常分析轮次。
 
-Active job ID 位于每个 run 的 `state/job_state.json`；每个 job 的状态和日志位于 `run_dir/jobs/<job_id>/job.json`。同一 session 的后续 run 可以发现并继续查询之前 run 的 job 和产物，同时 session 内只允许一个运行中的 job，避免 Continue 后重复启动分析。最终 evidence 位于 `run_dir/state/artifact_evidence.json` 和 `final_verification.json`。
+Active job ID 位于每个 run 的 `state/job_state.json`；每个 job 的状态和日志位于 `run_dir/jobs/<job_id>/job.json`。同一 session 的后续 run 可以发现并继续查询之前 run 的 job 和产物，同时 session 内只允许一个运行中的 job，避免 Continue 后重复启动分析。
+
+Workbench 的 job watcher 会把新 job 的 terminal 状态写成内部 `job_callback` event。Agent 正在运行时，callback 在下一个安全边界作为 system observation 消费；Agent 已结束时，Session 自动创建 continuation。Callback 用持久状态去重，不伪装成用户消息。
+
+每次 `start_job` 会写 `run_dir/state/execution_manifest.json`，保存脚本哈希、Docker image/profile、tool call/event ID、job 状态和输出 artifact 的 ID/SHA256。`inspect_artifact` 会把这条 provenance 带入 evidence。最终 evidence 位于 `run_dir/state/artifact_evidence.json` 和 `final_verification.json`。
+
+Session SSE event 使用稳定 envelope：`eventId`、`sessionId`、`runId`、`turnId`、`parentEventId`、`toolCallId` 和 `createdAt`。Tool result 显式指向对应 tool call；排队用户消息记录何时及由哪个 turn 消费。
 
 ### Memory Harness
 
@@ -246,7 +261,9 @@ http://127.0.0.1:8013/
 | `GET /api/sessions` | 查看历史 Session 列表 |
 | `GET /api/sessions/{session_id}` | 获取 Session、当前 run 和消息 snapshot |
 | `POST /api/sessions/{session_id}/messages` | 追加消息；运行中作为 steering，暂停时只回答，结束后启动 follow-up run |
-| `POST /api/sessions/{session_id}/pause` | 请求暂停当前 run |
+| `POST /api/sessions/{session_id}/pause` | 只暂停 Agent 后续决策；不会取消异步 job |
+| `POST /api/sessions/{session_id}/interrupt` | 中断当前同步 Docker tool |
+| `POST /api/sessions/{session_id}/jobs/cancel` | 取消 active/指定异步 job，并验证容器已退出 |
 | `POST /api/sessions/{session_id}/resume` | 显式恢复已暂停的 run |
 | `GET /api/sessions/{session_id}/events` | Session SSE 实时事件流 |
 | `GET /api/settings/model` | 获取脱敏后的当前模型配置 |
@@ -284,6 +301,7 @@ result = resume_bio_agent(
 ```
 
 `resume_bio_agent()` 会恢复同一个 run 的消息历史、追加用户回答，并继续原来的单主 Agent loop。
+结构化回答会通过 `question_id` 绑定原阻塞工具。明确批准 Plan 时，Harness 会先把持久 Plan 状态切换为 `active`，再恢复模型循环。
 
 ### 生信任务路由
 

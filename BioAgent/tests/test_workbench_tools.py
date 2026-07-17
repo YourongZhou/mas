@@ -9,7 +9,7 @@ import pytest
 
 from bioagent.config import AgentConfig
 from bioagent.tools.artifacts import ArtifactStore
-from bioagent.tools.jobs import DockerJobManager
+from bioagent.tools.jobs import DockerJobManager, attach_job_provenance
 from bioagent.tools.registry import build_tools
 from bioagent.tools.workspace import edit_run_file_impl, write_run_file_impl
 
@@ -121,6 +121,15 @@ def test_async_job_is_persisted_and_can_be_polled_after_manager_rebuild(tmp_path
         script_path="scripts/analysis.py",
         env_profile="py-general-v1",
     )
+    attach_job_provenance(
+        [run_dir],
+        job_id=started["job_id"],
+        tool_call_id="toolcall_start_job",
+        event_id="event_start_job",
+    )
+    output = run_dir / "outputs" / "summary.json"
+    output.parent.mkdir(parents=True)
+    output.write_text('{"status": "complete"}\n', encoding="utf-8")
     rebuilt = DockerJobManager(config, logger=None, run_dir=run_dir)
     listed = rebuilt.list_jobs()
     polled = rebuilt.poll_job("")
@@ -133,8 +142,62 @@ def test_async_job_is_persisted_and_can_be_polled_after_manager_rebuild(tmp_path
     assert polled["status"] == "completed"
     assert polled["exit_code"] == 0
     assert polled["stdout_tail"] == "analysis complete\n"
+    assert polled["script_sha256"]
+    assert polled["artifacts"][0]["artifact_id"].startswith("artifact_")
+    assert polled["artifacts"][0]["created_by_job_id"] == started["job_id"]
+    assert polled["artifacts"][0]["created_by_tool_call_id"] == "toolcall_start_job"
+    assert polled["artifacts"][0]["created_by_event_id"] == "event_start_job"
+    assert polled["execution_manifest_path"].endswith("state/execution_manifest.json")
     assert (run_dir / "jobs" / started["job_id"] / "job.json").is_file()
+    evidence = ArtifactStore(run_dir, config=config).inspect(str(output))
+    assert evidence["provenance"]["created_by_job_id"] == started["job_id"]
+    assert evidence["provenance"]["script_sha256"] == polled["script_sha256"]
     assert any("/work/scripts/analysis.py" in part for part in calls[1])
+
+
+def test_stale_concurrent_poll_cannot_overwrite_completed_job_as_cancelled(tmp_path: Path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    run_dir = config.runs_dir / "run_poll_race"
+    job_id = "job_20260717_130000_abcdef"
+    job_dir = run_dir / "jobs" / job_id
+    job_dir.mkdir(parents=True)
+    metadata = {
+        "job_id": job_id,
+        "run_id": run_dir.name,
+        "run_dir": str(run_dir),
+        "container_id": "container-finished",
+        "status": "running",
+        "callback_state": "pending",
+    }
+    (job_dir / "job.json").write_text(json.dumps(metadata), encoding="utf-8")
+    (run_dir / "outputs").mkdir()
+    (run_dir / "outputs" / "summary.json").write_text('{"ok": true}', encoding="utf-8")
+    inspect_calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal inspect_calls
+        if command[:2] == ["docker", "inspect"]:
+            inspect_calls += 1
+            if inspect_calls == 1:
+                state = {"Status": "exited", "Running": False, "ExitCode": 0, "Error": ""}
+                return subprocess.CompletedProcess(command, 0, json.dumps(state), "")
+            return subprocess.CompletedProcess(command, 1, "", "Error: No such object")
+        if command[:2] == ["docker", "logs"]:
+            return subprocess.CompletedProcess(command, 0, "analysis complete\n", "")
+        if command[:3] == ["docker", "rm", "-f"]:
+            return subprocess.CompletedProcess(command, 0, "container-finished\n", "")
+        raise AssertionError(command)
+
+    monkeypatch.setattr("bioagent.tools.jobs.subprocess.run", fake_run)
+    manager = DockerJobManager(config, logger=None, run_dir=run_dir)
+
+    first = manager._poll_once(job_dir, dict(metadata))
+    second = manager._poll_once(job_dir, dict(metadata))
+
+    assert first["status"] == "completed"
+    assert second["status"] == "completed"
+    assert inspect_calls == 1
+    assert json.loads((job_dir / "job.json").read_text(encoding="utf-8"))["status"] == "completed"
 
 
 def test_job_manager_rejects_invented_ids_and_exposes_active_job(tmp_path: Path, monkeypatch) -> None:
@@ -176,6 +239,43 @@ def test_job_manager_rejects_invented_ids_and_exposes_active_job(tmp_path: Path,
     assert duplicate["status"] == "job_already_running"
     assert duplicate["active_job_id"] == started["job_id"]
     assert docker_runs == 1
+
+
+def test_cancel_job_verifies_that_the_container_is_gone(tmp_path: Path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    run_dir = config.runs_dir / "run_cancel_job"
+    job_id = "job_20260717_130000_abcdef"
+    job_dir = run_dir / "jobs" / job_id
+    job_dir.mkdir(parents=True)
+    (job_dir / "job.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "run_id": run_dir.name,
+                "run_dir": str(run_dir),
+                "container_id": "container-cancel",
+                "status": "running",
+                "callback_state": "pending",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_run(command, **kwargs):
+        if command[:3] == ["docker", "rm", "-f"]:
+            return subprocess.CompletedProcess(command, 0, "container-cancel\n", "")
+        if command[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(command, 1, "", "No such container")
+        raise AssertionError(command)
+
+    monkeypatch.setattr("bioagent.tools.jobs.subprocess.run", fake_run)
+    result = DockerJobManager(config, logger=None, run_dir=run_dir).cancel_job(job_id)
+
+    assert result["ok"] is True
+    assert result["status"] == "cancelled"
+    assert result["verified_exit"] is True
+    persisted = json.loads((job_dir / "job.json").read_text(encoding="utf-8"))
+    assert persisted["cancel_verified"] is True
 
 
 def test_job_and_artifacts_remain_accessible_from_a_follow_up_run(tmp_path: Path, monkeypatch) -> None:
@@ -288,4 +388,52 @@ def test_default_tools_expose_workspace_jobs_and_grounded_finish(tmp_path: Path)
         "cancel_job",
         "inspect_artifact",
         "finish_task",
+        "propose_plan",
+        "update_plan",
     } <= names
+
+
+def test_plan_tools_persist_semantic_steps_and_block_for_approval(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    run_dir = config.runs_dir / "run_plan"
+    tools = {tool.name: tool for tool in build_tools(config, logger=None, run_dir=run_dir)}
+
+    proposed = tools["propose_plan"].invoke(
+        {
+            "goal": "Complete a reproducible single-cell core analysis",
+            "steps": [
+                {
+                    "title": "Inspect inputs and skill",
+                    "success_criteria": "The dataset and exact skill functions are verified.",
+                },
+                {
+                    "title": "Run and verify analysis",
+                    "success_criteria": "Core artifacts pass evidence inspection.",
+                },
+            ],
+            "assumptions": ["Use Scanpy unless the input requires another runtime."],
+            "requires_approval": True,
+        }
+    )
+
+    assert proposed["status"] == "needs_user_input"
+    assert proposed["interaction_type"] == "plan_approval"
+    assert proposed["question_id"].startswith("question_")
+    assert proposed["plan"]["status"] == "awaiting_approval"
+    first_step_id = proposed["plan"]["steps"][0]["id"]
+
+    updated = tools["update_plan"].invoke(
+        {
+            "step_id": first_step_id,
+            "step_status": "in_progress",
+            "plan_status": "active",
+            "note": "Input path confirmed.",
+        }
+    )
+
+    assert updated["ok"] is True
+    assert updated["plan"]["status"] == "active"
+    assert updated["plan"]["steps"][0]["status"] == "in_progress"
+    assert updated["plan"]["steps"][0]["note"] == "Input path confirmed."
+    persisted = json.loads((run_dir / "state" / "plan.json").read_text(encoding="utf-8"))
+    assert persisted == updated["plan"]

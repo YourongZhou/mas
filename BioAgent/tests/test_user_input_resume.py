@@ -53,12 +53,17 @@ def test_request_user_input_tool_returns_structured_interrupt(tmp_path: Path) ->
             "question": "Which species is this dataset?",
             "reason": "The selected single-cell skill needs species-specific QC genes.",
             "required_fields": ["species"],
+            "options": ["human", "mouse"],
+            "allow_free_text": False,
         }
     )
 
     assert result["status"] == "needs_user_input"
     assert result["question"] == "Which species is this dataset?"
     assert result["required_fields"] == ["species"]
+    assert result["question_id"].startswith("question_")
+    assert result["options"] == ["human", "mouse"]
+    assert result["allow_free_text"] is False
 
 
 def test_pending_state_round_trips_messages(tmp_path: Path) -> None:
@@ -89,6 +94,21 @@ def test_pending_state_round_trips_messages(tmp_path: Path) -> None:
     assert loaded.run_id == "run_test"
     assert loaded.question == "Need species?"
     assert [message.content for message in loaded.messages] == ["system", "task"]
+
+
+def test_messages_for_model_moves_runtime_system_observations_to_the_prefix(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    messages = [
+        SystemMessage("base system"),
+        HumanMessage("task"),
+        SystemMessage("verified asynchronous job callback"),
+        HumanMessage("continue"),
+    ]
+
+    compacted = messages_for_model(messages, config)
+
+    assert [message.type for message in compacted] == ["system", "system", "human", "human"]
+    assert compacted[1].content == "verified asynchronous job callback"
 
 
 class _FakeLLM:

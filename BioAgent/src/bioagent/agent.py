@@ -2,6 +2,8 @@
 
 import json
 import time
+import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -14,6 +16,8 @@ from .logging_utils import RunLogger
 from .memory import build_memory_harness
 from .run_state import save_pending_state
 from .tools import build_tools
+from .tools.jobs import attach_job_provenance
+from .tools.planning import PlanStore
 
 
 CONTEXT_LOOKUP_TOOLS = {
@@ -47,6 +51,9 @@ You own the whole task: understand the request, inspect relevant files or workfl
 
 Important operating rules:
 - Use tools when you need filesystem context, workflow metadata, Docker profile details, code execution, or artifact verification.
+- For a complex task with at least three dependent stages, use propose_plan before execution and keep it current with update_plan. Plans describe the model's intended scientific work; they are not a list of tool calls.
+- Request plan approval only when ambiguity, cost, or a consequential scientific choice requires the user. Simple or already well-specified tasks should proceed without an approval ceremony.
+- When clarification is required, use request_user_input with concise options when possible. Never guess a consequential missing input.
 - Choose the lightest sufficient route, similar to a CLI coding agent:
   1. Answer directly for conceptual questions that need no files or execution.
   2. Use file/search tools for inspection-only tasks.
@@ -110,7 +117,9 @@ def messages_for_model(messages: list[Any], config: AgentConfig, *, keep_recent_
                 tool_name=tool_name,
             )
         )
-    return compacted
+    system_messages = [message for message in compacted if getattr(message, "type", "") == "system"]
+    non_system_messages = [message for message in compacted if getattr(message, "type", "") != "system"]
+    return [*system_messages, *non_system_messages]
 
 
 def _compact_ai_tool_calls(message: Any, *, max_code_chars: int = 1400) -> Any:
@@ -269,6 +278,7 @@ class AgentRunResult:
     pending_question: str = ""
     resume_id: str = ""
     pending_state_path: str = ""
+    pending_interaction: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -280,6 +290,7 @@ class AgentRunResult:
             "pending_question": self.pending_question,
             "resume_id": self.resume_id,
             "pending_state_path": self.pending_state_path,
+            "pending_interaction": self.pending_interaction or {},
         }
 
 
@@ -297,6 +308,7 @@ class BioAgent:
         self.run_dir = run_dir
         self.prior_run_dirs = [Path(path) for path in prior_run_dirs or []]
         self.memory_harness = build_memory_harness(config)
+        self.plan_store = PlanStore(run_dir)
         self.tools = build_tools(
             config,
             logger,
@@ -331,17 +343,25 @@ class BioAgent:
             parts.append("Do not copy files there. Write all artifacts to /work/outputs; the frontend reads that directory directly.")
         return "\n".join(parts)
 
-    def _emit_event(self, event_sink: Callable[[dict[str, Any]], None] | None, event_type: str, **payload: Any) -> None:
+    def _emit_event(
+        self,
+        event_sink: Callable[[dict[str, Any]], None] | None,
+        event_type: str,
+        **payload: Any,
+    ) -> dict[str, Any] | None:
         if event_sink is None:
-            return
+            return None
         event = {
             "type": event_type,
+            "eventId": f"event_{uuid.uuid4().hex[:16]}",
+            "createdAt": datetime.now(timezone.utc).isoformat(),
             "run_id": self.logger.run_id,
             "run_dir": str(self.run_dir),
             "log_path": str(self.logger.path),
         }
         event.update(payload)
         event_sink(event)
+        return event
 
     def _emit_memory_state(self, event_sink: Callable[[dict[str, Any]], None] | None) -> None:
         self._emit_event(event_sink, "memory_state", memory=self.memory_harness.public_snapshot())
@@ -358,7 +378,7 @@ class BioAgent:
         initial_memory_state: dict[str, Any] | None = None,
         event_sink: Callable[[dict[str, Any]], None] | None = None,
         pause_requested: Callable[[], bool] | None = None,
-        take_pending_messages: Callable[[], list[str]] | None = None,
+        take_pending_messages: Callable[[], list[Any]] | None = None,
     ) -> AgentRunResult:
         self.memory_harness.start_task(
             task,
@@ -394,6 +414,7 @@ class BioAgent:
         status = "completed"
         pending_question = ""
         pending_state_path = ""
+        pending_interaction: dict[str, Any] = {}
         workflow_skill_inspected = False
         workflow_skill_detail_seen = False
         last_context_lookup_key: tuple[str, str] | None = None
@@ -406,7 +427,7 @@ class BioAgent:
         while True:
             turn = min(max_turns, decision_turns + 1)
             model_calls += 1
-            self._append_pending_messages(messages, take_pending_messages, event_sink=event_sink)
+            self._append_pending_messages(messages, take_pending_messages, event_sink=event_sink, turn=turn)
             if _pause_is_requested(pause_requested):
                 status = "paused"
                 pending_question = "Task paused. Add instructions to continue."
@@ -438,7 +459,9 @@ class BioAgent:
                     self.config,
                     turn=turn,
                     max_turns=max_turns,
-                    memory_context=self.memory_harness.context_text(),
+                    memory_context="\n\n".join(
+                        value for value in (self.memory_harness.context_text(), self.plan_store.context_text()) if value
+                    ),
                 )
             )
             elapsed = time.perf_counter() - started
@@ -484,7 +507,12 @@ class BioAgent:
                 break
 
             tool_calls = response.tool_calls or []
-            steering_messages = self._append_pending_messages(messages, take_pending_messages, event_sink=event_sink)
+            steering_messages = self._append_pending_messages(
+                messages,
+                take_pending_messages,
+                event_sink=event_sink,
+                turn=turn,
+            )
             if steering_messages:
                 if tool_calls:
                     self._cancel_unstarted_tool_calls(
@@ -551,13 +579,21 @@ class BioAgent:
             for call in tool_calls:
                 name = call.get("name")
                 args = call.get("args") or {}
-                call_id = call.get("id")
+                call_id = str(call.get("id") or f"toolcall_{uuid.uuid4().hex[:16]}")
                 self.logger.node(f"工具调用：{name}", f"call_id={call_id}")
                 self.logger.log(f"TOOL_CALL name={name} id={call_id}")
                 self.logger.preview("工具入参", _safe_json(args), max_chars=4000)
                 self.memory_harness.observe_tool_call(str(name), args)
                 self._emit_memory_state(event_sink)
-                self._emit_event(event_sink, "tool_call", turn=turn, tool_name=str(name), call_id=call_id, args=args)
+                tool_call_event = self._emit_event(
+                    event_sink,
+                    "tool_call",
+                    turn=turn,
+                    tool_name=str(name),
+                    call_id=call_id,
+                    toolCallId=call_id,
+                    args=args,
+                )
                 context_lookup_key = _context_lookup_call_key(str(name), args)
                 duplicate_context_lookup = (
                     context_lookup_key is not None and context_lookup_key == last_context_lookup_key
@@ -599,6 +635,15 @@ class BioAgent:
                         self.logger.error_reason(f"工具 {name} 执行异常：{exc}")
                         self.logger.log(f"TOOL_ERROR name={name} error={exc}")
                 result_text = _safe_json(result)
+                if str(name) == "start_job" and isinstance(result, dict) and result.get("job_id"):
+                    attach_job_provenance(
+                        [self.run_dir, *self.prior_run_dirs],
+                        job_id=str(result["job_id"]),
+                        tool_call_id=call_id,
+                        event_id=str((tool_call_event or {}).get("eventId") or ""),
+                    )
+                    result["created_by_tool_call_id"] = call_id
+                    result["created_by_event_id"] = str((tool_call_event or {}).get("eventId") or "")
                 message_result_text = tool_message_text(str(name), result)
                 self.memory_harness.observe_tool_result(str(name), args, result)
                 self._emit_memory_state(event_sink)
@@ -610,6 +655,8 @@ class BioAgent:
                     turn=turn,
                     tool_name=str(name),
                     call_id=call_id,
+                    toolCallId=call_id,
+                    parentEventId=str((tool_call_event or {}).get("eventId") or ""),
                     ok=_tool_succeeded(result),
                     status="cancelled" if _pause_is_requested(pause_requested) else None,
                     result=result,
@@ -634,11 +681,13 @@ class BioAgent:
                     completed_job_needs_finish = False
                 if _is_user_input_request(result):
                     pending_question = str(result.get("question") or "")
+                    pending_interaction = dict(result)
                     metadata = {
                         "tool_name": name,
                         "reason": result.get("reason", ""),
                         "required_fields": result.get("required_fields", []),
                         "resume_hint": result.get("resume_hint", ""),
+                        "pending_interaction": pending_interaction,
                         "memory_state": self.memory_harness.snapshot(),
                     }
                     pending_path = save_pending_state(
@@ -685,6 +734,7 @@ class BioAgent:
             pending_question=pending_question,
             resume_id=self.logger.run_id if status in {"needs_user_input", "paused"} else "",
             pending_state_path=pending_state_path,
+            pending_interaction=pending_interaction,
         )
         self._emit_event(event_sink, "final", turn=result.turns, content=result.final_answer, status=result.status, result=result.to_dict())
         self._emit_event(event_sink, "run_end", turn=result.turns, status=result.status, result=result.to_dict())
@@ -744,17 +794,46 @@ class BioAgent:
     def _append_pending_messages(
         self,
         messages: list[Any],
-        callback: Callable[[], list[str]] | None,
+        callback: Callable[[], list[Any]] | None,
         *,
         event_sink: Callable[[dict[str, Any]], None] | None,
-    ) -> list[str]:
+        turn: int | None = None,
+    ) -> list[Any]:
         if callback is None:
             return []
         try:
-            pending = [str(item).strip() for item in callback() if str(item).strip()]
+            pending = [item for item in callback() if item]
         except Exception:
             return []
-        for content in pending:
+        for item in pending:
+            if isinstance(item, dict) and item.get("type") == "job_callback":
+                content = str(item.get("content") or f"Job {item.get('jobId')} status={item.get('status')}")
+                messages.append(SystemMessage(content=f"Verified asynchronous job callback:\n{content}"))
+                self._emit_event(
+                    event_sink,
+                    "job_callback_consumed",
+                    callback_id=item.get("callbackId"),
+                    job_id=item.get("jobId"),
+                    status=item.get("status"),
+                )
+                continue
+            if isinstance(item, dict) and item.get("type") == "user_message":
+                content = str(item.get("content") or "").strip()
+                if not content:
+                    continue
+                messages.append(HumanMessage(content=f"Session steering message:\n{content}"))
+                self._emit_event(
+                    event_sink,
+                    "steering_message",
+                    turn=turn,
+                    messageId=item.get("messageId"),
+                    content=content,
+                    status="consumed",
+                )
+                continue
+            content = str(item).strip()
+            if not content:
+                continue
             messages.append(HumanMessage(content=f"Session steering message:\n{content}"))
             self._emit_event(event_sink, "steering_message", content=content, status="consumed")
         return pending

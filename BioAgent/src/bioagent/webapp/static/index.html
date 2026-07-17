@@ -65,13 +65,20 @@
         <form class="composer" id="taskForm">
           <div class="composer-box">
             <textarea id="taskInput" placeholder="Describe an analysis task...">使用 bmmc_b_cell.h5ad 做单细胞核心分析：读取数据、QC、标准化、HVG、PCA、neighbors、Leiden、UMAP、summary JSON、关键图和 processed h5ad。不要额外做 DE、marker gene、rank_genes_groups、轨迹或 PDF 报告。</textarea>
+            <div class="question-panel" id="questionPanel" hidden>
+              <div class="question-title" id="questionText"></div>
+              <div class="question-reason" id="questionReason"></div>
+              <div class="question-options" id="questionOptions"></div>
+            </div>
             <div class="composer-tools">
               <div class="tool-buttons" id="composerOptions">
                 <input id="dataPathInput" value="mas_2/data/bmmc_b_cell.h5ad" />
                 <label class="turns-label">turns <input id="maxTurnsInput" type="number" min="1" max="100" value="20" /></label>
               </div>
               <div class="composer-actions">
-                <button class="composer-control pause-control" id="pauseButton" type="button" hidden>Pause</button>
+                <button class="composer-control pause-control" id="pauseButton" type="button" title="Pause agent decisions without cancelling an asynchronous job" hidden>Pause Agent</button>
+                <button class="composer-control interrupt-control" id="interruptButton" type="button" title="Interrupt the currently running synchronous tool" hidden>Interrupt Tool</button>
+                <button class="composer-control cancel-control" id="cancelJobButton" type="button" title="Cancel the active asynchronous job" hidden>Cancel Job</button>
                 <button class="composer-control" id="continueButton" type="button" hidden>Continue</button>
                 <button class="send" id="sendButton" type="submit">Run</button>
               </div>

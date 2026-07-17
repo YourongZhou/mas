@@ -13,7 +13,7 @@ from bioagent.config import AgentConfig, load_model_settings, model_settings_pat
 import bioagent.webapp.app as webapp_module
 import bioagent.webapp.state as web_state_module
 from bioagent.webapp.app import TEXT_PREVIEW_LIMIT_BYTES, TEXT_PREVIEW_TRUNCATED_MESSAGE, create_app, _read_text_preview
-from bioagent.webapp.state import TaskRecord, apply_event_to_record, build_file_tree, record_from_payload, stop_active_docker_containers
+from bioagent.webapp.state import TaskRecord, TaskStore, apply_event_to_record, build_file_tree, record_from_payload, stop_active_docker_containers
 
 
 def _config(tmp_path: Path) -> AgentConfig:
@@ -296,6 +296,57 @@ def test_session_api_creates_an_open_conversation_with_an_initial_run(tmp_path: 
     assert snapshot["messages"][0]["content"] == "Run GWAS"
 
 
+def test_session_events_have_stable_protocol_ids_and_tool_parent_links(tmp_path: Path) -> None:
+    app = create_app(config=_config(tmp_path), stream_runner=_fake_stream)
+    client = TestClient(app)
+    session_id = client.post("/api/sessions", json={"task": "Run GWAS"}).json()["sessionId"]
+    snapshot = _wait_for_status(client, session_id, "completed")
+
+    assert snapshot["events"]
+    assert len({event["eventId"] for event in snapshot["events"]}) == len(snapshot["events"])
+    assert all(event["sessionId"] == session_id for event in snapshot["events"])
+    assert all(event["createdAt"] for event in snapshot["events"])
+    tool_call = next(event for event in snapshot["events"] if event["type"] == "tool_call")
+    tool_result = next(event for event in snapshot["events"] if event["type"] == "tool_result")
+    assert tool_result["parentEventId"] == tool_call["eventId"]
+    assert tool_result["toolCallId"] == tool_call["toolCallId"] == "call_skill"
+
+
+def test_explicit_plan_and_structured_question_are_exposed_in_snapshot() -> None:
+    record = TaskRecord(id="session-plan", task="Analyze cells", title="Analyze cells", data_path=None, max_turns=20)
+    plan = {
+        "plan_id": "plan_1",
+        "goal": "Analyze cells",
+        "status": "awaiting_approval",
+        "assumptions": [],
+        "steps": [{"id": "step_1", "title": "Inspect data", "status": "pending", "success_criteria": "Input verified"}],
+    }
+    apply_event_to_record(
+        record,
+        {
+            "type": "tool_result",
+            "tool_name": "propose_plan",
+            "call_id": "call_plan",
+            "ok": True,
+            "result": {
+                "status": "needs_user_input",
+                "interaction_type": "plan_approval",
+                "question_id": "question_1",
+                "question": "Approve this plan?",
+                "options": ["Approve", "Request changes"],
+                "allow_free_text": True,
+                "plan": plan,
+            },
+        },
+    )
+
+    snapshot = record.snapshot()
+    assert snapshot["planState"] == plan
+    assert snapshot["plan"][0]["title"] == "Inspect data"
+    assert snapshot["activeQuestion"]["questionId"] == "question_1"
+    assert snapshot["activeQuestion"]["options"] == ["Approve", "Request changes"]
+
+
 def test_paused_session_message_is_answered_without_resuming_the_run(tmp_path: Path) -> None:
     resume_calls: list[tuple[str, str]] = []
 
@@ -365,8 +416,14 @@ def test_running_session_message_is_queued_for_the_active_agent(tmp_path: Path) 
     snapshot = _wait_for_status(client, session_id, "completed")
 
     assert response.status_code == 202
-    assert received == ["Use only chromosome 22."]
     queued_message = next(message for message in snapshot["messages"] if message["content"] == "Use only chromosome 22.")
+    assert received == [
+        {
+            "type": "user_message",
+            "messageId": queued_message["id"],
+            "content": "Use only chromosome 22.",
+        }
+    ]
     assert queued_message["delivery"] == "consumed"
 
 
@@ -437,11 +494,19 @@ def test_workbench_session_composer_separates_send_pause_and_continue_controls()
 
     assert 'id="sendButton"' in markup
     assert 'id="pauseButton"' in markup
+    assert 'id="interruptButton"' in markup
+    assert 'id="cancelJobButton"' in markup
     assert 'id="continueButton"' in markup
+    assert 'id="questionPanel"' in markup
     assert "async function sendSessionMessage" in script
     assert "`/api/sessions/${sessionId}/messages`" in script
     assert 'els.pauseButton.addEventListener("click", pauseTask)' in script
+    assert 'els.interruptButton.addEventListener("click", interruptCurrentTool)' in script
+    assert 'els.cancelJobButton.addEventListener("click", cancelActiveJob)' in script
     assert 'els.continueButton.addEventListener("click", resumeTask)' in script
+    assert '`/api/sessions/${taskId}/interrupt`' in script
+    assert '`/api/sessions/${taskId}/jobs/cancel`' in script
+    assert "snapshot?.activeQuestion" in script
     assert 'els.taskInput.disabled = false' in script
 
 
@@ -802,6 +867,46 @@ def test_task_files_api_prefers_web_result_dir_when_present(tmp_path: Path) -> N
     assert snapshot["compute"]["resultRoot"].endswith(f"/web_{task_id}")
 
 
+def test_session_results_survive_follow_up_run_without_outputs(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    first_run = config.runs_dir / "run_first"
+    second_run = config.runs_dir / "run_follow_up"
+    output = first_run / "outputs" / "umap.png"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"png")
+    (second_run / "state").mkdir(parents=True)
+    (second_run / "state" / "final_verification.json").write_text("{}", encoding="utf-8")
+    record = TaskRecord(
+        id="session-results",
+        task="Analyze PBMC3K",
+        title="Analyze PBMC3K",
+        data_path=None,
+        max_turns=20,
+        status="completed",
+        run_dir=str(second_run),
+        runs=[
+            {"id": "first", "runDir": str(first_run), "status": "failed"},
+            {"id": "follow-up", "runDir": str(second_run), "status": "completed"},
+        ],
+        active_run_id="follow-up",
+    )
+    store = TaskStore(config=config, start_job_watcher=False)
+    store._persist_record(record)
+    app = create_app(config=config, start_job_watcher=False)
+    client = TestClient(app)
+
+    snapshot = client.get(f"/api/sessions/{record.id}").json()
+    preview = client.get(
+        f"/api/tasks/{record.id}/files/download",
+        params={"path": str(output)},
+    )
+
+    assert [node["name"] for node in snapshot["resultFiles"]] == ["umap.png"]
+    assert snapshot["compute"]["resultRoot"] == str(first_run / "outputs")
+    assert preview.status_code == 200
+    assert preview.content == b"png"
+
+
 def test_runner_error_is_visible_in_task_conversation(tmp_path: Path) -> None:
     app = create_app(config=_config(tmp_path), stream_runner=_failing_stream)
     client = TestClient(app)
@@ -849,6 +954,117 @@ def test_task_can_pause_and_resume_same_run_with_user_instruction(tmp_path: Path
     assert paused["status"] == "paused"
     assert resumed["taskId"] == task_id
     assert completed["messages"][-2]["content"] == "Use a faster vectorized method"
+
+
+def test_pause_only_pauses_agent_and_does_not_cancel_running_compute(tmp_path: Path, monkeypatch) -> None:
+    stopped: list[Path] = []
+    monkeypatch.setattr(web_state_module, "stop_active_docker_containers", lambda path: stopped.append(path))
+    app = create_app(config=_config(tmp_path), stream_runner=_pausable_stream, resume_runner=_fake_resume)
+    client = TestClient(app)
+    task_id = client.post("/api/tasks", json={"task": "Run demo"}).json()["taskId"]
+    _wait_for_status(client, task_id, "running")
+
+    response = client.post(f"/api/sessions/{task_id}/pause")
+    _wait_for_status(client, task_id, "paused")
+
+    assert response.status_code == 200
+    assert stopped == []
+
+
+def test_terminal_job_callback_is_persisted_once_without_becoming_user_message(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    store = TaskStore(config=config, start_job_watcher=False)
+    run_dir = config.runs_dir / "run_callback"
+    job_dir = run_dir / "jobs" / "job_20260717_120000_abcdef"
+    job_dir.mkdir(parents=True)
+    (job_dir / "job.json").write_text(
+        json.dumps(
+            {
+                "job_id": "job_20260717_120000_abcdef",
+                "run_id": run_dir.name,
+                "run_dir": str(run_dir),
+                "status": "completed",
+                "callback_state": "pending",
+                "exit_code": 0,
+                "finished_at": "2026-07-17T12:01:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    record = TaskRecord(
+        id="session-callback",
+        task="Analyze cells",
+        title="Analyze cells",
+        data_path=None,
+        max_turns=20,
+        status="paused",
+        run_dir=str(run_dir),
+        runs=[{"id": "session-run", "runDir": str(run_dir), "status": "paused"}],
+        active_run_id="session-run",
+    )
+    store._tasks[record.id] = record
+
+    assert store.scan_job_callbacks() == 1
+    assert store.scan_job_callbacks() == 0
+    callback = next(event for event in record.events if event["type"] == "job_callback")
+    assert callback["callbackId"].startswith("callback_")
+    assert callback["jobId"] == "job_20260717_120000_abcdef"
+    assert callback["status"] == "completed"
+    assert record.pending_context_events[0]["type"] == "job_callback"
+    assert all(message.get("role") != "user" for message in record.messages)
+
+
+def test_terminal_job_callback_automatically_continues_an_idle_session(tmp_path: Path) -> None:
+    received_context: list[dict] = []
+
+    def callback_stream(task: str, *, result_dir=None, take_pending_messages=None, **kwargs):
+        received_context.extend(item for item in take_pending_messages() if isinstance(item, dict))
+        run_dir = Path(result_dir).parent / "run_after_callback"
+        yield {"type": "run_start", "run_id": "run_after_callback", "run_dir": str(run_dir), "log_path": str(run_dir / "run.log")}
+        yield {"type": "final", "content": "Callback handled.", "status": "completed"}
+        yield {"type": "run_end", "run_id": "run_after_callback", "run_dir": str(run_dir), "status": "completed"}
+
+    config = _config(tmp_path)
+    store = TaskStore(config=config, stream_runner=callback_stream, start_job_watcher=False)
+    run_dir = config.runs_dir / "run_callback_idle"
+    job_dir = run_dir / "jobs" / "job_20260717_120000_fedcba"
+    job_dir.mkdir(parents=True)
+    (job_dir / "job.json").write_text(
+        json.dumps(
+            {
+                "job_id": "job_20260717_120000_fedcba",
+                "run_id": run_dir.name,
+                "run_dir": str(run_dir),
+                "status": "completed",
+                "callback_state": "pending",
+                "exit_code": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    record = TaskRecord(
+        id="session-callback-idle",
+        task="Analyze cells",
+        title="Analyze cells",
+        data_path=None,
+        max_turns=20,
+        status="completed",
+        run_dir=str(run_dir),
+        runs=[{"id": "first-run", "runDir": str(run_dir), "status": "completed"}],
+        active_run_id="first-run",
+    )
+    store._tasks[record.id] = record
+
+    assert store.scan_job_callbacks() == 1
+    deadline = time.time() + 3
+    while record.status != "completed" and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert len(record.runs) == 2
+    assert record.status == "completed"
+    assert received_context[0]["type"] == "job_callback"
+    assert received_context[0]["jobId"] == "job_20260717_120000_fedcba"
+    assert record.final_answer == "Callback handled."
 
 
 def test_pause_stops_only_containers_named_by_run_cidfiles(tmp_path: Path, monkeypatch) -> None:

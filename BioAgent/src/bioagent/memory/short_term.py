@@ -79,6 +79,10 @@ class ShortTermMemory:
             )
         elif tool_name == "request_user_input":
             self.update(current_stage="waiting_for_user", next_action="Wait for the requested user input.")
+        elif tool_name == "propose_plan":
+            self.update(current_stage="planning", next_action="Follow the persisted plan or wait for its approval.")
+        elif tool_name == "update_plan":
+            self.update(current_stage="executing_plan", next_action="Continue with the next active plan step.")
         elif tool_name == "inspect_artifact":
             self.update(current_stage="verifying_artifacts", next_action="Inspect all important outputs, then finish with their evidence ids.")
         elif tool_name == "finish_task":

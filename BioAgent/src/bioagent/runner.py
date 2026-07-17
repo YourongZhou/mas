@@ -13,6 +13,7 @@ from .config import AgentConfig
 from .logging_utils import RunLogger, now_stamp
 from .llm import build_llm, message_text
 from .run_state import clear_pending_state, load_pending_state
+from .tools.planning import PlanStore
 
 
 def run_bio_agent(
@@ -47,7 +48,7 @@ def run_bio_agent_stream(
     result_dir: str | None = None,
     max_turns: int = 20,
     pause_requested: Callable[[], bool] | None = None,
-    take_pending_messages: Callable[[], list[str]] | None = None,
+    take_pending_messages: Callable[[], list[Any]] | None = None,
     initial_memory_state: dict[str, Any] | None = None,
     session_message: str | None = None,
     prior_run_dirs: list[str] | None = None,
@@ -191,7 +192,7 @@ def resume_bio_agent(
     max_turns: int = 20,
     pause_requested: Callable[[], bool] | None = None,
     event_sink: Callable[[dict], None] | None = None,
-    take_pending_messages: Callable[[], list[str]] | None = None,
+    take_pending_messages: Callable[[], list[Any]] | None = None,
 ) -> dict:
     """Resume a run that previously returned status='needs_user_input'."""
 
@@ -201,11 +202,25 @@ def resume_bio_agent(
 
     with RunLogger(config.logs_dir, run_id=pending.run_id, append=True) as logger:
         agent = BioAgent(config=config, logger=logger, run_dir=pending.run_dir)
+        pending_interaction = pending.metadata.get("pending_interaction")
+        bound_answer = user_answer
+        if isinstance(pending_interaction, dict) and pending_interaction.get("question_id"):
+            bound_answer = (
+                f"Response to question_id={pending_interaction['question_id']} "
+                f"({pending_interaction.get('interaction_type', 'clarification')}):\n{user_answer}"
+            )
+            if pending_interaction.get("interaction_type") == "plan_approval" and user_answer.strip().lower() in {
+                "approve",
+                "approve plan",
+                "approved",
+                "yes",
+            }:
+                PlanStore(pending.run_dir).update(plan_status="active")
         run_kwargs = dict(
             task="",
             max_turns=max_turns,
             initial_messages=pending.messages,
-            resume_answer=user_answer,
+            resume_answer=bound_answer,
         )
         memory_state = pending.metadata.get("memory_state")
         if isinstance(memory_state, dict):

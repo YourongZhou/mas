@@ -22,7 +22,7 @@ from bioagent.config import (
 )
 from bioagent.llm import build_llm
 
-from .state import ChatRunner, ResumeRunner, StreamRunner, TaskStore, sse_payload
+from .state import ChatRunner, ResumeRunner, StreamRunner, TaskStore, session_run_dirs as web_state_session_run_dirs, sse_payload
 
 
 TEXT_PREVIEW_LIMIT_BYTES = 200_000
@@ -43,6 +43,10 @@ class ResumeTaskRequest(BaseModel):
 class SessionMessageRequest(BaseModel):
     content: str = Field(..., min_length=1)
     max_turns: int = Field(20, ge=1, le=100)
+
+
+class CancelJobRequest(BaseModel):
+    job_id: str = ""
 
 
 class ModelSettingsRequest(BaseModel):
@@ -66,10 +70,14 @@ def create_app(
     resume_runner: ResumeRunner | None = None,
     chat_runner: ChatRunner | None = None,
     model_test_runner: ModelTestRunner | None = None,
+    start_job_watcher: bool | None = None,
 ) -> FastAPI:
     base_config = config or AgentConfig.from_env(include_model_settings=False)
     effective_config = apply_model_settings(base_config)
-    store_kwargs: dict[str, Any] = {"config": effective_config}
+    store_kwargs: dict[str, Any] = {
+        "config": effective_config,
+        "start_job_watcher": (config is None and stream_runner is None) if start_job_watcher is None else start_job_watcher,
+    }
     if stream_runner:
         store_kwargs["stream_runner"] = stream_runner
     if resume_runner:
@@ -155,6 +163,28 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"taskId": record.id, "status": record.status}
+
+    @app.post("/api/sessions/{task_id}/interrupt")
+    def interrupt_current_tool(task_id: str) -> dict[str, str]:
+        try:
+            record = store.interrupt_current_tool(task_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"sessionId": record.id, "status": "interrupting"}
+
+    @app.post("/api/sessions/{task_id}/jobs/cancel")
+    def cancel_session_job(task_id: str, payload: CancelJobRequest) -> dict[str, Any]:
+        try:
+            result = store.cancel_job(task_id, payload.job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not result.get("ok"):
+            raise HTTPException(status_code=409, detail=result.get("error") or "Could not cancel job")
+        return result
 
     @app.post("/api/sessions/{task_id}/messages", status_code=202)
     def send_session_message(task_id: str, payload: SessionMessageRequest) -> dict[str, str]:
@@ -276,20 +306,25 @@ def _record_or_404(store: TaskStore, task_id: str):
 
 
 def _safe_task_path(record, requested: str) -> Path:
-    if not record.run_dir:
+    run_dirs = [Path(path).resolve() for path in record.result_roots()]
+    session_roots = [Path(path).resolve() for path in web_state_session_run_dirs(record)]
+    if not session_roots:
         raise HTTPException(status_code=404, detail="Task has no run directory yet")
-    root = Path(record.run_dir).resolve()
     requested_path = Path(requested)
-    candidate_roots = [record.result_root(), root]
     roots: list[Path] = []
-    for candidate_root in candidate_roots:
-        if candidate_root is None:
-            continue
-        resolved = candidate_root.resolve()
+    for resolved in [*run_dirs, *session_roots]:
         if resolved not in roots:
             roots.append(resolved)
     candidates = [requested_path.resolve()] if requested_path.is_absolute() else [(base / requested_path).resolve() for base in roots]
-    target = next((candidate for candidate in candidates if candidate.exists() and (root in candidate.parents or candidate == root)), None)
+    target = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.exists()
+            and any(session_root in candidate.parents or candidate == session_root for session_root in session_roots)
+        ),
+        None,
+    )
     if target is None:
         raise HTTPException(status_code=404, detail="File not found for this task")
     if target.is_dir():
