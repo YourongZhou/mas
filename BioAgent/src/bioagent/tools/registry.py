@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from pathlib import Path
+import uuid
 
 from langchain_core.tools import StructuredTool
 
@@ -13,6 +14,7 @@ from .attempts import ExecutionAttemptBudget
 from .execution import execute_python_impl, execute_r_impl
 from .filesystem import glob_search_impl, grep_text_impl, list_files_impl, read_file_impl
 from .jobs import DockerJobManager
+from .planning import PlanStore
 from .schemas import (
     CancelJobArgs,
     EditRunFileArgs,
@@ -30,6 +32,7 @@ from .schemas import (
     ListJobsArgs,
     ListWorkflowSkillsArgs,
     PollJobArgs,
+    ProposePlanArgs,
     ReadFileArgs,
     ReadSkillScriptArgs,
     RequestUserInputArgs,
@@ -37,6 +40,7 @@ from .schemas import (
     RunSkillWorkflowArgs,
     StartJobArgs,
     TailJobArgs,
+    UpdatePlanArgs,
     ValidateScriptArgs,
     WriteRunFileArgs,
 )
@@ -63,6 +67,7 @@ def build_tools(
     attempt_budget = ExecutionAttemptBudget(run_dir, config.max_execution_attempts)
     job_manager = DockerJobManager(config, logger, run_dir, prior_run_dirs=prior_run_dirs)
     artifact_store = ArtifactStore(run_dir, config=config, prior_run_dirs=prior_run_dirs)
+    plan_store = PlanStore(run_dir)
 
     def list_files(path: str = ".", recursive: bool = False, max_entries: int = 200) -> str:
         return list_files_impl(config, run_dir, path=path, recursive=recursive, max_entries=max_entries)
@@ -248,14 +253,48 @@ def build_tools(
         reason: str = "",
         required_fields: list[str] | None = None,
         resume_hint: str = "",
+        options: list[str] | None = None,
+        allow_free_text: bool = True,
+        input_type: str = "text",
     ) -> dict:
         return {
             "status": "needs_user_input",
+            "interaction_type": "clarification",
+            "question_id": f"question_{uuid.uuid4().hex[:12]}",
             "question": question,
             "reason": reason,
             "required_fields": required_fields or [],
             "resume_hint": resume_hint,
+            "options": options or [],
+            "allow_free_text": allow_free_text,
+            "input_type": input_type,
         }
+
+    def propose_plan(
+        goal: str,
+        steps: list[dict],
+        assumptions: list[str] | None = None,
+        requires_approval: bool = False,
+    ) -> dict:
+        return plan_store.propose(
+            goal=goal,
+            steps=steps,
+            assumptions=assumptions,
+            requires_approval=requires_approval,
+        )
+
+    def update_plan(
+        step_id: str = "",
+        step_status: str = "",
+        plan_status: str = "",
+        note: str = "",
+    ) -> dict:
+        return plan_store.update(
+            step_id=step_id,
+            step_status=step_status,
+            plan_status=plan_status,
+            note=note,
+        )
 
     tools = [
         StructuredTool.from_function(list_files, name="list_files", description="列出项目允许范围内的文件和目录。", args_schema=ListFilesArgs),
@@ -270,6 +309,20 @@ def build_tools(
                 "向用户提出一个具体问题，并等待 resume 后继续。"
             ),
             args_schema=RequestUserInputArgs,
+        ),
+        StructuredTool.from_function(
+            propose_plan,
+            name="propose_plan",
+            description=(
+                "为复杂任务创建持久的语义计划。步骤和成功标准由 Agent 编写；只有高代价、关键歧义或用户要求审批时才设置 requires_approval=true。"
+            ),
+            args_schema=ProposePlanArgs,
+        ),
+        StructuredTool.from_function(
+            update_plan,
+            name="update_plan",
+            description="按 propose_plan 返回的 step_id 更新步骤状态、证据说明或整个计划状态。",
+            args_schema=UpdatePlanArgs,
         ),
         StructuredTool.from_function(list_workflow_skills, name="list_workflow_skills", description="列出 workflow skills。默认 compact 只返回路由字段；需要路径/env image 时用 detail='full'。", args_schema=ListWorkflowSkillsArgs),
         StructuredTool.from_function(inspect_workflow_skill, name="inspect_workflow_skill", description="读取某个 workflow skill 的元数据、scripts/references 清单和短正文预览；完整 SKILL.md 可用 read_skill_script 读取。", args_schema=InspectSkillArgs),

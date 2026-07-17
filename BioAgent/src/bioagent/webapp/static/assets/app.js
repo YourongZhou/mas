@@ -27,7 +27,8 @@ document.addEventListener("DOMContentLoaded", () => {
     "errorLine", "detailTabs", "detailBody", "traceTab", "memoryTab", "resultTab", "fileTab", "traceTitle", "traceMeta", "tracePlanCount", "tracePlanList", "traceInput", "traceOutput", "traceListCount", "traceList",
     "memoryMeta", "memoryState", "memoryEpisodes",
     "resultSummary", "resultVisuals", "resultFileList", "fileTitle", "fileMeta", "copyFilePathButton", "downloadLink", "filePreview", "planCount",
-    "planList", "filesRefreshButton", "fileSearch", "clearFileSearchButton", "fileTree", "computeState", "computeGrid", "resultComputeGrid", "sendButton", "pauseButton", "continueButton",
+    "planList", "filesRefreshButton", "fileSearch", "clearFileSearchButton", "fileTree", "computeState", "computeGrid", "resultComputeGrid", "sendButton", "pauseButton", "interruptButton", "cancelJobButton", "continueButton",
+    "questionPanel", "questionText", "questionReason", "questionOptions",
     "composerOptions", "workbenchNavButton", "settingsNavButton", "modelSettingsPage", "modelSettingsForm",
     "modelSettingsSource", "modelConnectionStatus", "modelProviderInput", "modelBaseUrlInput", "modelNameInput", "modelApiKeyInput",
     "modelTemperatureInput", "modelTimeoutInput", "modelChatThinkingInput", "modelMimoThinkingInput",
@@ -41,6 +42,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
   els.taskForm.addEventListener("submit", startTask);
   els.pauseButton.addEventListener("click", pauseTask);
+  els.interruptButton.addEventListener("click", interruptCurrentTool);
+  els.cancelJobButton.addEventListener("click", cancelActiveJob);
   els.continueButton.addEventListener("click", resumeTask);
   els.currentToolPill.addEventListener("click", () => {
     if (state.snapshot?.status === "needs_user_input" || state.snapshot?.status === "paused") {
@@ -446,6 +449,41 @@ async function pauseTask() {
   }
 }
 
+async function interruptCurrentTool() {
+  const taskId = state.taskId;
+  if (!taskId || !state.snapshot?.compute?.currentTool) return;
+  const submitToken = beginSubmit("interrupt");
+  try {
+    await api(`/api/sessions/${taskId}/interrupt`, { method: "POST" });
+    if (state.submitToken !== submitToken) return;
+    await refresh();
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    finishSubmit(submitToken);
+  }
+}
+
+async function cancelActiveJob() {
+  const taskId = state.taskId;
+  const jobId = activeJobId(state.snapshot);
+  if (!taskId || !jobId || !window.confirm(`Cancel job ${jobId}?`)) return;
+  const submitToken = beginSubmit("cancel");
+  try {
+    await api(`/api/sessions/${taskId}/jobs/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobId }),
+    });
+    if (state.submitToken !== submitToken) return;
+    await refresh();
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    finishSubmit(submitToken);
+  }
+}
+
 async function selectTask(taskId) {
   enterWorkbenchView();
   const previousTaskId = state.taskId;
@@ -597,6 +635,7 @@ function render() {
   renderResultVisuals(snapshot);
   renderResultFileList(snapshot);
   renderMemory(snapshot);
+  renderQuestion(snapshot);
   renderComposer(snapshot);
 }
 
@@ -959,11 +998,18 @@ function finishSubmit(submitToken) {
 
 function renderComposer(snapshot) {
   els.pauseButton.hidden = true;
+  els.interruptButton.hidden = true;
+  els.cancelJobButton.hidden = true;
   els.continueButton.hidden = true;
   els.pauseButton.disabled = false;
+  els.interruptButton.disabled = false;
+  els.cancelJobButton.disabled = false;
   els.continueButton.disabled = false;
+  els.taskInput.readOnly = false;
   if (state.isSubmitting) {
     const labels = { reply: "Replying", continue: "Continuing", pause: "Pausing", message: "Sending" };
+    labels.interrupt = "Interrupting";
+    labels.cancel = "Cancelling";
     els.sendButton.textContent = labels[state.submitMode] || "Creating";
     els.sendButton.disabled = true;
     els.taskInput.disabled = true;
@@ -995,6 +1041,7 @@ function renderComposer(snapshot) {
     els.taskInput.disabled = false;
     els.taskInput.placeholder = replyPrompt ? `Reply to: ${replyPrompt}` : "Reply to BioAgent and continue this run...";
     els.composerOptions.hidden = true;
+    els.taskInput.readOnly = snapshot?.activeQuestion?.allowFreeText === false;
     return;
   }
   if (snapshot?.status === "pausing") {
@@ -1005,7 +1052,7 @@ function renderComposer(snapshot) {
     els.composerOptions.hidden = true;
     els.pauseButton.hidden = false;
     els.pauseButton.disabled = true;
-    els.pauseButton.textContent = "Pausing";
+    els.pauseButton.textContent = "Pausing Agent";
     return;
   }
   if (isActiveStatus(snapshot?.status)) {
@@ -1015,7 +1062,9 @@ function renderComposer(snapshot) {
     els.taskInput.placeholder = "Send guidance; it will be applied at the next safe boundary...";
     els.composerOptions.hidden = true;
     els.pauseButton.hidden = false;
-    els.pauseButton.textContent = "Pause";
+    els.pauseButton.textContent = "Pause Agent";
+    els.interruptButton.hidden = !snapshot?.compute?.currentTool;
+    els.cancelJobButton.hidden = !activeJobId(snapshot);
     return;
   }
   if (isTerminalStatus(snapshot?.status)) {
@@ -1031,6 +1080,31 @@ function renderComposer(snapshot) {
   els.taskInput.disabled = false;
   els.taskInput.placeholder = "Describe an analysis task...";
   els.composerOptions.hidden = false;
+}
+
+function activeJobId(snapshot) {
+  return snapshot?.memory?.taskState?.active_job_id || snapshot?.memory?.task_state?.active_job_id || "";
+}
+
+function renderQuestion(snapshot) {
+  const question = snapshot?.status === "needs_user_input" ? snapshot?.activeQuestion : null;
+  els.questionPanel.hidden = !question?.question;
+  els.questionText.textContent = question?.question || "";
+  els.questionReason.textContent = question?.reason || "";
+  els.questionReason.hidden = !question?.reason;
+  els.questionOptions.innerHTML = "";
+  for (const option of question?.options || []) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "question-option";
+    button.textContent = option;
+    button.addEventListener("click", () => {
+      els.taskInput.value = option;
+      els.questionOptions.querySelectorAll(".question-option").forEach((item) => item.classList.toggle("selected", item === button));
+      els.sendButton.focus();
+    });
+    els.questionOptions.appendChild(button);
+  }
 }
 
 function latestAssistantPrompt(snapshot) {
@@ -1291,6 +1365,13 @@ function renderPlan(snapshot) {
 
 function renderPlanItems(container, visiblePlan, snapshot) {
   container.innerHTML = visiblePlan.length ? "" : `<div class="empty">Plan updates appear as the run progresses.</div>`;
+  const goal = snapshot?.planState?.goal || "";
+  if (goal) {
+    const heading = document.createElement("div");
+    heading.className = "plan-goal";
+    heading.textContent = goal;
+    container.appendChild(heading);
+  }
   for (const item of visiblePlan) {
     const step = document.createElement("div");
     const displayStatus = formatPlanStatus(item, snapshot);
@@ -1301,6 +1382,8 @@ function renderPlanItems(container, visiblePlan, snapshot) {
         <strong>${escapeHtml(formatPlanTitle(item.title))}</strong>
         <span class="meta">${escapeHtml(displayStatus)}</span>
       </div>
+      ${item.success_criteria ? `<div class="step-detail">${escapeHtml(item.success_criteria)}</div>` : ""}
+      ${item.note ? `<div class="step-note">${escapeHtml(item.note)}</div>` : ""}
     `;
     container.appendChild(step);
   }

@@ -1,5 +1,7 @@
 ﻿from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -136,6 +138,29 @@ class RequestUserInputArgs(BaseModel):
     reason: str = Field("", description="Why this answer is required now.")
     required_fields: list[str] = Field(default_factory=list, description="Structured missing fields, e.g. species or data_path.")
     resume_hint: str = Field("", description="Short instruction for how the answer should be used when the run resumes.")
+    options: list[str] = Field(default_factory=list, description="Optional user-facing choices. Keep empty for free text only.")
+    allow_free_text: bool = Field(True, description="Whether the user may provide an answer outside the listed options.")
+    input_type: Literal["text", "single_choice", "multiple_choice"] = "text"
+
+
+class PlanStepArgs(BaseModel):
+    title: str = Field(..., description="Concrete action phrased for the user-facing plan.")
+    dependencies: list[str] = Field(default_factory=list, description="Optional prior step titles or ids.")
+    success_criteria: str = Field("", description="Observable condition for completing this step.")
+
+
+class ProposePlanArgs(BaseModel):
+    goal: str = Field(..., description="The task outcome this plan is intended to achieve.")
+    steps: list[PlanStepArgs] = Field(..., min_length=1, max_length=20)
+    assumptions: list[str] = Field(default_factory=list)
+    requires_approval: bool = Field(False, description="Use true when ambiguity, cost, or scientific choices require approval.")
+
+
+class UpdatePlanArgs(BaseModel):
+    step_id: str = Field("", description="Persisted step id returned by propose_plan.")
+    step_status: Literal["", "pending", "in_progress", "completed", "blocked", "cancelled"] = ""
+    plan_status: Literal["", "draft", "awaiting_approval", "active", "completed", "cancelled"] = ""
+    note: str = Field("", description="Short evidence or blocker note for the selected step.")
 
 
 class RunSkillWorkflowArgs(BaseModel):

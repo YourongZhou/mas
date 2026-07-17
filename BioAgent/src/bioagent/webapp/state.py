@@ -6,6 +6,7 @@ import json
 import queue
 import subprocess
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -15,7 +16,9 @@ from typing import Any, Callable, Iterator
 from bioagent.config import AgentConfig
 from bioagent.runner import answer_bio_agent_message, resume_bio_agent, run_bio_agent_stream
 from bioagent.skills.registry import list_workflow_skills
-from bioagent.tools.jobs import cancel_run_jobs
+from bioagent.tools.jobs import DockerJobManager, TERMINAL_JOB_STATUSES, cancel_run_jobs
+
+from .protocol import envelope_event
 
 
 StreamRunner = Callable[..., Iterator[dict[str, Any]]]
@@ -40,6 +43,8 @@ class TaskRecord:
     messages: list[dict[str, Any]] = field(default_factory=list)
     traces: list[dict[str, Any]] = field(default_factory=list)
     plan: list[dict[str, Any]] = field(default_factory=list)
+    plan_state: dict[str, Any] = field(default_factory=dict)
+    active_question: dict[str, Any] = field(default_factory=dict)
     events: list[dict[str, Any]] = field(default_factory=list)
     event_queue: queue.Queue[dict[str, Any] | None] = field(default_factory=queue.Queue)
     compute: dict[str, Any] = field(default_factory=dict)
@@ -49,6 +54,8 @@ class TaskRecord:
     runs: list[dict[str, Any]] = field(default_factory=list)
     active_run_id: str = ""
     pending_user_messages: list[dict[str, str]] = field(default_factory=list)
+    pending_context_events: list[dict[str, Any]] = field(default_factory=list)
+    delivered_job_callbacks: dict[str, str] = field(default_factory=dict)
     final_answer: str = ""
     run_dir: str = ""
     log_path: str = ""
@@ -73,7 +80,10 @@ class TaskRecord:
             "messages": self.messages,
             "traces": self.traces,
             "plan": self.plan,
-            "resultFiles": build_file_tree(self.result_root()),
+            "planState": self.plan_state,
+            "activeQuestion": self.active_question,
+            "events": self.events,
+            "resultFiles": self.result_files(),
             "compute": self.compute_snapshot(),
             "memory": self.memory,
             "finalAnswer": self.final_answer,
@@ -81,15 +91,27 @@ class TaskRecord:
         }
 
     def result_root(self) -> Path | None:
-        if not self.run_dir:
-            return None
-        root = Path(self.run_dir)
-        web_result = root / f"web_{self.id}"
-        if web_result.is_dir():
-            return web_result
-        if (root / "outputs").is_dir():
-            return root / "outputs"
-        return root
+        roots = self.result_roots()
+        return roots[-1] if roots else None
+
+    def result_roots(self) -> list[Path]:
+        run_dirs = [Path(path) for path in session_run_dirs(self)]
+        if self.run_dir and Path(self.run_dir) not in run_dirs:
+            run_dirs.append(Path(self.run_dir))
+        canonical: list[Path] = []
+        for root in run_dirs:
+            web_result = root / f"web_{self.id}"
+            candidate = web_result if web_result.is_dir() else root / "outputs"
+            if candidate.is_dir() and candidate not in canonical:
+                canonical.append(candidate)
+        if canonical:
+            return canonical
+        if self.run_dir and Path(self.run_dir).exists():
+            return [Path(self.run_dir)]
+        return []
+
+    def result_files(self) -> list[dict[str, Any]]:
+        return build_merged_file_tree(self.result_roots())
 
     def compute_snapshot(self) -> dict[str, Any]:
         result_root = ""
@@ -118,6 +140,8 @@ class TaskStore:
         stream_runner: StreamRunner = run_bio_agent_stream,
         resume_runner: ResumeRunner = resume_bio_agent,
         chat_runner: ChatRunner = answer_bio_agent_message,
+        start_job_watcher: bool = False,
+        job_watch_interval_s: float = 2.0,
     ) -> None:
         self.config = config
         self.stream_runner = stream_runner
@@ -128,6 +152,10 @@ class TaskStore:
         self._tasks: dict[str, TaskRecord] = {}
         self._lock = threading.Lock()
         self._load_history()
+        self._job_watch_interval_s = max(0.2, job_watch_interval_s)
+        self._job_watcher_stop = threading.Event()
+        if start_job_watcher:
+            threading.Thread(target=self._job_watch_loop, name="bioagent-job-watcher", daemon=True).start()
 
     def create_task(self, *, task: str, data_path: str | None = None, max_turns: int = 20) -> TaskRecord:
         task_id = uuid.uuid4().hex[:8]
@@ -203,13 +231,21 @@ class TaskStore:
         if record.status not in {"needs_user_input", "paused"}:
             raise ValueError(f"Task {task_id} is not waiting for user input or paused")
         resume_kind = record.status
+        question_id = str(record.active_question.get("questionId") or "")
         with self._lock:
             record.pause_event.clear()
             record.status = "running"
             record.error = ""
             record.final_answer = ""
             record.event_queue = queue.Queue()
-            append_session_message(record, "user", user_answer, delivery="consumed", resume=True)
+            append_session_message(
+                record,
+                "user",
+                user_answer,
+                delivery="consumed",
+                resume=True,
+                responseToQuestionId=question_id,
+            )
             record.updated_at = utc_now()
             self._persist_record(record)
         thread = threading.Thread(
@@ -233,28 +269,131 @@ class TaskStore:
             record.updated_at = utc_now()
             self._persist_record(record)
         record.event_queue.put(event)
-        stop_active_docker_containers(Path(record.run_dir)) if record.run_dir else None
         return record
 
-    def take_pending_messages(self, task_id: str) -> list[str]:
+    def interrupt_current_tool(self, task_id: str) -> TaskRecord:
+        record = self.get_task(task_id)
+        if not record.run_dir:
+            raise ValueError(f"Session {task_id} has no active run workspace")
+        stop_active_docker_containers(Path(record.run_dir), include_jobs=False)
+        self._apply_event(record, {"type": "tool_interrupt_requested", "status": "interrupting"})
+        return record
+
+    def cancel_job(self, task_id: str, job_id: str = "") -> dict[str, Any]:
+        record = self.get_task(task_id)
+        run_dirs = [Path(path) for path in session_run_dirs(record)]
+        if not run_dirs:
+            raise ValueError(f"Session {task_id} has no job workspace")
+        manager = DockerJobManager(self.config, None, run_dirs[-1], prior_run_dirs=run_dirs[:-1])
+        result = manager.cancel_job(job_id)
+        self._apply_event(
+            record,
+            {
+                "type": "job_cancelled" if result.get("ok") else "job_cancel_failed",
+                "jobId": str(result.get("job_id") or job_id),
+                "status": str(result.get("status") or "cancelled"),
+                "result": result,
+            },
+        )
+        return result
+
+    def take_pending_messages(self, task_id: str) -> list[Any]:
         record = self.get_task(task_id)
         with self._lock:
             pending = list(record.pending_user_messages)
             record.pending_user_messages.clear()
+            context_events = list(record.pending_context_events)
+            record.pending_context_events.clear()
             pending_ids = {item["id"] for item in pending}
             for message in record.messages:
                 if message.get("id") in pending_ids:
                     message["delivery"] = "consumed"
+                    message["consumedAt"] = utc_now()
             if pending:
                 record.updated_at = utc_now()
                 self._persist_record(record)
-        return [item["content"] for item in pending]
+        return [
+            {"type": "user_message", "messageId": item["id"], "content": item["content"]}
+            for item in pending
+        ] + context_events
+
+    def scan_job_callbacks(self) -> int:
+        with self._lock:
+            records = list(self._tasks.values())
+        delivered = 0
+        for record in records:
+            run_dirs = [Path(path) for path in session_run_dirs(record)]
+            if not run_dirs:
+                continue
+            manager = DockerJobManager(self.config, None, run_dirs[-1], prior_run_dirs=run_dirs[:-1])
+            for job in manager.list_jobs().get("jobs", []):
+                job_id = str(job.get("job_id") or "")
+                status = str(job.get("status") or "")
+                if status == "running":
+                    refreshed = manager.get_job(job_id, refresh=True)
+                    status = str(refreshed.get("status") or status)
+                    job = refreshed
+                elif status in TERMINAL_JOB_STATUSES:
+                    job = manager.get_job(job_id)
+                if not job_id or status not in TERMINAL_JOB_STATUSES or status == "cancelled":
+                    continue
+                if str(job.get("callback_state") or "") != "pending":
+                    continue
+                if record.delivered_job_callbacks.get(job_id) == status:
+                    continue
+                callback_id = f"callback_{uuid.uuid4().hex[:16]}"
+                event = {
+                    "type": "job_callback",
+                    "callbackId": callback_id,
+                    "jobId": job_id,
+                    "status": status,
+                    "exitCode": job.get("exit_code"),
+                    "artifacts": job.get("artifacts") or [],
+                    "content": f"Job {job_id} reached terminal status {status}. Inspect its exact results and continue.",
+                }
+                self._apply_event(record, event)
+                manager.mark_callback_delivered(job_id, callback_id)
+                record.delivered_job_callbacks[job_id] = status
+                delivered += 1
+                if record.status in {"completed", "failed"} and not record.interaction_status:
+                    self._start_callback_follow_up(record)
+        return delivered
+
+    def _job_watch_loop(self) -> None:
+        while not self._job_watcher_stop.wait(self._job_watch_interval_s):
+            try:
+                self.scan_job_callbacks()
+            except Exception:
+                time.sleep(self._job_watch_interval_s)
+
+    def stop_job_watcher(self) -> None:
+        self._job_watcher_stop.set()
+
+    def _start_callback_follow_up(self, record: TaskRecord) -> None:
+        with self._lock:
+            if record.status not in {"completed", "failed"}:
+                return
+            start_session_run(record, kind="agent")
+            record.status = "queued"
+            record.error = ""
+            record.final_answer = ""
+            record.event_queue = queue.Queue()
+            record.updated_at = utc_now()
+            self._persist_record(record)
+        threading.Thread(
+            target=self._run_follow_up,
+            args=(record, False),
+            name=f"bioagent-callback-{record.id}",
+            daemon=True,
+        ).start()
 
     def list_tasks(self) -> list[dict[str, Any]]:
         with self._lock:
             records = list(self._tasks.values())
-        return [
-            {
+        result: list[dict[str, Any]] = []
+        for record in sorted(records, key=lambda item: item.updated_at, reverse=True):
+            result_files = record.result_files()
+            result.append({
                 "id": record.id,
                 "title": record.title,
                 "task": record.task,
@@ -266,14 +405,13 @@ class TaskStore:
                 "logPath": record.log_path,
                 "messageCount": len(record.messages),
                 "traceCount": len(record.traces),
-                "resultFileCount": count_result_files(record.result_root()),
-                "resultFileNames": result_file_names(record.result_root()),
+                "resultFileCount": len(flatten_file_nodes(result_files)),
+                "resultFileNames": [node["name"] for node in flatten_file_nodes(result_files)],
                 "sessionStatus": record.session_status,
                 "runStatus": record.status,
                 "runCount": len(record.runs),
-            }
-            for record in sorted(records, key=lambda item: item.updated_at, reverse=True)
-        ]
+            })
+        return result
 
     def get_task(self, task_id: str) -> TaskRecord:
         with self._lock:
@@ -349,7 +487,7 @@ class TaskStore:
         finally:
             record.event_queue.put(None)
 
-    def _run_follow_up(self, record: TaskRecord) -> None:
+    def _run_follow_up(self, record: TaskRecord, include_latest_user_message: bool = True) -> None:
         self._apply_event(record, {"type": "task_started", "status": "running"})
         try:
             kwargs: dict[str, Any] = {
@@ -363,7 +501,7 @@ class TaskStore:
                 kwargs["take_pending_messages"] = lambda: self.take_pending_messages(record.id)
             if callable_accepts(self.stream_runner, "initial_memory_state"):
                 kwargs["initial_memory_state"] = session_memory_state(record)
-            if callable_accepts(self.stream_runner, "session_message"):
+            if include_latest_user_message and callable_accepts(self.stream_runner, "session_message"):
                 kwargs["session_message"] = latest_user_message(record)
             if callable_accepts(self.stream_runner, "prior_run_dirs"):
                 kwargs["prior_run_dirs"] = session_run_dirs(record)
@@ -410,6 +548,12 @@ class TaskStore:
 
     def _apply_event(self, record: TaskRecord, event: dict[str, Any]) -> None:
         with self._lock:
+            event = envelope_event(
+                event,
+                session_id=record.id,
+                current_run_id=str(record.compute.get("runId") or ""),
+                prior_events=record.events,
+            )
             apply_event_to_record(record, event)
             record.events.append(event)
             record.updated_at = utc_now()
@@ -445,6 +589,8 @@ def record_to_payload(record: TaskRecord) -> dict[str, Any]:
         "messages": record.messages,
         "traces": record.traces,
         "plan": record.plan,
+        "plan_state": record.plan_state,
+        "active_question": record.active_question,
         "events": record.events,
         "compute": record.compute,
         "memory": record.memory,
@@ -453,6 +599,8 @@ def record_to_payload(record: TaskRecord) -> dict[str, Any]:
         "runs": record.runs,
         "active_run_id": record.active_run_id,
         "pending_user_messages": record.pending_user_messages,
+        "pending_context_events": record.pending_context_events,
+        "delivered_job_callbacks": record.delivered_job_callbacks,
         "final_answer": record.final_answer,
         "run_dir": record.run_dir,
         "log_path": record.log_path,
@@ -473,6 +621,8 @@ def record_from_payload(payload: dict[str, Any]) -> TaskRecord:
         messages=_normalize_stored_messages(payload.get("messages") or []),
         traces=list(payload.get("traces") or []),
         plan=list(payload.get("plan") or []),
+        plan_state=dict(payload.get("plan_state") or {}),
+        active_question=dict(payload.get("active_question") or {}),
         events=list(payload.get("events") or []),
         compute=dict(payload.get("compute") or {}),
         memory=dict(payload.get("memory") or {}),
@@ -481,6 +631,8 @@ def record_from_payload(payload: dict[str, Any]) -> TaskRecord:
         runs=list(payload.get("runs") or []),
         active_run_id=str(payload.get("active_run_id") or ""),
         pending_user_messages=list(payload.get("pending_user_messages") or []),
+        pending_context_events=list(payload.get("pending_context_events") or []),
+        delivered_job_callbacks=dict(payload.get("delivered_job_callbacks") or {}),
         final_answer=str(payload.get("final_answer") or ""),
         run_dir=str(payload.get("run_dir") or ""),
         log_path=str(payload.get("log_path") or ""),
@@ -497,6 +649,17 @@ def record_from_payload(payload: dict[str, Any]) -> TaskRecord:
                 "endedAt": record.updated_at if record.status in {"completed", "failed", "paused", "needs_user_input"} else "",
             }
         )
+    restored_events: list[dict[str, Any]] = []
+    for event in record.events:
+        restored_events.append(
+            envelope_event(
+                event,
+                session_id=record.id,
+                current_run_id=str(record.compute.get("runId") or ""),
+                prior_events=restored_events,
+            )
+        )
+    record.events = restored_events
     for trace in record.traces:
         output = trace.get("output")
         if isinstance(output, dict) and output.get("ok") is False:
@@ -580,6 +743,7 @@ def apply_event_to_record(record: TaskRecord, event: dict[str, Any]) -> None:
         return
     if event_type == "resume_started":
         record.status = "running"
+        record.active_question = {}
         update_active_session_run(record, status="running")
         if event.get("resume_kind") == "paused":
             ensure_plan_step(record, "Pause task", "completed")
@@ -622,6 +786,15 @@ def apply_event_to_record(record: TaskRecord, event: dict[str, Any]) -> None:
         if content:
             append_session_message(record, "assistant", content, delivery="consumed")
         return
+    if event_type == "steering_message":
+        message_id = str(event.get("messageId") or event.get("message_id") or "")
+        message = next((item for item in record.messages if item.get("id") == message_id), None)
+        if message is not None:
+            message["delivery"] = "consumed"
+            message["consumedAt"] = str(event.get("createdAt") or utc_now())
+            message["consumedByEventId"] = str(event.get("eventId") or "")
+            message["consumedByTurnId"] = str(event.get("turnId") or "")
+        return
     if event_type == "tool_call":
         call_id = str(event.get("call_id") or uuid.uuid4().hex[:8])
         tool_name = str(event.get("tool_name") or "tool")
@@ -629,6 +802,10 @@ def apply_event_to_record(record: TaskRecord, event: dict[str, Any]) -> None:
         record.traces.append(
             {
                 "id": call_id,
+                "eventId": str(event.get("eventId") or ""),
+                "toolCallId": str(event.get("toolCallId") or call_id),
+                "runId": str(event.get("runId") or event.get("run_id") or ""),
+                "turnId": str(event.get("turnId") or ""),
                 "toolName": tool_name,
                 "status": "running",
                 "input": event.get("args") or {},
@@ -647,8 +824,25 @@ def apply_event_to_record(record: TaskRecord, event: dict[str, Any]) -> None:
         if trace is not None:
             trace["status"] = status
             trace["output"] = event.get("result")
+            trace["resultEventId"] = str(event.get("eventId") or "")
             trace["updatedAt"] = utc_now()
         record.compute["currentTool"] = ""
+        result = event.get("result") if isinstance(event.get("result"), dict) else {}
+        plan = result.get("plan") if isinstance(result.get("plan"), dict) else None
+        if plan is not None:
+            record.plan_state = plan
+            record.plan = [dict(item) for item in plan.get("steps") or [] if isinstance(item, dict)]
+        if result.get("status") == "needs_user_input" and result.get("question"):
+            record.active_question = {
+                "questionId": str(result.get("question_id") or ""),
+                "interactionType": str(result.get("interaction_type") or "clarification"),
+                "question": str(result.get("question") or ""),
+                "reason": str(result.get("reason") or ""),
+                "options": list(result.get("options") or []),
+                "allowFreeText": bool(result.get("allow_free_text", True)),
+                "inputType": str(result.get("input_type") or "text"),
+                "requiredFields": list(result.get("required_fields") or []),
+            }
         ensure_plan_step(record, f"Call {tool_name}", status)
         ensure_plan_step(record, f"Finish {tool_name}", status)
         return
@@ -698,6 +892,15 @@ def apply_event_to_record(record: TaskRecord, event: dict[str, Any]) -> None:
             ensure_plan_step(record, "Pause task", "completed")
             return
         ensure_plan_step(record, "Finish run", "completed" if record.status == "completed" else record.status)
+        return
+    if event_type == "job_callback":
+        job_id = str(event.get("jobId") or event.get("job_id") or "")
+        callback_id = str(event.get("callbackId") or event.get("callback_id") or "")
+        if job_id:
+            record.delivered_job_callbacks[job_id] = str(event.get("status") or "unknown")
+        if callback_id and not any(item.get("callbackId") == callback_id for item in record.pending_context_events):
+            record.pending_context_events.append(dict(event))
+        ensure_plan_step(record, f"Job {job_id} {event.get('status', 'updated')}", "completed")
         return
     if event_type == "error":
         record.status = "failed"
@@ -827,6 +1030,8 @@ def session_run_dirs(record: TaskRecord) -> list[str]:
 
 
 def ensure_plan_step(record: TaskRecord, title: str, status: str) -> None:
+    if record.plan_state:
+        return
     existing = next((item for item in record.plan if item["title"] == title), None)
     if existing:
         existing["status"] = status
@@ -844,7 +1049,7 @@ def callable_accepts(function: Callable[..., Any], parameter: str) -> bool:
     )
 
 
-def stop_active_docker_containers(run_dir: Path) -> None:
+def stop_active_docker_containers(run_dir: Path, *, include_jobs: bool = True) -> None:
     for name in (".docker-python.cid", ".docker-r.cid"):
         cidfile = run_dir / name
         if not cidfile.is_file():
@@ -861,7 +1066,8 @@ def stop_active_docker_containers(run_dir: Path) -> None:
             timeout=30,
             check=False,
         )
-    cancel_run_jobs(run_dir)
+    if include_jobs:
+        cancel_run_jobs(run_dir)
 
 
 def normalize_plan_from_traces(record: TaskRecord) -> None:
@@ -885,6 +1091,38 @@ def build_file_tree(root: Path | None) -> list[dict[str, Any]]:
         return []
     children = sorted(root.iterdir(), key=file_tree_sort_key)
     return [_file_node(path) for path in children if path.name != "__pycache__"]
+
+
+def build_merged_file_tree(roots: list[Path]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for root in roots:
+        for node in build_file_tree(root):
+            name = str(node.get("name") or "")
+            existing = merged.get(name)
+            if existing and existing.get("type") == node.get("type") == "directory":
+                existing["children"] = merge_file_nodes(existing.get("children", []), node.get("children", []))
+            else:
+                merged[name] = node
+    return sorted(merged.values(), key=file_node_sort_key)
+
+
+def merge_file_nodes(existing: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged = {str(node.get("name") or ""): node for node in existing}
+    for node in incoming:
+        name = str(node.get("name") or "")
+        current = merged.get(name)
+        if current and current.get("type") == node.get("type") == "directory":
+            current["children"] = merge_file_nodes(current.get("children", []), node.get("children", []))
+        else:
+            merged[name] = node
+    return sorted(merged.values(), key=file_node_sort_key)
+
+
+def file_node_sort_key(node: dict[str, Any]) -> tuple[int, int, str]:
+    if node.get("type") == "directory":
+        return (0, 0, str(node.get("name") or "").lower())
+    name = str(node.get("name") or "")
+    return (1, result_file_rank(name), name.lower())
 
 
 def count_result_files(root: Path | None) -> int:

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import mimetypes
 import re
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -21,6 +24,7 @@ from .workspace import resolve_run_path, run_relative_path, validate_script_impl
 
 JOB_ID_PATTERN = re.compile(r"^job_\d{8}_\d{6}_[0-9a-f]{6}$")
 TERMINAL_JOB_STATUSES = {"completed", "failed", "cancelled", "timed_out", "failed_to_start"}
+JOB_METADATA_LOCK = threading.RLock()
 
 
 def _now() -> str:
@@ -94,6 +98,7 @@ class DockerJobManager:
         job_dir.mkdir(parents=True, exist_ok=False)
         cidfile = job_dir / "container.cid"
         relative_script = run_relative_path(self.run_dir, script)
+        script_sha256 = _sha256(script)
         docker_script = f"/work/{relative_script}"
         inner = self._inner_command(
             runtime=normalized_runtime,
@@ -138,6 +143,7 @@ class DockerJobManager:
                     "exit_code": started.returncode,
                     "stderr": started.stderr,
                     "created_at": _now(),
+                    "callback_state": "pending",
                 },
             )
             self._set_active_job(job_id)
@@ -160,13 +166,17 @@ class DockerJobManager:
             "env_profile": env_profile,
             "image": image,
             "script_path": str(script),
+            "script_sha256": script_sha256,
             "workspace_script_path": docker_script,
             "container_id": container_id,
             "timeout_s": max(1, timeout_s),
             "created_at": _now(),
             "updated_at": _now(),
             "attempts_used": attempt["attempts_used"],
+            "callback_state": "pending",
         }
+        self._write_job(job_dir, metadata)
+        metadata["execution_manifest_path"] = str(_write_execution_manifest(self.run_dir, metadata))
         self._write_job(job_dir, metadata)
         self._set_active_job(job_id)
         return {"ok": True, **metadata, "attempts_remaining": attempt["attempts_remaining"]}
@@ -257,16 +267,51 @@ class DockerJobManager:
             }
         container_id = str(metadata.get("container_id") or "")
         removed = _run(["docker", "rm", "-f", container_id], timeout=30)
-        metadata.update(status="cancelled", updated_at=_now(), cancelled_at=_now())
+        inspected = _run(["docker", "inspect", container_id], timeout=30) if removed.returncode == 0 else removed
+        verified_exit = removed.returncode == 0 and inspected.returncode != 0
+        metadata.update(
+            status="cancelled" if verified_exit else metadata.get("status", "running"),
+            updated_at=_now(),
+            cancelled_at=_now() if verified_exit else "",
+            cancel_verified=verified_exit,
+        )
         self._write_job(job_dir, metadata)
         return {
-            "ok": removed.returncode == 0,
+            "ok": verified_exit,
             "job_id": resolved_job_id,
-            "status": "cancelled",
-            "error": "" if removed.returncode == 0 else removed.stderr.strip(),
+            "status": metadata["status"],
+            "verified_exit": verified_exit,
+            "error": "" if verified_exit else (removed.stderr.strip() or "Container still exists after cancellation request."),
         }
 
+    def mark_callback_delivered(self, job_id: str, callback_id: str) -> None:
+        with JOB_METADATA_LOCK:
+            loaded = self._load_job_or_error(job_id)
+            if isinstance(loaded, dict):
+                return
+            job_dir, metadata = loaded
+            metadata.update(
+                callback_state="delivered",
+                callback_id=callback_id,
+                callback_delivered_at=_now(),
+                updated_at=_now(),
+            )
+            self._write_job(job_dir, metadata)
+            run_dir = job_dir.parent.parent
+            metadata["execution_manifest_path"] = str(_write_execution_manifest(run_dir, metadata))
+            self._write_job(job_dir, metadata)
+
     def _poll_once(self, job_dir: Path, metadata: dict[str, Any]) -> dict:
+        with JOB_METADATA_LOCK:
+            return self._poll_once_locked(job_dir, metadata)
+
+    def _poll_once_locked(self, job_dir: Path, metadata: dict[str, Any]) -> dict:
+        try:
+            persisted = json.loads((job_dir / "job.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            persisted = None
+        if isinstance(persisted, dict):
+            metadata = persisted
         if metadata.get("status") in TERMINAL_JOB_STATUSES:
             return self._public_result(metadata)
         container_id = str(metadata.get("container_id") or "")
@@ -302,9 +347,11 @@ class DockerJobManager:
             error=str(state.get("Error") or ""),
             updated_at=_now(),
             finished_at=_now(),
-            artifacts=_output_artifacts(job_run_dir),
+            artifacts=_output_artifacts(job_run_dir, metadata),
             container_removed=removed.returncode == 0,
         )
+        self._write_job(job_dir, metadata)
+        metadata["execution_manifest_path"] = str(_write_execution_manifest(job_run_dir, metadata))
         self._write_job(job_dir, metadata)
         self._progress("Docker job finished", f"job_id={metadata['job_id']} status={status} exit_code={exit_code}")
         return self._public_result(metadata)
@@ -443,10 +490,11 @@ class DockerJobManager:
 
     @staticmethod
     def _write_job(job_dir: Path, metadata: dict[str, Any]) -> None:
-        path = job_dir / "job.json"
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        temporary.replace(path)
+        with JOB_METADATA_LOCK:
+            path = job_dir / "job.json"
+            temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+            temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+            temporary.replace(path)
 
     @staticmethod
     def _public_result(metadata: dict[str, Any]) -> dict:
@@ -493,15 +541,110 @@ def _run(command: list[str], *, timeout: int) -> subprocess.CompletedProcess[str
     )
 
 
-def _output_artifacts(run_dir: Path) -> list[dict[str, Any]]:
+def _output_artifacts(run_dir: Path, job: dict[str, Any]) -> list[dict[str, Any]]:
     output_dir = run_dir / "outputs"
     if not output_dir.is_dir():
         return []
-    return [
-        {"path": str(path), "size_bytes": path.stat().st_size}
-        for path in sorted(output_dir.rglob("*"))
-        if path.is_file()
-    ]
+    result = []
+    for path in sorted(output_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        digest = _sha256(path)
+        artifact_id = "artifact_" + hashlib.sha256(
+            f"{job.get('job_id')}:{path.resolve()}:{digest}".encode("utf-8")
+        ).hexdigest()[:16]
+        result.append(
+            {
+                "artifact_id": artifact_id,
+                "path": str(path.resolve()),
+                "size_bytes": path.stat().st_size,
+                "mime_type": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+                "sha256": digest,
+                "created_by_job_id": str(job.get("job_id") or ""),
+                "created_by_tool_call_id": str(job.get("created_by_tool_call_id") or ""),
+                "created_by_event_id": str(job.get("created_by_event_id") or ""),
+                "script_path": str(job.get("script_path") or ""),
+                "script_sha256": str(job.get("script_sha256") or ""),
+                "runtime": str(job.get("runtime") or ""),
+                "env_profile": str(job.get("env_profile") or ""),
+                "image": str(job.get("image") or ""),
+                "input_artifact_ids": [],
+                "created_at": _now(),
+            }
+        )
+    return result
+
+
+def attach_job_provenance(
+    run_dirs: list[Path],
+    *,
+    job_id: str,
+    tool_call_id: str,
+    event_id: str,
+) -> None:
+    with JOB_METADATA_LOCK:
+        for run_dir in run_dirs:
+            metadata_path = run_dir / "jobs" / job_id / "job.json"
+            if not metadata_path.is_file():
+                continue
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return
+            metadata.update(created_by_tool_call_id=tool_call_id, created_by_event_id=event_id, updated_at=_now())
+            DockerJobManager._write_job(metadata_path.parent, metadata)
+            metadata["execution_manifest_path"] = str(_write_execution_manifest(run_dir, metadata))
+            DockerJobManager._write_job(metadata_path.parent, metadata)
+            return
+
+
+def _write_execution_manifest(run_dir: Path, job: dict[str, Any]) -> Path:
+    with JOB_METADATA_LOCK:
+        path = run_dir / "state" / "execution_manifest.json"
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = {"version": 1, "jobs": {}, "artifacts": {}}
+        if not isinstance(manifest, dict):
+            manifest = {"version": 1, "jobs": {}, "artifacts": {}}
+        jobs = manifest.setdefault("jobs", {})
+        artifacts = manifest.setdefault("artifacts", {})
+        jobs[str(job.get("job_id") or "unknown")] = {
+            key: job.get(key)
+            for key in (
+                "job_id",
+                "run_id",
+                "status",
+                "runtime",
+                "env_profile",
+                "image",
+                "script_path",
+                "script_sha256",
+                "created_by_tool_call_id",
+                "created_by_event_id",
+                "created_at",
+                "finished_at",
+                "exit_code",
+            )
+            if job.get(key) is not None
+        }
+        for artifact in job.get("artifacts") or []:
+            if isinstance(artifact, dict) and artifact.get("artifact_id"):
+                artifacts[str(artifact["artifact_id"])] = artifact
+        manifest["updated_at"] = _now()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+        temp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(path)
+        return path
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _compact_job(metadata: dict[str, Any], *, run_dir: Path) -> dict[str, Any]:
@@ -519,6 +662,7 @@ def _compact_job(metadata: dict[str, Any], *, run_dir: Path) -> dict[str, Any]:
             "finished_at",
             "exit_code",
             "attempts_used",
+            "callback_state",
         )
         if metadata.get(key) is not None
     }
