@@ -249,6 +249,8 @@ cd /home/luting/projects/mas/BioAgent
 http://127.0.0.1:8013/
 ```
 
+Composer 支持点击 `Attach` 或把文件拖入输入区域。上传内容持久化到 `BioAgent/uploads/`，消息会保存附件元数据，并向 Agent 提供 host path 与 Docker `/repo` path。后端按流读取并强制执行单文件 100 MB 上限，超限的半文件会立即清理。
+
 模型设置页面位于 `http://127.0.0.1:8013/settings`。保存后的显式覆盖写入
 `BioAgent/state/model-settings.json`（权限 `0600`）；API key 只以掩码返回前端。新 run 会重新加载该配置，
 无需重启 Workbench。Reset 会删除覆盖文件并恢复启动时的环境配置。
@@ -258,6 +260,8 @@ http://127.0.0.1:8013/
 | API | 作用 |
 |---|---|
 | `POST /api/sessions` | 创建 Session 并启动首次 BioAgent run |
+| `POST /api/uploads` | 上传新任务或现有 Session 的附件；query 参数为 `filename` 和可选 `session_id` |
+| `DELETE /api/uploads/{upload_id}` | 删除尚未发送的临时附件 |
 | `GET /api/sessions` | 查看历史 Session 列表 |
 | `GET /api/sessions/{session_id}` | 获取 Session、当前 run 和消息 snapshot |
 | `POST /api/sessions/{session_id}/messages` | 追加消息；运行中作为 steering，暂停时只回答，结束后启动 follow-up run |

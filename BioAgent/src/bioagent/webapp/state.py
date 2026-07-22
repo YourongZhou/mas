@@ -14,9 +14,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from bioagent.config import AgentConfig
+from bioagent.llm import build_llm, message_text
 from bioagent.runner import answer_bio_agent_message, resume_bio_agent, run_bio_agent_stream
 from bioagent.skills.registry import list_workflow_skills
 from bioagent.tools.jobs import DockerJobManager, TERMINAL_JOB_STATUSES, cancel_run_jobs
+from langchain_core.messages import HumanMessage
 
 from .protocol import envelope_event
 
@@ -24,10 +26,34 @@ from .protocol import envelope_event
 StreamRunner = Callable[..., Iterator[dict[str, Any]]]
 ResumeRunner = Callable[..., dict[str, Any]]
 ChatRunner = Callable[[dict[str, Any], str], str]
+TitleRunner = Callable[[AgentConfig, str], str]
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def fallback_session_title(task: str) -> str:
+    first_line = next((line.strip() for line in task.splitlines() if line.strip()), "")
+    return " ".join(first_line.split())[:90] or "Untitled BioAgent task"
+
+
+def clean_session_title(value: str) -> str:
+    title = " ".join(str(value or "").strip().splitlines()[0:1]).strip()
+    title = title.removeprefix("Title:").removeprefix("title:").removeprefix("标题：").removeprefix("标题:")
+    title = title.strip(" `\"'")
+    return " ".join(title.split())[:48]
+
+
+def generate_session_title(config: AgentConfig, task: str) -> str:
+    """Ask the configured chat model for a compact, sidebar-friendly session name."""
+    prompt = (
+        "为下面的 BioAgent 用户任务生成一个简短会话标题。\n"
+        "只输出标题本身，不要解释、引号或 Markdown。使用任务的语言，尽量 4-12 个字，最多 48 个字符。\n\n"
+        f"任务：\n{task.strip()[:2000]}"
+    )
+    response = build_llm(config).invoke([HumanMessage(content=prompt)])
+    return message_text(response)
 
 
 @dataclass
@@ -63,6 +89,7 @@ class TaskRecord:
     pause_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def snapshot(self) -> dict[str, Any]:
+        semantic_plan = [dict(item) for item in self.plan_state.get("steps") or [] if isinstance(item, dict)]
         return {
             "id": self.id,
             "title": self.title,
@@ -79,8 +106,9 @@ class TaskRecord:
             "updatedAt": self.updated_at,
             "messages": self.messages,
             "traces": self.traces,
-            "plan": self.plan,
+            "plan": semantic_plan,
             "planState": self.plan_state,
+            "activity": build_tool_activity(self.traces),
             "activeQuestion": self.active_question,
             "events": self.events,
             "resultFiles": self.result_files(),
@@ -140,6 +168,7 @@ class TaskStore:
         stream_runner: StreamRunner = run_bio_agent_stream,
         resume_runner: ResumeRunner = resume_bio_agent,
         chat_runner: ChatRunner = answer_bio_agent_message,
+        title_runner: TitleRunner | None = None,
         start_job_watcher: bool = False,
         job_watch_interval_s: float = 2.0,
     ) -> None:
@@ -147,6 +176,7 @@ class TaskStore:
         self.stream_runner = stream_runner
         self.resume_runner = resume_runner
         self.chat_runner = chat_runner
+        self.title_runner = title_runner
         self.history_dir = config.runs_dir / "web_tasks"
         self.history_dir.mkdir(parents=True, exist_ok=True)
         self._tasks: dict[str, TaskRecord] = {}
@@ -157,21 +187,63 @@ class TaskStore:
         if start_job_watcher:
             threading.Thread(target=self._job_watch_loop, name="bioagent-job-watcher", daemon=True).start()
 
-    def create_task(self, *, task: str, data_path: str | None = None, max_turns: int = 20) -> TaskRecord:
+    def create_task(
+        self,
+        *,
+        task: str,
+        data_path: str | None = None,
+        max_turns: int = 20,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> TaskRecord:
         task_id = uuid.uuid4().hex[:8]
-        title = task.strip().splitlines()[0][:90] or "Untitled BioAgent task"
+        title = fallback_session_title(task)
         record = TaskRecord(id=task_id, task=task, title=title, data_path=data_path, max_turns=max_turns)
         record.compute.update({"model": self.config.model_name, "baseUrl": self.config.base_url})
-        message = append_session_message(record, "user", task, delivery="consumed")
+        message = append_session_message(record, "user", task, delivery="consumed", attachments=attachments or [])
         start_session_run(record, kind="agent", trigger_message_id=message["id"])
         with self._lock:
             self._tasks[task_id] = record
             self._persist_record(record)
         thread = threading.Thread(target=self._run_task, args=(record,), name=f"bioagent-web-{task_id}", daemon=True)
         thread.start()
+        if self.title_runner is not None:
+            threading.Thread(
+                target=self._generate_session_title,
+                args=(record,),
+                name=f"bioagent-title-{task_id}",
+                daemon=True,
+            ).start()
         return record
 
-    def send_message(self, *, task_id: str, content: str, max_turns: int = 20) -> TaskRecord:
+    def _generate_session_title(self, record: TaskRecord) -> None:
+        """Replace the immediate local fallback without delaying the agent run."""
+        try:
+            title = clean_session_title(self.title_runner(self.config, record.task)) if self.title_runner else ""
+        except Exception:
+            return
+        if not title or title == record.title:
+            return
+        with self._lock:
+            record.title = title
+            event = envelope_event(
+                {"type": "session_title", "title": title},
+                session_id=record.id,
+                current_run_id=str(record.compute.get("runId") or ""),
+                prior_events=record.events,
+            )
+            record.events.append(event)
+            record.updated_at = utc_now()
+            self._persist_record(record)
+        record.event_queue.put(event)
+
+    def send_message(
+        self,
+        *,
+        task_id: str,
+        content: str,
+        max_turns: int = 20,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> TaskRecord:
         record = self.get_task(task_id)
         content = content.strip()
         if not content:
@@ -179,10 +251,21 @@ class TaskStore:
         if record.interaction_status:
             raise ValueError(f"Session {task_id} is already answering a message")
         if record.status == "needs_user_input":
-            return self.resume_task(task_id=task_id, user_answer=content, max_turns=max_turns)
+            return self.resume_task(
+                task_id=task_id,
+                user_answer=content,
+                max_turns=max_turns,
+                attachments=attachments,
+            )
         if record.status in {"queued", "running", "pausing"}:
             with self._lock:
-                message = append_session_message(record, "user", content, delivery="queued")
+                message = append_session_message(
+                    record,
+                    "user",
+                    content,
+                    delivery="queued",
+                    attachments=attachments or [],
+                )
                 record.pending_user_messages.append({"id": message["id"], "content": content})
                 event = {"type": "user_message", "message": message, "delivery": "queued"}
                 record.events.append(event)
@@ -192,7 +275,13 @@ class TaskStore:
             return record
         if record.status == "paused":
             with self._lock:
-                message = append_session_message(record, "user", content, delivery="consumed")
+                message = append_session_message(
+                    record,
+                    "user",
+                    content,
+                    delivery="consumed",
+                    attachments=attachments or [],
+                )
                 record.interaction_status = "answering"
                 record.event_queue = queue.Queue()
                 chat_run = start_session_run(record, kind="chat", trigger_message_id=message["id"], activate=False)
@@ -208,7 +297,13 @@ class TaskStore:
             return record
         if record.status in {"completed", "failed"}:
             with self._lock:
-                message = append_session_message(record, "user", content, delivery="consumed")
+                message = append_session_message(
+                    record,
+                    "user",
+                    content,
+                    delivery="consumed",
+                    attachments=attachments or [],
+                )
                 start_session_run(record, kind="agent", trigger_message_id=message["id"])
                 record.status = "queued"
                 record.error = ""
@@ -226,7 +321,14 @@ class TaskStore:
             return record
         raise ValueError(f"Session {task_id} cannot accept messages while status={record.status}")
 
-    def resume_task(self, *, task_id: str, user_answer: str, max_turns: int = 20) -> TaskRecord:
+    def resume_task(
+        self,
+        *,
+        task_id: str,
+        user_answer: str,
+        max_turns: int = 20,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> TaskRecord:
         record = self.get_task(task_id)
         if record.status not in {"needs_user_input", "paused"}:
             raise ValueError(f"Task {task_id} is not waiting for user input or paused")
@@ -245,6 +347,7 @@ class TaskStore:
                 delivery="consumed",
                 resume=True,
                 responseToQuestionId=question_id,
+                attachments=attachments or [],
             )
             record.updated_at = utc_now()
             self._persist_record(record)
@@ -1144,6 +1247,28 @@ def flatten_file_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
             files.append(node)
         files.extend(flatten_file_nodes(node.get("children", [])))
     return files
+
+
+def build_tool_activity(traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    order: list[str] = []
+    activity: dict[str, dict[str, Any]] = {}
+    for index, trace in enumerate(traces):
+        key = str(trace.get("toolCallId") or trace.get("id") or trace.get("eventId") or f"trace-{index}")
+        if key not in activity:
+            order.append(key)
+        activity[key] = {
+            "id": key,
+            "traceId": str(trace.get("id") or key),
+            "eventId": str(trace.get("eventId") or ""),
+            "toolCallId": str(trace.get("toolCallId") or key),
+            "toolName": str(trace.get("toolName") or "tool"),
+            "status": str(trace.get("status") or "pending"),
+            "runId": str(trace.get("runId") or ""),
+            "turnId": str(trace.get("turnId") or ""),
+            "createdAt": str(trace.get("createdAt") or ""),
+            "updatedAt": str(trace.get("updatedAt") or ""),
+        }
+    return [activity[key] for key in order]
 
 
 def file_tree_sort_key(path: Path) -> tuple[int, int, str]:

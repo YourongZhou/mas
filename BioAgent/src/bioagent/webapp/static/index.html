@@ -63,8 +63,10 @@
         <button class="scroll-latest" id="scrollLatestButton" type="button">Jump to latest</button>
 
         <form class="composer" id="taskForm">
-          <div class="composer-box">
+          <div class="composer-box" id="composerBox">
             <textarea id="taskInput" placeholder="Describe an analysis task...">使用 bmmc_b_cell.h5ad 做单细胞核心分析：读取数据、QC、标准化、HVG、PCA、neighbors、Leiden、UMAP、summary JSON、关键图和 processed h5ad。不要额外做 DE、marker gene、rank_genes_groups、轨迹或 PDF 报告。</textarea>
+            <input id="attachmentInput" type="file" multiple hidden />
+            <div class="attachment-list" id="attachmentList" hidden></div>
             <div class="question-panel" id="questionPanel" hidden>
               <div class="question-title" id="questionText"></div>
               <div class="question-reason" id="questionReason"></div>
@@ -76,6 +78,7 @@
                 <label class="turns-label">turns <input id="maxTurnsInput" type="number" min="1" max="100" value="20" /></label>
               </div>
               <div class="composer-actions">
+                <button class="composer-control attachment-control" id="attachButton" type="button" title="Attach files">Attach</button>
                 <button class="composer-control pause-control" id="pauseButton" type="button" title="Pause agent decisions without cancelling an asynchronous job" hidden>Pause Agent</button>
                 <button class="composer-control interrupt-control" id="interruptButton" type="button" title="Interrupt the currently running synchronous tool" hidden>Interrupt Tool</button>
                 <button class="composer-control cancel-control" id="cancelJobButton" type="button" title="Cancel the active asynchronous job" hidden>Cancel Job</button>
@@ -119,7 +122,7 @@
                 </section>
                 <section class="trace-plan">
                   <div class="group-head"><span>Plan</span><span class="pill" id="tracePlanCount">0</span></div>
-                  <div id="tracePlanList"><div class="empty">Plan updates appear as the run progresses.</div></div>
+                  <div id="tracePlanList"><div class="empty">No semantic plan.</div></div>
                 </section>
               </div>
             </div>
@@ -188,7 +191,12 @@
       <aside class="right">
         <section class="side-panel">
           <div class="panel-head"><h3>Plan</h3><span class="pill" id="planCount">0</span></div>
-          <div id="planList"><div class="empty">Plan updates appear as the run progresses.</div></div>
+          <div id="planList"><div class="empty">No semantic plan.</div></div>
+        </section>
+
+        <section class="side-panel activity-panel">
+          <div class="panel-head"><h3>Activity</h3><span class="pill" id="activityCount">0</span></div>
+          <div class="activity-list" id="activityList"><div class="empty">No tool activity yet.</div></div>
         </section>
 
         <section class="side-panel">

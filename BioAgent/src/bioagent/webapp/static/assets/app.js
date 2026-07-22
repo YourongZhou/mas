@@ -16,6 +16,9 @@ const state = {
   defaultMaxTurns: "20",
   view: "workbench",
   settingsBusy: false,
+  pendingAttachments: [],
+  maxUploadBytes: 100 * 1024 * 1024,
+  uploadBusy: false,
 };
 
 const els = {};
@@ -23,12 +26,12 @@ const els = {};
 document.addEventListener("DOMContentLoaded", () => {
   for (const id of [
     "taskTitle", "runtimeLine", "currentToolPill", "statusPill", "refreshButton", "newTaskButton", "taskSearch", "clearTaskSearchButton",
-    "taskList", "messageStream", "scrollLatestButton", "taskForm", "taskInput", "dataPathInput", "maxTurnsInput",
+    "taskList", "messageStream", "scrollLatestButton", "taskForm", "composerBox", "taskInput", "dataPathInput", "maxTurnsInput",
     "errorLine", "detailTabs", "detailBody", "traceTab", "memoryTab", "resultTab", "fileTab", "traceTitle", "traceMeta", "tracePlanCount", "tracePlanList", "traceInput", "traceOutput", "traceListCount", "traceList",
     "memoryMeta", "memoryState", "memoryEpisodes",
     "resultSummary", "resultVisuals", "resultFileList", "fileTitle", "fileMeta", "copyFilePathButton", "downloadLink", "filePreview", "planCount",
-    "planList", "filesRefreshButton", "fileSearch", "clearFileSearchButton", "fileTree", "computeState", "computeGrid", "resultComputeGrid", "sendButton", "pauseButton", "interruptButton", "cancelJobButton", "continueButton",
-    "questionPanel", "questionText", "questionReason", "questionOptions",
+    "planList", "activityCount", "activityList", "filesRefreshButton", "fileSearch", "clearFileSearchButton", "fileTree", "computeState", "computeGrid", "resultComputeGrid", "sendButton", "pauseButton", "interruptButton", "cancelJobButton", "continueButton",
+    "questionPanel", "questionText", "questionReason", "questionOptions", "attachmentInput", "attachmentList", "attachButton",
     "composerOptions", "workbenchNavButton", "settingsNavButton", "modelSettingsPage", "modelSettingsForm",
     "modelSettingsSource", "modelConnectionStatus", "modelProviderInput", "modelBaseUrlInput", "modelNameInput", "modelApiKeyInput",
     "modelTemperatureInput", "modelTimeoutInput", "modelChatThinkingInput", "modelMimoThinkingInput",
@@ -41,6 +44,24 @@ document.addEventListener("DOMContentLoaded", () => {
   state.defaultMaxTurns = els.maxTurnsInput.value;
 
   els.taskForm.addEventListener("submit", startTask);
+  els.attachButton.addEventListener("click", () => els.attachmentInput.click());
+  els.attachmentInput.addEventListener("change", async () => {
+    await uploadFiles([...els.attachmentInput.files]);
+    els.attachmentInput.value = "";
+  });
+  els.composerBox.addEventListener("dragover", (event) => {
+    if (!event.dataTransfer?.types?.includes("Files")) return;
+    event.preventDefault();
+    els.composerBox.classList.add("dragging");
+  });
+  els.composerBox.addEventListener("dragleave", (event) => {
+    if (!els.composerBox.contains(event.relatedTarget)) els.composerBox.classList.remove("dragging");
+  });
+  els.composerBox.addEventListener("drop", async (event) => {
+    event.preventDefault();
+    els.composerBox.classList.remove("dragging");
+    await uploadFiles([...event.dataTransfer.files]);
+  });
   els.pauseButton.addEventListener("click", pauseTask);
   els.interruptButton.addEventListener("click", interruptCurrentTool);
   els.cancelJobButton.addEventListener("click", cancelActiveJob);
@@ -144,6 +165,7 @@ document.addEventListener("DOMContentLoaded", () => {
 async function init() {
   try {
     const health = await api("/api/health");
+    state.maxUploadBytes = Number(health.maxUploadBytes || state.maxUploadBytes);
     els.runtimeLine.textContent = `${health.model || "model"} · ${health.baseUrl || "local"}`;
     await loadTasks();
     await handleLocationChange();
@@ -184,6 +206,7 @@ function showNewTask() {
   state.selectedFilePath = null;
   state.userSelectedTab = false;
   state.replyTaskId = null;
+  discardPendingAttachments();
   cancelSubmit();
   closeEvents();
   resetFilePreview();
@@ -354,9 +377,10 @@ async function startTask(event) {
   }
   closeEvents();
   const payload = {
-    task: els.taskInput.value.trim(),
+    task: els.taskInput.value.trim() || (state.pendingAttachments.length ? "Analyze the attached file(s)." : ""),
     data_path: els.dataPathInput.value.trim() || null,
     max_turns: Number(els.maxTurnsInput.value || 20),
+    attachment_ids: state.pendingAttachments.map((attachment) => attachment.uploadId),
   };
   if (!payload.task) {
     showError("Task is required.");
@@ -371,6 +395,7 @@ async function startTask(event) {
     });
     if (state.submitToken !== submitToken) return;
     addUserMessage(payload.task);
+    clearPendingAttachments();
     history.pushState(null, "", created.redirectUrl);
     await loadTasks();
     await selectTask(created.taskId);
@@ -382,7 +407,7 @@ async function startTask(event) {
 }
 
 async function sendSessionMessage(contentOverride = "", submitMode = "message") {
-  const content = contentOverride || els.taskInput.value.trim();
+  const content = contentOverride || els.taskInput.value.trim() || (state.pendingAttachments.length ? "Use the attached file(s) for this request." : "");
   const sessionId = state.taskId;
   if (!sessionId || !content) {
     showError("Message is required.");
@@ -396,10 +421,12 @@ async function sendSessionMessage(contentOverride = "", submitMode = "message") 
       body: JSON.stringify({
         content,
         max_turns: Number(els.maxTurnsInput.value || 20),
+        attachment_ids: state.pendingAttachments.map((attachment) => attachment.uploadId),
       }),
     });
     if (state.submitToken !== submitToken) return;
     els.taskInput.value = "";
+    clearPendingAttachments();
     await loadTasks();
     await selectTask(sessionId);
   } catch (error) {
@@ -410,7 +437,8 @@ async function sendSessionMessage(contentOverride = "", submitMode = "message") 
 }
 
 async function resumeTask() {
-  const userAnswer = els.taskInput.value.trim() || "Continue the paused run from its saved checkpoint.";
+  const userAnswer = els.taskInput.value.trim()
+    || (state.pendingAttachments.length ? "Continue using the attached file(s)." : "Continue the paused run from its saved checkpoint.");
   const taskId = state.taskId;
   const isPaused = state.snapshot?.status === "paused";
   const submitToken = beginSubmit(isPaused ? "continue" : "reply");
@@ -421,10 +449,12 @@ async function resumeTask() {
       body: JSON.stringify({
         user_answer: userAnswer,
         max_turns: Number(els.maxTurnsInput.value || 20),
+        attachment_ids: state.pendingAttachments.map((attachment) => attachment.uploadId),
       }),
     });
     if (state.submitToken !== submitToken) return;
     els.taskInput.value = "";
+    clearPendingAttachments();
     await loadTasks();
     await selectTask(taskId);
   } catch (error) {
@@ -432,6 +462,94 @@ async function resumeTask() {
   } finally {
     finishSubmit(submitToken);
   }
+}
+
+async function uploadFiles(files) {
+  const available = Math.max(0, 20 - state.pendingAttachments.length);
+  const selected = files.filter((file) => file instanceof File).slice(0, available);
+  if (!selected.length) return;
+  state.uploadBusy = true;
+  renderAttachmentComposer();
+  showError("");
+  try {
+    for (const file of selected) {
+      if (file.size > state.maxUploadBytes) {
+        throw new Error(`${file.name} exceeds the ${formatBytes(state.maxUploadBytes)} upload limit.`);
+      }
+      const params = new URLSearchParams({ filename: file.name });
+      if (state.taskId) params.set("session_id", state.taskId);
+      const uploaded = await api(`/api/uploads?${params}`, {
+        method: "POST",
+        headers: { "Content-Type": file.type || "application/octet-stream" },
+        body: file,
+      });
+      state.pendingAttachments.push(uploaded);
+      if (!state.taskId && state.pendingAttachments.length === 1) {
+        els.dataPathInput.value = uploaded.path;
+      }
+      renderAttachmentComposer();
+    }
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    state.uploadBusy = false;
+    renderComposer(state.snapshot);
+    renderAttachmentComposer();
+  }
+}
+
+async function removePendingAttachment(uploadId) {
+  const attachment = state.pendingAttachments.find((item) => item.uploadId === uploadId);
+  if (!attachment) return;
+  const params = new URLSearchParams();
+  if (attachment.sessionId) params.set("session_id", attachment.sessionId);
+  try {
+    await api(`/api/uploads/${encodeURIComponent(uploadId)}?${params}`, { method: "DELETE" });
+  } catch (_) {
+    // Removing the local chip is still safe if the temporary server file was already cleaned up.
+  }
+  if (!state.taskId && els.dataPathInput.value === attachment.path) els.dataPathInput.value = "";
+  state.pendingAttachments = state.pendingAttachments.filter((item) => item.uploadId !== uploadId);
+  renderAttachmentComposer();
+}
+
+function clearPendingAttachments() {
+  state.pendingAttachments = [];
+  renderAttachmentComposer();
+}
+
+function discardPendingAttachments() {
+  const pending = state.pendingAttachments;
+  state.pendingAttachments = [];
+  renderAttachmentComposer();
+  for (const attachment of pending) {
+    const params = new URLSearchParams();
+    if (attachment.sessionId) params.set("session_id", attachment.sessionId);
+    fetch(`/api/uploads/${encodeURIComponent(attachment.uploadId)}?${params}`, { method: "DELETE" }).catch(() => {});
+  }
+}
+
+function renderAttachmentComposer() {
+  els.attachButton.disabled = state.uploadBusy || state.isSubmitting || state.pendingAttachments.length >= 20;
+  if (state.uploadBusy) els.sendButton.disabled = true;
+  els.attachmentList.hidden = !state.pendingAttachments.length && !state.uploadBusy;
+  els.attachmentList.innerHTML = state.pendingAttachments.map((attachment) => `
+    <span class="attachment-chip" title="${escapeHtml(attachment.path)}">
+      <span class="attachment-name">${escapeHtml(attachment.name)}</span>
+      <span class="attachment-size">${escapeHtml(formatBytes(attachment.size))}</span>
+      <button type="button" data-remove-upload="${escapeHtml(attachment.uploadId)}" title="Remove attachment" aria-label="Remove ${escapeHtml(attachment.name)}">&times;</button>
+    </span>
+  `).join("") + (state.uploadBusy ? '<span class="attachment-uploading">Uploading...</span>' : "");
+  els.attachmentList.querySelectorAll("[data-remove-upload]").forEach((button) => {
+    button.addEventListener("click", () => removePendingAttachment(button.dataset.removeUpload));
+  });
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 async function pauseTask() {
@@ -488,6 +606,7 @@ async function selectTask(taskId) {
   enterWorkbenchView();
   const previousTaskId = state.taskId;
   const previousSnapshot = state.snapshot;
+  if (state.taskId !== taskId) discardPendingAttachments();
   state.taskId = taskId;
   try {
     const snapshot = await api(`/api/sessions/${taskId}`);
@@ -629,6 +748,7 @@ function render() {
   renderMessages(snapshot);
   renderTraces(snapshot);
   renderPlan(snapshot);
+  renderActivity(snapshot);
   renderFiles(snapshot);
   renderCompute(snapshot);
   renderResultSummary(snapshot);
@@ -637,6 +757,7 @@ function render() {
   renderMemory(snapshot);
   renderQuestion(snapshot);
   renderComposer(snapshot);
+  renderAttachmentComposer();
 }
 
 function mergeTaskSnapshot(snapshot) {
@@ -1136,14 +1257,32 @@ function renderMessages(snapshot) {
   els.messageStream.innerHTML = messages.map((message) => `
     <article class="message ${message.role === "user" ? "user" : ""} ${message.error ? "error" : ""} ${message.final ? "final" : ""}">
       <div class="speaker">${message.role === "user" ? "User" : message.final ? "Final" : "BioAgent"}</div>
-      <p>${escapeHtml(message.content || "")}</p>
+      <p>${escapeHtml(displayMessageContent(message.content || ""))}</p>
+      ${renderMessageAttachments(message.attachments || [])}
     </article>
-  `).join("") + traceBlock(snapshot.traces || [], snapshot);
+  `).join("");
   if (stickToBottom) {
     scrollToLatest();
   } else {
     setScrollLatestVisible(true);
   }
+}
+
+function displayMessageContent(content) {
+  return String(content || "")
+    .replace(/\n*<bioagent_attachments>[\s\S]*?<\/bioagent_attachments>\n*/g, "\n")
+    .replace(/\n*Use these exact uploaded file paths\.[^\n]*/g, "")
+    .trim();
+}
+
+function renderMessageAttachments(attachments) {
+  if (!attachments.length) return "";
+  return `<div class="message-attachments">${attachments.map((attachment) => `
+    <span class="message-attachment" title="${escapeHtml(attachment.path || "")}">
+      <strong>${escapeHtml(attachment.name || "file")}</strong>
+      <span>${escapeHtml(formatBytes(attachment.size))}</span>
+    </span>
+  `).join("")}</div>`;
 }
 
 function shouldStickToBottom(element) {
@@ -1159,35 +1298,8 @@ function setScrollLatestVisible(visible) {
   els.scrollLatestButton.classList.toggle("visible", Boolean(visible));
 }
 
-function traceBlock(traces, snapshot) {
-  if (!traces.length) return "";
-  return `
-    <section class="trace-block">
-      <div class="trace-head"><span>Realtime traces</span><span class="meta">click a row to inspect</span></div>
-      ${traces.map((trace) => {
-        const displayStatus = formatTraceMeta(trace, snapshot);
-        const statusClass = formatTraceStatusClass(trace, snapshot);
-        return `
-          <div class="trace-row ${trace.id === state.selectedTraceId ? "selected" : ""}" data-trace-id="${trace.id}">
-            <span class="status-dot ${escapeHtml(statusClass)}"></span>
-            <span>${escapeHtml(formatToolName(trace.toolName))}</span>
-            <span class="meta">${escapeHtml(displayStatus)}</span>
-          </div>
-        `;
-      }).join("")}
-    </section>
-  `;
-}
-
 function renderTraces(snapshot) {
   renderTraceBrowser(snapshot);
-  const rows = els.messageStream.querySelectorAll("[data-trace-id]");
-  rows.forEach((row) => {
-    row.addEventListener("click", () => {
-      selectTrace(row.dataset.traceId);
-    });
-    enableKeyboardActivation(row);
-  });
   markSelectedTraceRow();
   renderTraceDetail();
 }
@@ -1229,7 +1341,7 @@ function selectTrace(traceId) {
 }
 
 function markSelectedTraceRow() {
-  [...els.messageStream.querySelectorAll("[data-trace-id]"), ...els.traceList.querySelectorAll("[data-trace-id]")].forEach((row) => {
+  [...els.traceList.querySelectorAll("[data-trace-id]"), ...els.activityList.querySelectorAll("[data-trace-id]")].forEach((row) => {
     row.classList.toggle("selected", row.dataset.traceId === state.selectedTraceId);
   });
 }
@@ -1355,16 +1467,15 @@ function formatTraceStatusClass(trace, snapshot) {
 }
 
 function renderPlan(snapshot) {
-  const plan = snapshot?.plan || [];
-  const visiblePlan = visiblePlanItems(plan);
-  els.planCount.textContent = String(visiblePlan.length);
-  els.tracePlanCount.textContent = String(visiblePlan.length);
-  renderPlanItems(els.planList, visiblePlan, snapshot);
-  renderPlanItems(els.tracePlanList, visiblePlan, snapshot);
+  const semanticPlan = snapshot?.planState?.steps || [];
+  els.planCount.textContent = String(semanticPlan.length);
+  els.tracePlanCount.textContent = String(semanticPlan.length);
+  renderPlanItems(els.planList, semanticPlan, snapshot);
+  renderPlanItems(els.tracePlanList, semanticPlan, snapshot);
 }
 
 function renderPlanItems(container, visiblePlan, snapshot) {
-  container.innerHTML = visiblePlan.length ? "" : `<div class="empty">Plan updates appear as the run progresses.</div>`;
+  container.innerHTML = visiblePlan.length ? "" : `<div class="empty">No semantic plan.</div>`;
   const goal = snapshot?.planState?.goal || "";
   if (goal) {
     const heading = document.createElement("div");
@@ -1389,21 +1500,36 @@ function renderPlanItems(container, visiblePlan, snapshot) {
   }
 }
 
+function renderActivity(snapshot) {
+  const activity = snapshot?.activity || [];
+  const recentActivity = activity.slice(-8);
+  els.activityCount.textContent = String(activity.length);
+  els.activityList.innerHTML = recentActivity.length ? recentActivity.map((item) => {
+    const displayStatus = formatTraceStatus(item, snapshot);
+    const statusClass = formatTraceStatusClass(item, snapshot);
+    const turn = String(item.turnId || "").split(":turn:").at(-1);
+    const turnLabel = turn && turn !== item.turnId ? `Turn ${turn}` : "";
+    return `
+      <button class="activity-row" type="button" data-trace-id="${escapeHtml(item.traceId)}">
+        <span class="status-dot ${escapeHtml(statusClass)}"></span>
+        <strong>${escapeHtml(formatToolName(item.toolName))}</strong>
+        <span class="meta">${escapeHtml([turnLabel, displayStatus].filter(Boolean).join(" · "))}</span>
+      </button>
+    `;
+  }).join("") : `<div class="empty">No tool activity yet.</div>`;
+  if (activity.length > recentActivity.length) {
+    els.activityList.insertAdjacentHTML("afterbegin", `<div class="activity-overflow">+${activity.length - recentActivity.length} earlier</div>`);
+  }
+  els.activityList.querySelectorAll("[data-trace-id]").forEach((row) => {
+    row.addEventListener("click", () => selectTrace(row.dataset.traceId));
+  });
+}
+
 function formatPlanStatus(item, snapshot) {
   if (snapshot?.status === "completed" && item.status === "failed") {
     return "recovered";
   }
   return item.status || "pending";
-}
-
-function visiblePlanItems(plan) {
-  const callTitles = new Set(plan.map((item) => String(item.title || "")).filter((title) => title.startsWith("Call ")));
-  return plan.filter((item) => {
-    const title = String(item.title || "");
-    if (!title.startsWith("Finish ")) return true;
-    const toolName = title.slice("Finish ".length);
-    return !callTitles.has(`Call ${toolName}`);
-  });
 }
 
 function formatPlanTitle(value) {
@@ -1931,10 +2057,10 @@ function activateTab(name, options = {}) {
   }
 }
 
-function addUserMessage(content) {
+function addUserMessage(content, attachments = state.pendingAttachments) {
   const article = document.createElement("article");
   article.className = "message user";
-  article.innerHTML = `<div class="speaker">User</div><p>${escapeHtml(content)}</p>`;
+  article.innerHTML = `<div class="speaker">User</div><p>${escapeHtml(content)}</p>${renderMessageAttachments(attachments)}`;
   els.messageStream.appendChild(article);
 }
 

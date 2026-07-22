@@ -296,6 +296,43 @@ def test_session_api_creates_an_open_conversation_with_an_initial_run(tmp_path: 
     assert snapshot["messages"][0]["content"] == "Run GWAS"
 
 
+def test_session_title_is_generated_asynchronously_and_persisted(tmp_path: Path) -> None:
+    def title_runner(config: AgentConfig, task: str) -> str:
+        assert config.model_name == "test-model"
+        assert task == "Analyze PBMC3K cells"
+        return "标题：PBMC3K 细胞分析"
+
+    config = _config(tmp_path)
+    app = create_app(config=config, stream_runner=_fake_stream, title_runner=title_runner)
+    client = TestClient(app)
+    session_id = client.post("/api/sessions", json={"task": "Analyze PBMC3K cells"}).json()["sessionId"]
+
+    deadline = time.time() + 3
+    snapshot = client.get(f"/api/sessions/{session_id}").json()
+    while time.time() < deadline and snapshot["title"] != "PBMC3K 细胞分析":
+        time.sleep(0.02)
+        snapshot = client.get(f"/api/sessions/{session_id}").json()
+
+    assert snapshot["title"] == "PBMC3K 细胞分析"
+    assert any(event["type"] == "session_title" for event in snapshot["events"])
+    stored = json.loads((config.runs_dir / "web_tasks" / f"{session_id}.json").read_text(encoding="utf-8"))
+    assert stored["title"] == "PBMC3K 细胞分析"
+
+
+def test_session_title_keeps_local_fallback_when_generation_fails(tmp_path: Path) -> None:
+    def title_runner(config: AgentConfig, task: str) -> str:
+        raise RuntimeError("model unavailable")
+
+    app = create_app(config=_config(tmp_path), stream_runner=_fake_stream, title_runner=title_runner)
+    client = TestClient(app)
+    session_id = client.post("/api/sessions", json={"task": "Analyze PBMC3K cells"}).json()["sessionId"]
+
+    snapshot = _wait_for_status(client, session_id, "completed")
+
+    assert snapshot["title"] == "Analyze PBMC3K cells"
+    assert not any(event["type"] == "session_title" for event in snapshot["events"])
+
+
 def test_session_events_have_stable_protocol_ids_and_tool_parent_links(tmp_path: Path) -> None:
     app = create_app(config=_config(tmp_path), stream_runner=_fake_stream)
     client = TestClient(app)
@@ -345,6 +382,47 @@ def test_explicit_plan_and_structured_question_are_exposed_in_snapshot() -> None
     assert snapshot["plan"][0]["title"] == "Inspect data"
     assert snapshot["activeQuestion"]["questionId"] == "question_1"
     assert snapshot["activeQuestion"]["options"] == ["Approve", "Request changes"]
+
+
+def test_snapshot_separates_semantic_plan_from_deduplicated_tool_activity() -> None:
+    record = TaskRecord(id="session-activity", task="Analyze cells", title="Analyze cells", data_path=None, max_turns=20)
+    record.plan = [{"id": "legacy", "title": "Call read_file", "status": "completed"}]
+    record.traces = [
+        {
+            "id": "call_1",
+            "eventId": "event_1",
+            "toolCallId": "tool_1",
+            "toolName": "read_file",
+            "status": "running",
+            "runId": "run_1",
+            "turnId": "run_1:turn:1",
+        },
+        {
+            "id": "call_1",
+            "eventId": "event_1",
+            "toolCallId": "tool_1",
+            "toolName": "read_file",
+            "status": "completed",
+            "runId": "run_1",
+            "turnId": "run_1:turn:1",
+        },
+        {
+            "id": "call_2",
+            "eventId": "event_2",
+            "toolCallId": "tool_2",
+            "toolName": "start_job",
+            "status": "running",
+            "runId": "run_1",
+            "turnId": "run_1:turn:2",
+        },
+    ]
+
+    snapshot = record.snapshot()
+
+    assert snapshot["plan"] == []
+    assert [item["toolName"] for item in snapshot["activity"]] == ["read_file", "start_job"]
+    assert snapshot["activity"][0]["status"] == "completed"
+    assert snapshot["activity"][0]["traceId"] == "call_1"
 
 
 def test_paused_session_message_is_answered_without_resuming_the_run(tmp_path: Path) -> None:
@@ -867,6 +945,126 @@ def test_task_files_api_prefers_web_result_dir_when_present(tmp_path: Path) -> N
     assert snapshot["compute"]["resultRoot"].endswith(f"/web_{task_id}")
 
 
+def test_raw_upload_is_size_limited_and_attached_to_a_new_session(tmp_path: Path) -> None:
+    received_tasks: list[str] = []
+
+    def capture_stream(task: str, *, result_dir=None, **kwargs):
+        received_tasks.append(task)
+        run_dir = Path(result_dir).parent / "run_upload"
+        yield {"type": "run_start", "run_id": "run_upload", "run_dir": str(run_dir), "log_path": str(run_dir / "run.log")}
+        yield {"type": "final", "content": "Upload received.", "status": "completed"}
+        yield {"type": "run_end", "run_id": "run_upload", "run_dir": str(run_dir), "status": "completed"}
+
+    config = _config(tmp_path)
+    app = create_app(
+        config=config,
+        stream_runner=capture_stream,
+        start_job_watcher=False,
+        max_upload_bytes=16,
+    )
+    client = TestClient(app)
+
+    health = client.get("/api/health").json()
+    uploaded = client.post(
+        "/api/uploads",
+        params={"filename": "cells.csv"},
+        content=b"gene,count\nA,1\n",
+        headers={"Content-Type": "text/csv"},
+    )
+    rejected = client.post(
+        "/api/uploads",
+        params={"filename": "too-large.bin"},
+        content=b"x" * 17,
+    )
+
+    assert health["maxUploadBytes"] == 16
+    assert uploaded.status_code == 200
+    attachment = uploaded.json()
+    assert attachment["uploadId"].startswith("upload_")
+    assert attachment["name"] == "cells.csv"
+    assert attachment["size"] == 15
+    assert Path(attachment["path"]).read_bytes() == b"gene,count\nA,1\n"
+    assert attachment["dockerPath"].startswith("/repo/BioAgent/uploads/")
+    assert rejected.status_code == 413
+    assert not list((config.project_root / "uploads").rglob("too-large.bin"))
+
+    created = client.post(
+        "/api/sessions",
+        json={
+            "task": "Analyze the uploaded table.",
+            "data_path": None,
+            "max_turns": 5,
+            "attachment_ids": [attachment["uploadId"]],
+        },
+    ).json()
+    snapshot = _wait_for_status(client, created["sessionId"], "completed")
+
+    assert snapshot["dataPath"] == attachment["path"]
+    assert snapshot["messages"][0]["attachments"][0]["uploadId"] == attachment["uploadId"]
+    assert "<bioagent_attachments>" in received_tasks[0]
+    assert attachment["path"] in received_tasks[0]
+    assert attachment["dockerPath"] in received_tasks[0]
+
+
+def test_existing_session_upload_is_bound_to_that_session(tmp_path: Path) -> None:
+    app = create_app(config=_config(tmp_path), stream_runner=_fake_stream, start_job_watcher=False)
+    client = TestClient(app)
+    task_id = client.post("/api/sessions", json={"task": "Run demo"}).json()["sessionId"]
+    _wait_for_status(client, task_id, "completed")
+
+    uploaded = client.post(
+        "/api/uploads",
+        params={"filename": "notes.txt", "session_id": task_id},
+        content=b"follow-up evidence",
+    )
+    missing = client.post(
+        "/api/uploads",
+        params={"filename": "notes.txt", "session_id": "missing-session"},
+        content=b"no",
+    )
+
+    assert uploaded.status_code == 200
+    assert f"/uploads/{task_id}/" in uploaded.json()["path"]
+    assert missing.status_code == 404
+
+    attachment = uploaded.json()
+    sent = client.post(
+        f"/api/sessions/{task_id}/messages",
+        json={
+            "content": "Use these notes.",
+            "max_turns": 5,
+            "attachment_ids": [attachment["uploadId"]],
+        },
+    )
+    messages = client.get(f"/api/sessions/{task_id}").json()["messages"]
+    message = next(item for item in reversed(messages) if item["role"] == "user")
+
+    assert sent.status_code == 202
+    assert message["role"] == "user"
+    assert message["attachments"][0]["uploadId"] == attachment["uploadId"]
+    assert "<bioagent_attachments>" in message["content"]
+
+
+def test_workbench_composer_supports_click_and_drop_uploads() -> None:
+    root = Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static"
+    markup = (root / "index.html").read_text(encoding="utf-8")
+    script = (root / "assets" / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="attachmentInput"' in markup
+    assert 'id="attachButton"' in markup
+    assert 'id="attachmentList"' in markup
+    assert 'multiple' in markup
+    assert 'addEventListener("drop"' in script
+    assert 'addEventListener("dragover"' in script
+    assert 'uploadFiles(' in script
+    assert 'attachment_ids' in script
+    upload = script.index("async function uploadFiles")
+    upload_finished = script.index("state.uploadBusy = false", upload)
+    composer_restored = script.index("renderComposer(state.snapshot)", upload_finished)
+    attachments_restored = script.index("renderAttachmentComposer()", composer_restored)
+    assert upload_finished < composer_restored < attachments_restored
+
+
 def test_session_results_survive_follow_up_run_without_outputs(tmp_path: Path) -> None:
     config = _config(tmp_path)
     first_run = config.runs_dir / "run_first"
@@ -1095,7 +1293,7 @@ def test_pause_stops_only_containers_named_by_run_cidfiles(tmp_path: Path, monke
     assert json.loads((job_dir / "job.json").read_text(encoding="utf-8"))["status"] == "cancelled"
 
 
-def test_task_resume_marks_waiting_for_input_step_completed(tmp_path: Path) -> None:
+def test_task_resume_does_not_turn_interaction_lifecycle_into_a_semantic_plan(tmp_path: Path) -> None:
     app = create_app(config=_config(tmp_path), stream_runner=_needs_input_stream, resume_runner=_fake_resume)
     client = TestClient(app)
     task_id = client.post("/api/tasks", json={"task": "Run demo"}).json()["taskId"]
@@ -1103,10 +1301,8 @@ def test_task_resume_marks_waiting_for_input_step_completed(tmp_path: Path) -> N
 
     client.post(f"/api/tasks/{task_id}/resume", json={"user_answer": "human", "max_turns": 5})
     snapshot = _wait_for_status(client, task_id, "completed")
-    plan = {item["title"]: item["status"] for item in snapshot["plan"]}
-
-    assert plan["Wait for user input"] == "completed"
-    assert plan["Resume with user input"] == "completed"
+    assert snapshot["status"] == "completed"
+    assert snapshot["plan"] == []
 
 
 def test_task_resume_streams_updated_memory_state(tmp_path: Path) -> None:
@@ -1165,17 +1361,14 @@ def test_waiting_for_human_input_does_not_duplicate_prompt_message(tmp_path: Pat
     assert len(prompts) == 1
 
 
-def test_waiting_for_human_input_plan_shows_waiting_state(tmp_path: Path) -> None:
+def test_waiting_for_human_input_does_not_create_a_semantic_plan(tmp_path: Path) -> None:
     app = create_app(config=_config(tmp_path), stream_runner=_needs_input_stream, resume_runner=_fake_resume)
     client = TestClient(app)
     task_id = client.post("/api/tasks", json={"task": "Run demo"}).json()["taskId"]
 
     snapshot = _wait_for_status(client, task_id, "needs_user_input")
-    plan = {item["title"]: item["status"] for item in snapshot["plan"]}
-
-    assert plan["Wait for user input"] == "running"
-    assert "Summarize result" not in plan
-    assert "Finish run" not in plan
+    assert snapshot["status"] == "needs_user_input"
+    assert snapshot["plan"] == []
 
 
 def test_workbench_serves_static_index(tmp_path: Path) -> None:
@@ -1332,14 +1525,16 @@ def test_workbench_humanizes_tool_names_in_trace_surfaces() -> None:
 
     current_tool = script.index("function renderCurrentTool")
     topbar_label = script.index("formatToolName(label)", current_tool)
-    trace_block = script.index("function traceBlock")
-    row_label = script.index("formatToolName(trace.toolName)", trace_block)
+    trace_browser = script.index("function renderTraceBrowser")
+    row_label = script.index("formatToolName(trace.toolName)", trace_browser)
     detail = script.index("function renderTraceDetail")
     detail_title = script.index("formatToolName(trace.toolName)", detail)
+    activity = script.index("function renderActivity")
+    activity_label = script.index("formatToolName(item.toolName)", activity)
     helper = script.index("function formatToolName")
     humanize = script.index("humanizeToolName", helper)
 
-    assert current_tool < topbar_label < trace_block < row_label < detail < detail_title
+    assert current_tool < topbar_label < trace_browser < row_label < detail < detail_title < activity < activity_label
     assert helper < humanize
 
 
@@ -1347,8 +1542,8 @@ def test_workbench_trace_surfaces_use_human_readable_status_labels() -> None:
     script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
     styles = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "styles.css").read_text(encoding="utf-8")
 
-    trace_block = script.index("function traceBlock")
-    row_status = script.index("formatTraceMeta(trace, snapshot)", trace_block)
+    trace_browser = script.index("function renderTraceBrowser")
+    row_status = script.index("formatTraceMeta(trace, snapshot)", trace_browser)
     row_status_class = script.index("formatTraceStatusClass(trace, snapshot)", row_status)
     row_dot = script.index("status-dot ${escapeHtml(statusClass)}", row_status_class)
     detail = script.index("function renderTraceDetail")
@@ -1363,7 +1558,7 @@ def test_workbench_trace_surfaces_use_human_readable_status_labels() -> None:
     class_recovered = script.index('return "recovered"', class_helper)
     class_fallback = script.index('replaceAll("_", "-")', class_recovered)
 
-    assert trace_block < row_status < row_status_class < row_dot < detail < detail_meta < detail_status
+    assert trace_browser < row_status < row_status_class < row_dot < detail < detail_meta < detail_status
     assert detail < meta_helper < meta_status < helper
     assert helper < recovered < fallback
     assert helper < class_helper < class_recovered < class_fallback
@@ -1373,8 +1568,8 @@ def test_workbench_trace_surfaces_use_human_readable_status_labels() -> None:
 def test_workbench_trace_rows_and_detail_show_tool_duration() -> None:
     script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
 
-    trace_block = script.index("function traceBlock")
-    row_meta = script.index("formatTraceMeta(trace, snapshot)", trace_block)
+    trace_browser = script.index("function renderTraceBrowser")
+    row_meta = script.index("formatTraceMeta(trace, snapshot)", trace_browser)
     detail = script.index("function renderTraceDetail")
     detail_meta = script.index("formatTraceMeta(trace, state.snapshot)", detail)
     helper = script.index("function formatTraceMeta")
@@ -1382,15 +1577,15 @@ def test_workbench_trace_rows_and_detail_show_tool_duration() -> None:
     duration = script.index("formatRunDuration(trace)", status)
     return_value = script.index("`${status} · ${duration}`", duration)
 
-    assert trace_block < row_meta < detail < detail_meta < helper
+    assert trace_browser < row_meta < detail < detail_meta < helper
     assert helper < status < duration < return_value
 
 
 def test_workbench_trace_tool_names_do_not_push_status_offscreen() -> None:
     styles = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "styles.css").read_text(encoding="utf-8")
 
-    trace_row = styles.index(".trace-row {")
-    tool_name = styles.index(".trace-row span:nth-child(2)", trace_row)
+    trace_row = styles.index(".trace-list-copy {")
+    tool_name = styles.index(".trace-list-copy strong", trace_row)
     tool_block = styles[tool_name:styles.index("}", tool_name)]
 
     assert "min-width: 0" in tool_block
@@ -1510,7 +1705,8 @@ def test_workbench_marks_selected_trace_row() -> None:
     assert 'trace.id === state.selectedTraceId ? "selected" : ""' in script
     assert "function markSelectedTraceRow" in script
     assert "markSelectedTraceRow();" in script
-    assert ".trace-row.selected" in styles
+    assert ".trace-list-row.selected" in styles
+    assert ".activity-row.selected" in styles
 
 
 def test_workbench_result_cards_open_file_preview() -> None:
@@ -2086,19 +2282,27 @@ def test_workbench_live_task_list_keeps_failure_reason_from_snapshot() -> None:
     assert status_field < error_field
 
 
-def test_workbench_plan_collapses_paired_tool_finish_rows() -> None:
+def test_workbench_renders_semantic_plan_and_activity_as_separate_surfaces() -> None:
+    markup = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "index.html").read_text(encoding="utf-8")
     script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
 
     render_start = script.index("function renderPlan")
-    visible_plan = script.index("const visiblePlan = visiblePlanItems(plan)", render_start)
-    count = script.index("els.planCount.textContent = String(visiblePlan.length)", visible_plan)
-    loop = script.index("for (const item of visiblePlan)", count)
-    helper = script.index("function visiblePlanItems")
-    finish_prefix = script.index('title.startsWith("Finish ")', helper)
-    paired_call = script.index('callTitles.has(`Call ${toolName}`)', finish_prefix)
+    semantic_plan = script.index("snapshot?.planState?.steps", render_start)
+    activity_start = script.index("function renderActivity")
+    activity_source = script.index("snapshot?.activity", activity_start)
+    recent_activity = script.index("slice(-8)", activity_source)
 
-    assert visible_plan < count < loop
-    assert helper < finish_prefix < paired_call
+    assert 'id="planList"' in markup
+    assert 'id="activityList"' in markup
+    assert render_start < semantic_plan < activity_start < activity_source < recent_activity
+
+
+def test_workbench_does_not_repeat_tool_trace_rows_inside_the_conversation() -> None:
+    script = (Path(__file__).resolve().parents[1] / "src" / "bioagent" / "webapp" / "static" / "assets" / "app.js").read_text(encoding="utf-8")
+
+    render_messages = script[script.index("function renderMessages"):script.index("function displayMessageContent")]
+
+    assert "traceBlock(" not in render_messages
 
 
 def test_workbench_trace_tab_contains_compact_plan_when_right_rail_is_hidden() -> None:
@@ -2111,8 +2315,8 @@ def test_workbench_trace_tab_contains_compact_plan_when_right_rail_is_hidden() -
     right_plan = markup.index('id="planList"', trace_plan)
     els_list = script.index('"tracePlanCount", "tracePlanList"')
     render_plan = script.index("function renderPlan")
-    trace_count = script.index("els.tracePlanCount.textContent = String(visiblePlan.length)", render_plan)
-    trace_render = script.index("renderPlanItems(els.tracePlanList, visiblePlan, snapshot)", trace_count)
+    trace_count = script.index("els.tracePlanCount.textContent = String(semanticPlan.length)", render_plan)
+    trace_render = script.index("renderPlanItems(els.tracePlanList, semanticPlan, snapshot)", trace_count)
 
     assert trace_pane < trace_plan < right_plan
     assert els_list < render_plan < trace_count < trace_render
@@ -2944,7 +3148,7 @@ def test_workbench_keyboard_focus_is_visible_on_interactive_rows_and_cards() -> 
 
     focus_start = styles.index(".task-row:focus-visible")
     assert ".file-row[data-demo-path]:focus-visible" in styles[focus_start:]
-    assert ".trace-row:focus-visible" in styles[focus_start:]
+    assert ".activity-row:focus-visible" in styles[focus_start:]
     assert ".file-node.is-file:focus-visible" in styles[focus_start:]
     assert ".plot-card:focus-visible" in styles[focus_start:]
     assert ".summary-card:focus-visible" in styles[focus_start:]

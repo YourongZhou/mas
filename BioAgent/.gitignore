@@ -2,5 +2,6 @@ logs/
 runs/
 /memory/
 /state/model-settings.json
+/uploads/
 __pycache__/
 *.py[cod]

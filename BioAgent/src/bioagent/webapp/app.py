@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
+import shutil
 import time
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from langchain_core.messages import HumanMessage
 from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -22,27 +26,42 @@ from bioagent.config import (
 )
 from bioagent.llm import build_llm
 
-from .state import ChatRunner, ResumeRunner, StreamRunner, TaskStore, session_run_dirs as web_state_session_run_dirs, sse_payload
+from .state import (
+    ChatRunner,
+    ResumeRunner,
+    StreamRunner,
+    TaskStore,
+    TitleRunner,
+    generate_session_title,
+    session_run_dirs as web_state_session_run_dirs,
+    sse_payload,
+)
 
 
 TEXT_PREVIEW_LIMIT_BYTES = 200_000
 TEXT_PREVIEW_TRUNCATED_MESSAGE = "\n\n[Preview truncated. Use Download to fetch the full file.]"
+DEFAULT_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+MAX_ATTACHMENTS_PER_MESSAGE = 20
+UPLOAD_ID_PATTERN = re.compile(r"^upload_[0-9a-f]{16}$")
 
 
 class CreateTaskRequest(BaseModel):
     task: str = Field(..., min_length=1)
     data_path: str | None = None
     max_turns: int = Field(20, ge=1, le=100)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=MAX_ATTACHMENTS_PER_MESSAGE)
 
 
 class ResumeTaskRequest(BaseModel):
     user_answer: str = Field(..., min_length=1)
     max_turns: int = Field(20, ge=1, le=100)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=MAX_ATTACHMENTS_PER_MESSAGE)
 
 
 class SessionMessageRequest(BaseModel):
     content: str = Field(..., min_length=1)
     max_turns: int = Field(20, ge=1, le=100)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=MAX_ATTACHMENTS_PER_MESSAGE)
 
 
 class CancelJobRequest(BaseModel):
@@ -69,8 +88,10 @@ def create_app(
     stream_runner: StreamRunner | None = None,
     resume_runner: ResumeRunner | None = None,
     chat_runner: ChatRunner | None = None,
+    title_runner: TitleRunner | None = None,
     model_test_runner: ModelTestRunner | None = None,
     start_job_watcher: bool | None = None,
+    max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES,
 ) -> FastAPI:
     base_config = config or AgentConfig.from_env(include_model_settings=False)
     effective_config = apply_model_settings(base_config)
@@ -84,11 +105,16 @@ def create_app(
         store_kwargs["resume_runner"] = resume_runner
     if chat_runner:
         store_kwargs["chat_runner"] = chat_runner
+    if title_runner is not None:
+        store_kwargs["title_runner"] = title_runner
+    elif config is None:
+        store_kwargs["title_runner"] = generate_session_title
     store = TaskStore(**store_kwargs)
     model_test_runner = model_test_runner or _test_model_connection
     app = FastAPI(title="BioAgent Workbench")
     app.state.task_store = store
     app.state.base_config = base_config
+    app.state.max_upload_bytes = max(1, int(max_upload_bytes))
     static_dir = Path(__file__).with_name("static")
 
     @app.get("/api/health")
@@ -99,7 +125,55 @@ def create_app(
             "provider": store.config.provider,
             "model": store.config.model_name,
             "baseUrl": store.config.base_url,
+            "maxUploadBytes": app.state.max_upload_bytes,
         }
+
+    @app.post("/api/uploads")
+    async def upload_file(request: Request, filename: str, session_id: str = "") -> dict[str, Any]:
+        if session_id:
+            _record_or_404(store, session_id)
+        safe_name = _safe_upload_name(filename)
+        content_length = request.headers.get("content-length", "")
+        if content_length.isdigit() and int(content_length) > app.state.max_upload_bytes:
+            raise HTTPException(status_code=413, detail=_upload_limit_message(app.state.max_upload_bytes))
+        upload_id = f"upload_{uuid.uuid4().hex[:16]}"
+        upload_dir = _upload_bucket(store.config.project_root, session_id) / upload_id
+        target = upload_dir / safe_name
+        upload_dir.mkdir(parents=True, exist_ok=False)
+        size = 0
+        try:
+            with target.open("wb") as handle:
+                async for chunk in request.stream():
+                    size += len(chunk)
+                    if size > app.state.max_upload_bytes:
+                        raise HTTPException(status_code=413, detail=_upload_limit_message(app.state.max_upload_bytes))
+                    handle.write(chunk)
+            if size == 0:
+                raise HTTPException(status_code=400, detail="Uploaded file is empty")
+            metadata = _upload_metadata(
+                store.config,
+                upload_id=upload_id,
+                name=safe_name,
+                path=target,
+                size=size,
+                content_type=request.headers.get("content-type", "application/octet-stream"),
+                session_id=session_id,
+            )
+            (upload_dir / "upload.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+            return metadata
+        except Exception:
+            shutil.rmtree(upload_dir, ignore_errors=True)
+            raise
+
+    @app.delete("/api/uploads/{upload_id}")
+    def delete_upload(upload_id: str, session_id: str = "") -> dict[str, Any]:
+        if session_id:
+            _record_or_404(store, session_id)
+        upload_dir = _upload_directory(store.config.project_root, upload_id, session_id=session_id)
+        if not upload_dir.is_dir():
+            raise HTTPException(status_code=404, detail="Upload not found")
+        shutil.rmtree(upload_dir)
+        return {"ok": True, "uploadId": upload_id}
 
     @app.get("/api/settings/model")
     def get_model_settings() -> dict[str, Any]:
@@ -139,14 +213,29 @@ def create_app(
     @app.post("/api/tasks")
     @app.post("/api/sessions")
     def create_task(payload: CreateTaskRequest) -> dict[str, str]:
-        record = store.create_task(task=payload.task, data_path=payload.data_path, max_turns=payload.max_turns)
+        attachments = _resolve_uploads(store.config, payload.attachment_ids)
+        task = _content_with_attachments(payload.task, attachments)
+        data_path = payload.data_path or (attachments[0]["path"] if len(attachments) == 1 else None)
+        record = store.create_task(
+            task=task,
+            data_path=data_path,
+            max_turns=payload.max_turns,
+            attachments=attachments,
+        )
         return {"taskId": record.id, "sessionId": record.id, "redirectUrl": f"/tasks/{record.id}"}
 
     @app.post("/api/tasks/{task_id}/resume")
     @app.post("/api/sessions/{task_id}/resume")
     def resume_task(task_id: str, payload: ResumeTaskRequest) -> dict[str, str]:
         try:
-            record = store.resume_task(task_id=task_id, user_answer=payload.user_answer, max_turns=payload.max_turns)
+            attachments = _resolve_uploads(store.config, payload.attachment_ids, session_id=task_id)
+            answer = _content_with_attachments(payload.user_answer, attachments)
+            record = store.resume_task(
+                task_id=task_id,
+                user_answer=answer,
+                max_turns=payload.max_turns,
+                attachments=attachments,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -189,7 +278,14 @@ def create_app(
     @app.post("/api/sessions/{task_id}/messages", status_code=202)
     def send_session_message(task_id: str, payload: SessionMessageRequest) -> dict[str, str]:
         try:
-            record = store.send_message(task_id=task_id, content=payload.content, max_turns=payload.max_turns)
+            attachments = _resolve_uploads(store.config, payload.attachment_ids, session_id=task_id)
+            content = _content_with_attachments(payload.content, attachments)
+            record = store.send_message(
+                task_id=task_id,
+                content=content,
+                max_turns=payload.max_turns,
+                attachments=attachments,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -303,6 +399,92 @@ def _record_or_404(store: TaskStore, task_id: str):
         return store.get_task(task_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _safe_upload_name(filename: str) -> str:
+    basename = Path(filename.replace("\\", "/")).name.strip()
+    safe = "".join(character if character.isalnum() or character in "._-" else "_" for character in basename)
+    safe = safe.strip("._")
+    if not safe:
+        raise HTTPException(status_code=422, detail="Upload filename is invalid")
+    return safe[:180]
+
+
+def _upload_bucket(project_root: Path, session_id: str = "") -> Path:
+    bucket = session_id if session_id else "staging"
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", bucket):
+        raise HTTPException(status_code=422, detail="Session id is invalid")
+    return project_root / "uploads" / bucket
+
+
+def _upload_directory(project_root: Path, upload_id: str, *, session_id: str = "") -> Path:
+    if not UPLOAD_ID_PATTERN.fullmatch(upload_id):
+        raise HTTPException(status_code=422, detail="Upload id is invalid")
+    return _upload_bucket(project_root, session_id) / upload_id
+
+
+def _upload_metadata(
+    config: AgentConfig,
+    *,
+    upload_id: str,
+    name: str,
+    path: Path,
+    size: int,
+    content_type: str,
+    session_id: str,
+) -> dict[str, Any]:
+    resolved = path.resolve()
+    docker_path = "/repo/" + resolved.relative_to(config.repo_root.resolve()).as_posix()
+    return {
+        "uploadId": upload_id,
+        "name": name,
+        "path": str(resolved),
+        "dockerPath": docker_path,
+        "size": size,
+        "contentType": content_type or "application/octet-stream",
+        "sessionId": session_id,
+    }
+
+
+def _resolve_uploads(config: AgentConfig, upload_ids: list[str], *, session_id: str = "") -> list[dict[str, Any]]:
+    attachments: list[dict[str, Any]] = []
+    for upload_id in upload_ids:
+        upload_dir = _upload_directory(config.project_root, upload_id, session_id=session_id)
+        metadata_path = upload_dir / "upload.json"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=404, detail=f"Upload not found: {upload_id}") from exc
+        target = Path(str(metadata.get("path") or "")).resolve()
+        if not target.is_file() or upload_dir.resolve() not in target.parents:
+            raise HTTPException(status_code=404, detail=f"Uploaded file is unavailable: {upload_id}")
+        attachments.append(metadata)
+    return attachments
+
+
+def _content_with_attachments(content: str, attachments: list[dict[str, Any]]) -> str:
+    if not attachments:
+        return content
+    lines = [content.rstrip(), "", "<bioagent_attachments>"]
+    for attachment in attachments:
+        lines.append(
+            "- "
+            f"name={attachment['name']}; "
+            f"host_path={attachment['path']}; "
+            f"docker_path={attachment['dockerPath']}; "
+            f"size_bytes={attachment['size']}"
+        )
+    lines.extend(
+        [
+            "</bioagent_attachments>",
+            "Use these exact uploaded file paths. Inside Docker, use docker_path; do not search for alternate files.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _upload_limit_message(max_bytes: int) -> str:
+    return f"File exceeds the {max_bytes}-byte upload limit"
 
 
 def _safe_task_path(record, requested: str) -> Path:
